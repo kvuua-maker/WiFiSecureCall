@@ -2,7 +2,7 @@ import SwiftUI
 
 @main
 struct WiFiSecureCallWatchApp: App {
-    @WKExtensionDelegateAdaptor(WatchNotificationController.self) private var notificationDelegate
+    @WKApplicationDelegateAdaptor(WatchNotificationController.self) private var notificationDelegate
     @StateObject private var session: CallSession
 
     init() {
@@ -16,4 +16,3 @@ struct WiFiSecureCallWatchApp: App {
     }
     var body: some Scene { WindowGroup { WatchRootView(session: session) } }
 }
-
