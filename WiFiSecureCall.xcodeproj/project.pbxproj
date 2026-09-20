@@ -1,0 +1,162 @@
+// !$*UTF8*$!
+{
+	archiveVersion = 1;
+	classes = {};
+	objectVersion = 56;
+	objects = {
+
+/* Begin PBXBuildFile section */
+		B10000000000000000000001 = {isa = PBXBuildFile; fileRef = F10000000000000000000001; };
+		B10000000000000000000002 = {isa = PBXBuildFile; fileRef = F10000000000000000000002; };
+		B10000000000000000000003 = {isa = PBXBuildFile; fileRef = F10000000000000000000003; };
+		B10000000000000000000004 = {isa = PBXBuildFile; fileRef = F10000000000000000000004; };
+		B10000000000000000000005 = {isa = PBXBuildFile; fileRef = F10000000000000000000005; };
+		B10000000000000000000006 = {isa = PBXBuildFile; fileRef = F10000000000000000000006; };
+		B10000000000000000000007 = {isa = PBXBuildFile; fileRef = F10000000000000000000007; };
+		B10000000000000000000008 = {isa = PBXBuildFile; fileRef = F10000000000000000000008; };
+		B10000000000000000000009 = {isa = PBXBuildFile; fileRef = F10000000000000000000009; };
+		B1000000000000000000000A = {isa = PBXBuildFile; fileRef = F1000000000000000000000A; };
+		B1000000000000000000000B = {isa = PBXBuildFile; fileRef = F1000000000000000000000B; };
+		B1000000000000000000000C = {isa = PBXBuildFile; fileRef = F1000000000000000000000C; };
+		B10000000000000000000011 = {isa = PBXBuildFile; fileRef = F10000000000000000000011; };
+		B10000000000000000000012 = {isa = PBXBuildFile; fileRef = F10000000000000000000012; };
+		B10000000000000000000013 = {isa = PBXBuildFile; fileRef = F10000000000000000000013; };
+		B10000000000000000000014 = {isa = PBXBuildFile; fileRef = F10000000000000000000014; };
+		B10000000000000000000101 = {isa = PBXBuildFile; fileRef = F10000000000000000000001; };
+		B10000000000000000000102 = {isa = PBXBuildFile; fileRef = F10000000000000000000002; };
+		B10000000000000000000103 = {isa = PBXBuildFile; fileRef = F10000000000000000000003; };
+		B10000000000000000000104 = {isa = PBXBuildFile; fileRef = F10000000000000000000004; };
+		B10000000000000000000105 = {isa = PBXBuildFile; fileRef = F10000000000000000000005; };
+		B10000000000000000000106 = {isa = PBXBuildFile; fileRef = F10000000000000000000006; };
+		B10000000000000000000107 = {isa = PBXBuildFile; fileRef = F10000000000000000000007; };
+		B10000000000000000000108 = {isa = PBXBuildFile; fileRef = F10000000000000000000008; };
+		B10000000000000000000109 = {isa = PBXBuildFile; fileRef = F10000000000000000000009; };
+		B1000000000000000000010A = {isa = PBXBuildFile; fileRef = F1000000000000000000000A; };
+		B1000000000000000000010B = {isa = PBXBuildFile; fileRef = F1000000000000000000000B; };
+		B1000000000000000000010C = {isa = PBXBuildFile; fileRef = F1000000000000000000000C; };
+		B10000000000000000000111 = {isa = PBXBuildFile; fileRef = F10000000000000000000021; };
+		B10000000000000000000112 = {isa = PBXBuildFile; fileRef = F10000000000000000000022; };
+		B10000000000000000000113 = {isa = PBXBuildFile; fileRef = F10000000000000000000023; };
+		B10000000000000000000114 = {isa = PBXBuildFile; fileRef = F10000000000000000000024; };
+		B10000000000000000000201 = {isa = PBXBuildFile; fileRef = F10000000000000000000031; };
+		B10000000000000000000202 = {isa = PBXBuildFile; fileRef = F10000000000000000000001; };
+		B10000000000000000000203 = {isa = PBXBuildFile; fileRef = F10000000000000000000002; };
+		B10000000000000000000204 = {isa = PBXBuildFile; fileRef = F10000000000000000000005; };
+		B10000000000000000000205 = {isa = PBXBuildFile; fileRef = F10000000000000000000007; };
+		B10000000000000000000206 = {isa = PBXBuildFile; fileRef = F10000000000000000000008; };
+		B10000000000000000000207 = {isa = PBXBuildFile; fileRef = F1000000000000000000000A; };
+		B10000000000000000000301 = {isa = PBXBuildFile; fileRef = F10000000000000000000040; };
+		B10000000000000000000302 = {isa = PBXBuildFile; fileRef = F10000000000000000000040; };
+		B10000000000000000000303 = {isa = PBXBuildFile; fileRef = F10000000000000000000016; };
+		B10000000000000000000304 = {isa = PBXBuildFile; fileRef = F10000000000000000000026; };
+		B10000000000000000000401 = {isa = PBXBuildFile; fileRef = F10000000000000000000051; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
+/* End PBXBuildFile section */
+
+/* Begin PBXContainerItemProxy section */
+		D10000000000000000000001 = {isa = PBXContainerItemProxy; containerPortal = P10000000000000000000001; proxyType = 1; remoteGlobalIDString = T10000000000000000000001; remoteInfo = WiFiSecureCall; };
+		D10000000000000000000002 = {isa = PBXContainerItemProxy; containerPortal = P10000000000000000000001; proxyType = 1; remoteGlobalIDString = T10000000000000000000002; remoteInfo = WiFiSecureCallWatch; };
+/* End PBXContainerItemProxy section */
+
+/* Begin PBXCopyFilesBuildPhase section */
+		C10000000000000000000001 = {isa = PBXCopyFilesBuildPhase; buildActionMask = 2147483647; dstPath = "$(CONTENTS_FOLDER_PATH)/Watch"; dstSubfolderSpec = 16; files = (B10000000000000000000401, ); name = "Embed Watch Content"; runOnlyForDeploymentPostprocessing = 0; };
+/* End PBXCopyFilesBuildPhase section */
+
+/* Begin PBXFileReference section */
+		F10000000000000000000001 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CallState.swift; sourceTree = "<group>"; };
+		F10000000000000000000002 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CallFailure.swift; sourceTree = "<group>"; };
+		F10000000000000000000003 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CallSession.swift; sourceTree = "<group>"; };
+		F10000000000000000000004 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = APIClient.swift; sourceTree = "<group>"; };
+		F10000000000000000000005 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = APIModels.swift; sourceTree = "<group>"; };
+		F10000000000000000000006 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AudioEngine.swift; sourceTree = "<group>"; };
+		F10000000000000000000007 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AudioPacket.swift; sourceTree = "<group>"; };
+		F10000000000000000000008 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MediaTransport.swift; sourceTree = "<group>"; };
+		F10000000000000000000009 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WebSocketMediaTransport.swift; sourceTree = "<group>"; };
+		F1000000000000000000000A = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppConfig.swift; sourceTree = "<group>"; };
+		F1000000000000000000000B = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Diagnostics.swift; sourceTree = "<group>"; };
+		F1000000000000000000000C = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NotificationRuntime.swift; sourceTree = "<group>"; };
+		F10000000000000000000011 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WiFiSecureCallApp.swift; sourceTree = "<group>"; };
+		F10000000000000000000012 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = IOSRootView.swift; sourceTree = "<group>"; };
+		F10000000000000000000013 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = IOSCallKitAdapter.swift; sourceTree = "<group>"; };
+		F10000000000000000000014 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = IOSNotificationController.swift; sourceTree = "<group>"; };
+		F10000000000000000000015 = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
+		F10000000000000000000016 = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
+		F10000000000000000000017 = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = WiFiSecureCall.entitlements; sourceTree = "<group>"; };
+		F10000000000000000000021 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WiFiSecureCallWatchApp.swift; sourceTree = "<group>"; };
+		F10000000000000000000022 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WatchRootView.swift; sourceTree = "<group>"; };
+		F10000000000000000000023 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WatchCallKitAdapter.swift; sourceTree = "<group>"; };
+		F10000000000000000000024 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WatchNotificationController.swift; sourceTree = "<group>"; };
+		F10000000000000000000025 = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
+		F10000000000000000000026 = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
+		F10000000000000000000027 = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = WiFiSecureCallWatch.entitlements; sourceTree = "<group>"; };
+		F10000000000000000000031 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WiFiSecureCallTests.swift; sourceTree = "<group>"; };
+		F10000000000000000000040 = {isa = PBXFileReference; lastKnownFileType = text.xml; path = PrivacyInfo.xcprivacy; sourceTree = "<group>"; };
+		F10000000000000000000041 = {isa = PBXFileReference; lastKnownFileType = text.xcconfig; path = Base.xcconfig; sourceTree = "<group>"; };
+		F10000000000000000000042 = {isa = PBXFileReference; lastKnownFileType = text.xcconfig; path = Secrets.xcconfig.example; sourceTree = "<group>"; };
+		F10000000000000000000050 = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = "WiFi Secure Call.app"; sourceTree = BUILT_PRODUCTS_DIR; };
+		F10000000000000000000051 = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = WiFiSecureCallWatch.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		F10000000000000000000052 = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = WiFiSecureCallTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
+/* End PBXFileReference section */
+
+/* Begin PBXFrameworksBuildPhase section */
+		H10000000000000000000001 = {isa = PBXFrameworksBuildPhase; buildActionMask = 2147483647; files = (); runOnlyForDeploymentPostprocessing = 0; };
+		H10000000000000000000002 = {isa = PBXFrameworksBuildPhase; buildActionMask = 2147483647; files = (); runOnlyForDeploymentPostprocessing = 0; };
+		H10000000000000000000003 = {isa = PBXFrameworksBuildPhase; buildActionMask = 2147483647; files = (); runOnlyForDeploymentPostprocessing = 0; };
+/* End PBXFrameworksBuildPhase section */
+
+/* Begin PBXGroup section */
+		G10000000000000000000001 = {isa = PBXGroup; children = (G10000000000000000000002, G10000000000000000000003, G10000000000000000000004, G10000000000000000000005, G10000000000000000000006, F10000000000000000000040, G10000000000000000000007); sourceTree = "<group>"; };
+		G10000000000000000000002 = {isa = PBXGroup; path = Shared; children = (F10000000000000000000001,F10000000000000000000002,F10000000000000000000003,F10000000000000000000004,F10000000000000000000005,F10000000000000000000006,F10000000000000000000007,F10000000000000000000008,F10000000000000000000009,F1000000000000000000000A,F1000000000000000000000B,F1000000000000000000000C); sourceTree = "<group>"; };
+		G10000000000000000000003 = {isa = PBXGroup; path = iOS; children = (F10000000000000000000011,F10000000000000000000012,F10000000000000000000013,F10000000000000000000014,F10000000000000000000015,F10000000000000000000016,F10000000000000000000017); sourceTree = "<group>"; };
+		G10000000000000000000004 = {isa = PBXGroup; path = Watch; children = (F10000000000000000000021,F10000000000000000000022,F10000000000000000000023,F10000000000000000000024,F10000000000000000000025,F10000000000000000000026,F10000000000000000000027); sourceTree = "<group>"; };
+		G10000000000000000000005 = {isa = PBXGroup; path = Tests; children = (F10000000000000000000031); sourceTree = "<group>"; };
+		G10000000000000000000006 = {isa = PBXGroup; path = Config; children = (F10000000000000000000041,F10000000000000000000042); sourceTree = "<group>"; };
+		G10000000000000000000007 = {isa = PBXGroup; name = Products; children = (F10000000000000000000050,F10000000000000000000051,F10000000000000000000052); sourceTree = "<group>"; };
+/* End PBXGroup section */
+
+/* Begin PBXNativeTarget section */
+		T10000000000000000000001 = {isa = PBXNativeTarget; buildConfigurationList = L10000000000000000000001; buildPhases = (S10000000000000000000001,H10000000000000000000001,R10000000000000000000001,C10000000000000000000001); buildRules = (); dependencies = (D20000000000000000000002,); name = WiFiSecureCall; productName = WiFiSecureCall; productReference = F10000000000000000000050; productType = "com.apple.product-type.application"; };
+		T10000000000000000000002 = {isa = PBXNativeTarget; buildConfigurationList = L10000000000000000000002; buildPhases = (S10000000000000000000002,H10000000000000000000002,R10000000000000000000002); buildRules = (); dependencies = (); name = WiFiSecureCallWatch; productName = WiFiSecureCallWatch; productReference = F10000000000000000000051; productType = "com.apple.product-type.application"; };
+		T10000000000000000000003 = {isa = PBXNativeTarget; buildConfigurationList = L10000000000000000000003; buildPhases = (S10000000000000000000003,H10000000000000000000003,R10000000000000000000003); buildRules = (); dependencies = (); name = WiFiSecureCallTests; productName = WiFiSecureCallTests; productReference = F10000000000000000000052; productType = "com.apple.product-type.bundle.unit-test"; };
+/* End PBXNativeTarget section */
+
+/* Begin PBXProject section */
+		P10000000000000000000001 = {isa = PBXProject; attributes = {BuildIndependentTargetsInParallel = YES; LastSwiftUpdateCheck = 2660; LastUpgradeCheck = 2660; TargetAttributes = {T10000000000000000000001 = {CreatedOnToolsVersion = 26.6; }; T10000000000000000000002 = {CreatedOnToolsVersion = 26.6; }; T10000000000000000000003 = {CreatedOnToolsVersion = 26.6; TestTargetID = T10000000000000000000001; }; }; }; buildConfigurationList = L10000000000000000000000; compatibilityVersion = "Xcode 14.0"; developmentRegion = en; hasScannedForEncodings = 0; knownRegions = (en, Base); mainGroup = G10000000000000000000001; productRefGroup = G10000000000000000000007; projectDirPath = ""; projectRoot = ""; targets = (T10000000000000000000001,T10000000000000000000002,T10000000000000000000003); };
+/* End PBXProject section */
+
+/* Begin PBXResourcesBuildPhase section */
+		R10000000000000000000001 = {isa = PBXResourcesBuildPhase; buildActionMask = 2147483647; files = (B10000000000000000000301,B10000000000000000000303); runOnlyForDeploymentPostprocessing = 0; };
+		R10000000000000000000002 = {isa = PBXResourcesBuildPhase; buildActionMask = 2147483647; files = (B10000000000000000000302,B10000000000000000000304); runOnlyForDeploymentPostprocessing = 0; };
+		R10000000000000000000003 = {isa = PBXResourcesBuildPhase; buildActionMask = 2147483647; files = (); runOnlyForDeploymentPostprocessing = 0; };
+/* End PBXResourcesBuildPhase section */
+
+/* Begin PBXSourcesBuildPhase section */
+		S10000000000000000000001 = {isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = (B10000000000000000000001,B10000000000000000000002,B10000000000000000000003,B10000000000000000000004,B10000000000000000000005,B10000000000000000000006,B10000000000000000000007,B10000000000000000000008,B10000000000000000000009,B1000000000000000000000A,B1000000000000000000000B,B1000000000000000000000C,B10000000000000000000011,B10000000000000000000012,B10000000000000000000013,B10000000000000000000014); runOnlyForDeploymentPostprocessing = 0; };
+		S10000000000000000000002 = {isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = (B10000000000000000000101,B10000000000000000000102,B10000000000000000000103,B10000000000000000000104,B10000000000000000000105,B10000000000000000000106,B10000000000000000000107,B10000000000000000000108,B10000000000000000000109,B1000000000000000000010A,B1000000000000000000010B,B1000000000000000000010C,B10000000000000000000111,B10000000000000000000112,B10000000000000000000113,B10000000000000000000114); runOnlyForDeploymentPostprocessing = 0; };
+		S10000000000000000000003 = {isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = (B10000000000000000000201,B10000000000000000000202,B10000000000000000000203,B10000000000000000000204,B10000000000000000000205,B10000000000000000000206,B10000000000000000000207); runOnlyForDeploymentPostprocessing = 0; };
+/* End PBXSourcesBuildPhase section */
+
+/* Begin PBXTargetDependency section */
+		D20000000000000000000001 = {isa = PBXTargetDependency; target = T10000000000000000000001; targetProxy = D10000000000000000000001; };
+		D20000000000000000000002 = {isa = PBXTargetDependency; target = T10000000000000000000002; targetProxy = D10000000000000000000002; };
+/* End PBXTargetDependency section */
+
+/* Begin XCBuildConfiguration section */
+		X10000000000000000000001 = {isa = XCBuildConfiguration; buildSettings = {CLANG_ENABLE_MODULES = YES; ENABLE_TESTABILITY = YES; SWIFT_OPTIMIZATION_LEVEL = "-Onone";}; name = Debug; };
+		X10000000000000000000002 = {isa = XCBuildConfiguration; buildSettings = {CLANG_ENABLE_MODULES = YES; SWIFT_COMPILATION_MODE = wholemodule; SWIFT_OPTIMIZATION_LEVEL = "-O";}; name = Release; };
+		X10000000000000000000011 = {isa = XCBuildConfiguration; baseConfigurationReference = F10000000000000000000041; buildSettings = {ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon; CODE_SIGN_ENTITLEMENTS = iOS/WiFiSecureCall.entitlements; GENERATE_INFOPLIST_FILE = NO; INFOPLIST_FILE = iOS/Info.plist; IPHONEOS_DEPLOYMENT_TARGET = 15.0; PRODUCT_BUNDLE_IDENTIFIER = com.vkapps.wifisecurecall; PRODUCT_MODULE_NAME = WiFiSecureCall; SDKROOT = iphoneos; SUPPORTED_PLATFORMS = "iphoneos iphonesimulator"; SUPPORTS_MACCATALYST = NO; TARGETED_DEVICE_FAMILY = 1;}; name = Debug; };
+		X10000000000000000000012 = {isa = XCBuildConfiguration; baseConfigurationReference = F10000000000000000000041; buildSettings = {ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon; CODE_SIGN_ENTITLEMENTS = iOS/WiFiSecureCall.entitlements; CODE_SIGN_IDENTITY = "Apple Distribution"; CODE_SIGN_STYLE = Manual; GENERATE_INFOPLIST_FILE = NO; INFOPLIST_FILE = iOS/Info.plist; IPHONEOS_DEPLOYMENT_TARGET = 15.0; PRODUCT_BUNDLE_IDENTIFIER = com.vkapps.wifisecurecall; PRODUCT_MODULE_NAME = WiFiSecureCall; PROVISIONING_PROFILE_SPECIFIER = WiFiSecureCallAppStore; SDKROOT = iphoneos; SUPPORTED_PLATFORMS = "iphoneos iphonesimulator"; SUPPORTS_MACCATALYST = NO; TARGETED_DEVICE_FAMILY = 1; VALIDATE_PRODUCT = YES;}; name = Release; };
+		X10000000000000000000021 = {isa = XCBuildConfiguration; baseConfigurationReference = F10000000000000000000041; buildSettings = {ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon; APPLICATION_EXTENSION_API_ONLY = YES; CODE_SIGN_ENTITLEMENTS = Watch/WiFiSecureCallWatch.entitlements; GENERATE_INFOPLIST_FILE = NO; INFOPLIST_FILE = Watch/Info.plist; PRODUCT_BUNDLE_IDENTIFIER = com.vkapps.wifisecurecall.watchkitapp; PRODUCT_NAME = WiFiSecureCallWatch; SDKROOT = watchos; SKIP_INSTALL = YES; SUPPORTED_PLATFORMS = "watchos watchsimulator"; SUPPORTS_RUNNING_WITHOUT_IOS_APP = YES; TARGETED_DEVICE_FAMILY = 4; WATCHOS_DEPLOYMENT_TARGET = 9.2; WK_COMPANION_APP_BUNDLE_IDENTIFIER = com.vkapps.wifisecurecall;}; name = Debug; };
+		X10000000000000000000022 = {isa = XCBuildConfiguration; baseConfigurationReference = F10000000000000000000041; buildSettings = {ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon; APPLICATION_EXTENSION_API_ONLY = YES; CODE_SIGN_ENTITLEMENTS = Watch/WiFiSecureCallWatch.entitlements; CODE_SIGN_IDENTITY = "Apple Distribution"; CODE_SIGN_STYLE = Manual; GENERATE_INFOPLIST_FILE = NO; INFOPLIST_FILE = Watch/Info.plist; PRODUCT_BUNDLE_IDENTIFIER = com.vkapps.wifisecurecall.watchkitapp; PRODUCT_NAME = WiFiSecureCallWatch; PROVISIONING_PROFILE_SPECIFIER = WiFiSecureCallWatchAppStore; SDKROOT = watchos; SKIP_INSTALL = YES; SUPPORTED_PLATFORMS = "watchos watchsimulator"; SUPPORTS_RUNNING_WITHOUT_IOS_APP = YES; TARGETED_DEVICE_FAMILY = 4; VALIDATE_PRODUCT = YES; WATCHOS_DEPLOYMENT_TARGET = 9.2; WK_COMPANION_APP_BUNDLE_IDENTIFIER = com.vkapps.wifisecurecall;}; name = Release; };
+		X10000000000000000000031 = {isa = XCBuildConfiguration; baseConfigurationReference = F10000000000000000000041; buildSettings = {GENERATE_INFOPLIST_FILE = YES; IPHONEOS_DEPLOYMENT_TARGET = 15.0; PRODUCT_BUNDLE_IDENTIFIER = com.vkapps.wifisecurecall.tests; PRODUCT_NAME = WiFiSecureCallTests; SDKROOT = iphoneos; TARGETED_DEVICE_FAMILY = 1;}; name = Debug; };
+		X10000000000000000000032 = {isa = XCBuildConfiguration; baseConfigurationReference = F10000000000000000000041; buildSettings = {GENERATE_INFOPLIST_FILE = YES; IPHONEOS_DEPLOYMENT_TARGET = 15.0; PRODUCT_BUNDLE_IDENTIFIER = com.vkapps.wifisecurecall.tests; PRODUCT_NAME = WiFiSecureCallTests; SDKROOT = iphoneos; TARGETED_DEVICE_FAMILY = 1;}; name = Release; };
+/* End XCBuildConfiguration section */
+
+/* Begin XCConfigurationList section */
+		L10000000000000000000000 = {isa = XCConfigurationList; buildConfigurations = (X10000000000000000000001,X10000000000000000000002); defaultConfigurationIsVisible = 0; defaultConfigurationName = Release; };
+		L10000000000000000000001 = {isa = XCConfigurationList; buildConfigurations = (X10000000000000000000011,X10000000000000000000012); defaultConfigurationIsVisible = 0; defaultConfigurationName = Release; };
+		L10000000000000000000002 = {isa = XCConfigurationList; buildConfigurations = (X10000000000000000000021,X10000000000000000000022); defaultConfigurationIsVisible = 0; defaultConfigurationName = Release; };
+		L10000000000000000000003 = {isa = XCConfigurationList; buildConfigurations = (X10000000000000000000031,X10000000000000000000032); defaultConfigurationIsVisible = 0; defaultConfigurationName = Release; };
+/* End XCConfigurationList section */
+	};
+	rootObject = P10000000000000000000001;
+}

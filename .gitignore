@@ -1,0 +1,11 @@
+Config/Secrets.xcconfig
+*.p8
+.env
+secrets/
+DerivedData/
+xcuserdata/
+archives/
+exports/
+*.xcresult
+.DS_Store
+

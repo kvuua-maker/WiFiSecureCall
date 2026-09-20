@@ -1,0 +1,17 @@
+import Foundation
+
+enum CallFailure: String, Codable, Error, Equatable, Sendable {
+    case permissionDenied
+    case serverUnavailable
+    case callExpired
+    case callRejected
+    case callCancelled
+    case callKitRejected
+    case audioActivationTimeout
+    case audioFailed
+    case mediaConnectionFailed
+    case networkLost
+    case invalidServerState
+    case notificationUnavailable
+}
+

@@ -1,0 +1,11 @@
+PRODUCT_NAME = WiFi Secure Call
+MARKETING_VERSION = 0.1.0
+CURRENT_PROJECT_VERSION = 1
+DEVELOPMENT_TEAM = 9V5XXDXF3N
+CODE_SIGN_STYLE = Automatic
+SWIFT_VERSION = 5.0
+ENABLE_USER_SCRIPT_SANDBOXING = YES
+API_BASE_URL = https:/$()/178.105.32.46/wifi-secure-call/v1
+MEDIA_BASE_URL = wss:/$()/178.105.32.46/wifi-secure-call/media
+#include? "Secrets.xcconfig"
+
