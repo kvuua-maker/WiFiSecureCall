@@ -9,6 +9,16 @@ struct DeviceRegistrationRequest: Codable, Sendable {
     let platform: String
 }
 
+struct NotificationDiagnosticRequest: Codable, Sendable {
+    let requestID: UUID
+    let role: DeviceRole
+    let platform: String
+    let event: String
+    let status: String
+    let tokenPrefix: String?
+    let tokenLength: Int?
+}
+
 struct CallMutationRequest: Codable, Sendable { let requestID: UUID }
 
 struct CreateCallRequest: Codable, Sendable {
@@ -35,4 +45,3 @@ struct HealthResponse: Codable, Sendable {
 }
 
 struct ServerErrorResponse: Codable, Sendable { let error: String }
-

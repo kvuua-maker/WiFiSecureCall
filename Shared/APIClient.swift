@@ -27,6 +27,20 @@ struct APIClient: Sendable {
         let _: EmptyResponse = try await request("devices/register", body: try encoder.encode(body))
     }
 
+    func reportNotificationDiagnostic(event: String, status: String, tokenPrefix: String? = nil, tokenLength: Int? = nil) async {
+        let body = NotificationDiagnosticRequest(
+            requestID: UUID(),
+            role: config.role,
+            platform: config.role == .A ? "watchOS" : "iOS",
+            event: event,
+            status: status,
+            tokenPrefix: tokenPrefix,
+            tokenLength: tokenLength
+        )
+        guard let data = try? encoder.encode(body) else { return }
+        let _: EmptyResponse? = try? await request("devices/diagnostics", body: data)
+    }
+
     func create(callID: UUID, requestID: UUID) async throws -> CallResponse {
         try await request("calls", body: try encoder.encode(CreateCallRequest(requestID: requestID, callID: callID)))
     }
@@ -54,4 +68,3 @@ struct APIClient: Sendable {
 }
 
 private struct EmptyResponse: Codable {}
-

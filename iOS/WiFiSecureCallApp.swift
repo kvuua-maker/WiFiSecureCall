@@ -7,14 +7,12 @@ struct WiFiSecureCallApp: App {
 
     init() {
         let config = AppConfig.load()
-        let api = APIClient(config: config)
+        let api = NotificationRuntime.shared.api
         let callSession = CallSession(config: config, api: api)
         callSession.attach(callKit: IOSCallKitAdapter())
         NotificationRuntime.shared.callSession = callSession
-        NotificationRuntime.shared.api = api
         _session = StateObject(wrappedValue: callSession)
     }
 
     var body: some Scene { WindowGroup { IOSRootView(session: session) } }
 }
-

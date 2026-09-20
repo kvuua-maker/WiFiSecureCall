@@ -4,7 +4,9 @@ import Foundation
 final class NotificationRuntime {
     static let shared = NotificationRuntime()
     weak var callSession: CallSession?
-    var api: APIClient?
-    private init() {}
-}
+    let api: APIClient
 
+    private init() {
+        api = APIClient(config: AppConfig.load())
+    }
+}

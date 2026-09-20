@@ -66,4 +66,34 @@ final class WiFiSecureCallTests: XCTestCase {
         XCTAssertTrue(CallState.failed(nil, .networkLost).isTerminal)
         XCTAssertFalse(CallState.active(UUID()).isTerminal)
     }
+
+    @MainActor
+    func testCallSessionRetainsCallKitAdapter() {
+        let config = AppConfig(
+            apiBaseURL: URL(string: "https://example.invalid/v1")!,
+            mediaURL: URL(string: "wss://example.invalid/media")!,
+            role: .B,
+            bearerToken: String(repeating: "a", count: 64)
+        )
+        let session = CallSession(config: config)
+        var adapter: RetainedCallKitMock? = RetainedCallKitMock()
+        weak var retained = adapter
+        session.attach(callKit: adapter!)
+        adapter = nil
+        XCTAssertNotNil(retained)
+    }
+}
+
+@MainActor
+private final class RetainedCallKitMock: CallKitHandling {
+    var onStartApproved: ((UUID) -> Void)?
+    var onAnswerApproved: ((UUID) -> Void)?
+    var onEndApproved: ((UUID) -> Void)?
+    var onAudioActivated: (() -> Void)?
+    var onAudioDeactivated: (() -> Void)?
+    func startOutgoing(id: UUID) async throws {}
+    func reportIncoming(id: UUID) async throws {}
+    func requestAnswer(id: UUID) async throws {}
+    func requestEnd(id: UUID) async throws {}
+    func reportEnded(id: UUID) {}
 }

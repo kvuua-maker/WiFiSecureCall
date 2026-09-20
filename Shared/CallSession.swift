@@ -25,7 +25,7 @@ final class CallSession: ObservableObject {
     private let audio: AudioEngine
     private let media: MediaTransport
     private let diagnostics = Diagnostics.shared
-    private weak var callKit: CallKitHandling?
+    private var callKit: CallKitHandling?
     private var pollingTask: Task<Void, Never>?
     private var reconnectTask: Task<Void, Never>?
     private var watchdogTask: Task<Void, Never>?
@@ -229,4 +229,3 @@ final class CallSession: ObservableObject {
         }
     }
 }
-
