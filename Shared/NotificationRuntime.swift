@@ -3,11 +3,20 @@ import Foundation
 @MainActor
 final class NotificationRuntime {
     static let shared = NotificationRuntime()
-    weak var callSession: CallSession?
+    private(set) var callSession: CallSession?
     let api: APIClient
 
     private init() {
         api = APIClient(config: AppConfig.load())
+    }
+
+    @discardableResult
+    func install(callKit: CallKitHandling) -> CallSession {
+        if let callSession { return callSession }
+        let session = CallSession(config: AppConfig.load(), api: api)
+        session.attach(callKit: callKit)
+        callSession = session
+        return session
     }
 }
 

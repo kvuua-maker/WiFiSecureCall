@@ -30,6 +30,7 @@ enum CallState: Equatable, Sendable {
 enum CallStateTransition {
     static func isLegal(from: CallState, to: CallState) -> Bool {
         if from == to { return true }
+        if let fromID = from.callID, let toID = to.callID, fromID != toID { return false }
         switch (from, to) {
         case (.idle, .outgoingRinging), (.idle, .incomingRinging),
              (.outgoingRinging, .connecting), (.outgoingRinging, .ending),
@@ -39,11 +40,12 @@ enum CallStateTransition {
              (.reconnecting, .active), (.reconnecting, .ending),
              (.ending, .ended), (.ended, .idle), (.failed, .idle):
             return true
-        case (_, .failed):
-            return !from.isTerminal
+        case (.idle, .failed(nil, _)):
+            return true
+        case (_, .failed(let id, _)):
+            return !from.isTerminal && id == from.callID
         default:
             return false
         }
     }
 }
-

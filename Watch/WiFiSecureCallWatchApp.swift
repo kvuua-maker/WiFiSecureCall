@@ -6,11 +6,7 @@ struct WiFiSecureCallWatchApp: App {
     @StateObject private var session: CallSession
 
     init() {
-        let config = AppConfig.load()
-        let api = NotificationRuntime.shared.api
-        let callSession = CallSession(config: config, api: api)
-        callSession.attach(callKit: WatchCallKitAdapter())
-        NotificationRuntime.shared.callSession = callSession
+        let callSession = NotificationRuntime.shared.install(callKit: WatchCallKitAdapter())
         _session = StateObject(wrappedValue: callSession)
     }
     var body: some Scene { WindowGroup { WatchRootView(session: session) } }

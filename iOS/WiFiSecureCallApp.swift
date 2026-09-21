@@ -6,11 +6,7 @@ struct WiFiSecureCallApp: App {
     @StateObject private var session: CallSession
 
     init() {
-        let config = AppConfig.load()
-        let api = NotificationRuntime.shared.api
-        let callSession = CallSession(config: config, api: api)
-        callSession.attach(callKit: IOSCallKitAdapter())
-        NotificationRuntime.shared.callSession = callSession
+        let callSession = NotificationRuntime.shared.install(callKit: IOSCallKitAdapter())
         _session = StateObject(wrappedValue: callSession)
     }
 

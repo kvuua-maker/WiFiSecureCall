@@ -30,9 +30,9 @@ struct WatchRootView: View {
             HStack { Button("Reject", role: .destructive) { Task { await session.reject() } }; Button("Accept") { Task { await session.accept() } } }
         case .active:
             HStack { Button(session.isMuted ? "Unmute" : "Mute") { session.toggleMute() }; Button("End", role: .destructive) { Task { await session.endCall() } } }
-        case .connecting, .reconnecting, .ending: ProgressView()
+        case .connecting, .reconnecting: VStack { ProgressView(); Button("End", role: .destructive) { Task { await session.endCall() } } }
+        case .ending: ProgressView()
         case .ended, .failed: Button("Done") { session.reset() }
         }
     }
 }
-

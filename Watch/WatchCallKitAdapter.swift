@@ -6,12 +6,15 @@ import Foundation
 final class WatchCallKitAdapter: NSObject, CallKitHandling, CXProviderDelegate {
     var onPrepareAudio: (() throws -> Void)?
     var onActionFailed: ((UUID, String, Error) -> Void)?
-    var onStartApproved: ((UUID) -> Void)?
-    var onAnswerApproved: ((UUID) -> Void)?
-    var onEndApproved: ((UUID) -> Void)?
+    var onStartRequested: ((UUID, Date) async throws -> Void)?
+    var onAnswerRequested: ((UUID, Date) async throws -> Void)?
+    var onEndRequested: ((UUID, Date) async throws -> Void)?
+    var onMutedRequested: ((UUID, Bool) throws -> Void)?
+    var onActionTimedOut: ((UUID, String) -> Void)?
     var onAudioActivated: ((UUID) -> Void)?
     var onAudioDeactivated: ((UUID?) -> Void)?
     var onProviderReset: ((UUID?) -> Void)?
+
     private let provider: CXProvider
     private let controller = CXCallController()
     private var currentCallUUID: UUID?
@@ -20,59 +23,50 @@ final class WatchCallKitAdapter: NSObject, CallKitHandling, CXProviderDelegate {
 
     override init() {
         provider = CXProvider(configuration: Self.configuration())
-        super.init(); provider.setDelegate(self, queue: .main)
+        super.init()
+        provider.setDelegate(self, queue: .main)
     }
 
-    func startOutgoing(id: UUID) async throws { provider.configuration = Self.configuration(); currentCallUUID = id; try await request(CXStartCallAction(call: id, handle: CXHandle(type: .generic, value: "Wi-Fi call"))) }
+    func startOutgoing(id: UUID) async throws { provider.configuration = Self.configuration(); try await request(CXStartCallAction(call: id, handle: CXHandle(type: .generic, value: "Wi-Fi call"))); currentCallUUID = id }
     func reportIncoming(id: UUID) async throws {
-        provider.configuration = Self.configuration(); currentCallUUID = id
-        let update = CXCallUpdate(); update.localizedCallerName = "Incoming Wi-Fi call"; update.remoteHandle = CXHandle(type: .generic, value: "Wi-Fi call"); update.hasVideo = false
-        try await withCheckedThrowingContinuation { continuation in provider.reportNewIncomingCall(with: id, update: update) { error in error.map { continuation.resume(throwing: $0) } ?? continuation.resume(returning: ()) } }
+        provider.configuration = Self.configuration()
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+            provider.reportNewIncomingCall(with: id, update: Self.callUpdate()) { error in
+                if let error { continuation.resume(throwing: error) } else { continuation.resume(returning: ()) }
+            }
+        }
+        currentCallUUID = id
     }
     func requestAnswer(id: UUID) async throws { try await request(CXAnswerCallAction(call: id)) }
     func requestEnd(id: UUID) async throws { try await request(CXEndCallAction(call: id)) }
+    func requestSetMuted(id: UUID, muted: Bool) async throws { try await request(CXSetMutedCallAction(call: id, muted: muted)) }
     func reportOutgoingStartedConnecting(id: UUID) { provider.reportOutgoingCall(with: id, startedConnectingAt: Date()) }
     func reportOutgoingConnected(id: UUID) { provider.reportOutgoingCall(with: id, connectedAt: Date()) }
-    func reportEnded(id: UUID) { provider.reportCall(with: id, endedAt: Date(), reason: .remoteEnded); if currentCallUUID == id { currentCallUUID = nil }; if pendingAudioCallUUID == id { pendingAudioCallUUID = nil }; if activatedAudioCallUUID == id { activatedAudioCallUUID = nil } }
-    private func request(_ action: CXAction) async throws { try await withCheckedThrowingContinuation { continuation in controller.request(CXTransaction(action: action)) { error in error.map { continuation.resume(throwing: $0) } ?? continuation.resume(returning: ()) } } }
+    func reportEnded(id: UUID, reason: CallEndReason) { provider.reportCall(with: id, endedAt: Date(), reason: Self.cxReason(reason)); clear(id) }
+    private func request(_ action: CXAction) async throws { try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in controller.request(CXTransaction(action: action)) { error in if let error { continuation.resume(throwing: error) } else { continuation.resume(returning: ()) } } } }
 
     private static func configuration() -> CXProviderConfiguration {
         let configuration = CXProviderConfiguration()
-        configuration.supportsVideo = false
-        configuration.maximumCallGroups = 1
-        configuration.maximumCallsPerCallGroup = 1
-        configuration.supportedHandleTypes = [.generic]
+        configuration.supportsVideo = false; configuration.maximumCallGroups = 1; configuration.maximumCallsPerCallGroup = 1; configuration.supportedHandleTypes = [.generic]
         return configuration
     }
+    private static func callUpdate() -> CXCallUpdate {
+        let update = CXCallUpdate(); update.localizedCallerName = "Incoming Wi-Fi call"; update.remoteHandle = CXHandle(type: .generic, value: "Wi-Fi call"); update.hasVideo = false
+        update.supportsHolding = false; update.supportsGrouping = false; update.supportsUngrouping = false; update.supportsDTMF = false
+        return update
+    }
+    private static func cxReason(_ reason: CallEndReason) -> CXCallEndedReason {
+        switch reason { case .remoteEnded: return .remoteEnded; case .failed: return .failed; case .unanswered: return .unanswered; case .declined: return .declinedElsewhere; case .localEnded: return .remoteEnded }
+    }
+    private func clear(_ id: UUID) { if currentCallUUID == id { currentCallUUID = nil }; if pendingAudioCallUUID == id { pendingAudioCallUUID = nil }; if activatedAudioCallUUID == id { activatedAudioCallUUID = nil } }
+    private func perform(_ action: CXCallAction, stage: String, operation: @escaping (UUID, Date) async throws -> Void) async { do { try await operation(action.callUUID, action.timeoutDate); guard !action.isComplete else { return }; action.fulfill() } catch { if !action.isComplete { action.fail() }; onActionFailed?(action.callUUID, stage, error) } }
 
     nonisolated func providerDidReset(_ provider: CXProvider) { Task { @MainActor in let id = currentCallUUID ?? activatedAudioCallUUID ?? pendingAudioCallUUID; currentCallUUID = nil; pendingAudioCallUUID = nil; activatedAudioCallUUID = nil; onProviderReset?(id) } }
-    nonisolated func provider(_ provider: CXProvider, perform action: CXStartCallAction) {
-        Task { @MainActor in
-            do {
-                try onPrepareAudio?()
-                pendingAudioCallUUID = action.callUUID; currentCallUUID = action.callUUID
-                onStartApproved?(action.callUUID)
-                action.fulfill()
-            } catch {
-                action.fail()
-                onActionFailed?(action.callUUID, "prepareStart", error)
-            }
-        }
-    }
-    nonisolated func provider(_ provider: CXProvider, perform action: CXAnswerCallAction) {
-        Task { @MainActor in
-            do {
-                try onPrepareAudio?()
-                pendingAudioCallUUID = action.callUUID; currentCallUUID = action.callUUID
-                onAnswerApproved?(action.callUUID)
-                action.fulfill()
-            } catch {
-                action.fail()
-                onActionFailed?(action.callUUID, "prepareAnswer", error)
-            }
-        }
-    }
-    nonisolated func provider(_ provider: CXProvider, perform action: CXEndCallAction) { Task { @MainActor in onEndApproved?(action.callUUID); action.fulfill() } }
+    nonisolated func provider(_ provider: CXProvider, perform action: CXStartCallAction) { Task { @MainActor in await self.perform(action, stage: "start") { [self] id, deadline in try self.onPrepareAudio?(); guard let handler = self.onStartRequested else { throw CallKitCoordinatorError.missingCoordinator }; self.pendingAudioCallUUID = id; self.currentCallUUID = id; try await handler(id, deadline) } } }
+    nonisolated func provider(_ provider: CXProvider, perform action: CXAnswerCallAction) { Task { @MainActor in await self.perform(action, stage: "answer") { [self] id, deadline in try self.onPrepareAudio?(); guard let handler = self.onAnswerRequested else { throw CallKitCoordinatorError.missingCoordinator }; self.pendingAudioCallUUID = id; self.currentCallUUID = id; try await handler(id, deadline) } } }
+    nonisolated func provider(_ provider: CXProvider, perform action: CXEndCallAction) { Task { @MainActor in await self.perform(action, stage: "end") { [self] id, deadline in guard let handler = self.onEndRequested else { throw CallKitCoordinatorError.missingCoordinator }; try await handler(id, deadline) } } }
+    nonisolated func provider(_ provider: CXProvider, perform action: CXSetMutedCallAction) { Task { @MainActor in do { guard let handler = onMutedRequested else { throw CallKitCoordinatorError.missingCoordinator }; try handler(action.callUUID, action.isMuted); if !action.isComplete { action.fulfill() } } catch { if !action.isComplete { action.fail() }; onActionFailed?(action.callUUID, "mute", error) } } }
+    nonisolated func provider(_ provider: CXProvider, timedOutPerforming action: CXAction) { Task { @MainActor in onActionTimedOut?((action as? CXCallAction)?.callUUID ?? action.uuid, String(describing: type(of: action))) } }
     nonisolated func provider(_ provider: CXProvider, didActivate audioSession: AVAudioSession) { Task { @MainActor in guard let id = pendingAudioCallUUID ?? currentCallUUID else { return }; activatedAudioCallUUID = id; pendingAudioCallUUID = nil; onAudioActivated?(id) } }
     nonisolated func provider(_ provider: CXProvider, didDeactivate audioSession: AVAudioSession) { Task { @MainActor in let id = activatedAudioCallUUID; activatedAudioCallUUID = nil; onAudioDeactivated?(id) } }
 }

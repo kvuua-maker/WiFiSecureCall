@@ -29,7 +29,12 @@ struct AudioPacket: Equatable, Sendable {
         let uuid = UUID(uuid: (uuidBytes[0], uuidBytes[1], uuidBytes[2], uuidBytes[3], uuidBytes[4], uuidBytes[5], uuidBytes[6], uuidBytes[7], uuidBytes[8], uuidBytes[9], uuidBytes[10], uuidBytes[11], uuidBytes[12], uuidBytes[13], uuidBytes[14], uuidBytes[15]))
         let sequence = data[18..<26].reduce(UInt64(0)) { ($0 << 8) | UInt64($1) }
         let timestamp = data[26..<34].reduce(UInt64(0)) { ($0 << 8) | UInt64($1) }
-        return AudioPacket(type: type, callID: uuid, sequence: sequence, timestampMicroseconds: timestamp, payload: Data(data.dropFirst(headerSize)))
+        let payload = Data(data.dropFirst(headerSize))
+        switch type {
+        case .audio: guard payload.count == AudioEngine.bytesPerFrame else { return nil }
+        case .end, .ping: guard payload.isEmpty else { return nil }
+        }
+        return AudioPacket(type: type, callID: uuid, sequence: sequence, timestampMicroseconds: timestamp, payload: payload)
     }
 }
 
@@ -37,23 +42,36 @@ struct JitterBuffer: Sendable {
     private(set) var packets: [UInt64: AudioPacket] = [:]
     private(set) var nextSequence: UInt64?
     let maximumFrames: Int
+    private let initialFrames: Int
+    private var started = false
+    private var consecutiveMisses = 0
 
     init(initialMilliseconds: Int = 60, maximumMilliseconds: Int = 120) {
         let boundedInitial = min(max(initialMilliseconds, 40), 120)
-        self.maximumFrames = max(boundedInitial / 20, maximumMilliseconds / 20)
+        self.initialFrames = max(2, boundedInitial / 20)
+        self.maximumFrames = max(initialFrames, maximumMilliseconds / 20)
     }
 
     mutating func insert(_ packet: AudioPacket) {
         guard packet.type == .audio else { return }
         if nextSequence == nil { nextSequence = packet.sequence }
+        if let nextSequence, packet.sequence &+ UInt64(maximumFrames * 4) < nextSequence { return }
         packets[packet.sequence] = packet
         while packets.count > maximumFrames, let oldest = packets.keys.min() { packets.removeValue(forKey: oldest) }
     }
 
-    mutating func pop() -> AudioPacket? {
+    mutating func nextPayload() -> Data? {
+        guard started || packets.count >= initialFrames else { return nil }
+        started = true
         guard let sequence = nextSequence else { return nil }
-        nextSequence = sequence &+ 1
-        return packets.removeValue(forKey: sequence)
+        if let packet = packets.removeValue(forKey: sequence) {
+            nextSequence = sequence &+ 1; consecutiveMisses = 0; return packet.payload
+        }
+        consecutiveMisses += 1
+        if consecutiveMisses >= maximumFrames, let lowest = packets.keys.min() { nextSequence = lowest; consecutiveMisses = 0 }
+        else { nextSequence = sequence &+ 1 }
+        return Data(repeating: 0, count: AudioEngine.bytesPerFrame)
     }
-}
 
+    mutating func resetForReconnect() { packets.removeAll(keepingCapacity: true); nextSequence = nil; started = false; consecutiveMisses = 0 }
+}
