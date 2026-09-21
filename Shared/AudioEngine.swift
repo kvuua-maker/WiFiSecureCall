@@ -19,29 +19,29 @@ protocol AudioEngineHandling: AnyObject {
     func play(_ payload: Data)
 }
 
-struct InputTapLifecycle {
+struct CaptureSourceLifecycle {
     private(set) var isInstalled = false
 
     mutating func install(
-        installTap: () -> Void,
+        installSource: () -> Void,
         startEngine: () throws -> Void,
-        removeTap: () -> Void
+        removeSource: () -> Void
     ) throws {
         guard !isInstalled else { throw CallFailure.audioFailed }
-        installTap()
+        installSource()
         isInstalled = true
         do {
             try startEngine()
         } catch {
-            removeTap()
+            removeSource()
             isInstalled = false
             throw error
         }
     }
 
-    mutating func remove(_ removeTap: () -> Void) {
+    mutating func remove(_ removeSource: () -> Void) {
         guard isInstalled else { return }
-        removeTap()
+        removeSource()
         isInstalled = false
     }
 }
@@ -61,10 +61,12 @@ final class AudioEngine: AudioEngineHandling, @unchecked Sendable {
     private var inputConverter: AVAudioConverter?
     private var outputConverter: AVAudioConverter?
     private var networkFormat: AVAudioFormat?
-    private var tapLifecycle = InputTapLifecycle()
+    private var captureSink: AVAudioSinkNode?
+    private var captureLifecycle = CaptureSourceLifecycle()
     private var starting = false
     private var firstMicBufferReported = false
     private var firstNetworkFrameReported = false
+    private var firstCaptureFailureReported = false
     private var firstPlaybackReported = false
     private var firstPlaybackFailureReported = false
 
@@ -76,14 +78,19 @@ final class AudioEngine: AudioEngineHandling, @unchecked Sendable {
         let session = AVAudioSession.sharedInstance()
         switch session.recordPermission {
         case .granted:
+            emit("microphone_permission", "granted")
             return true
         case .denied:
+            emit("microphone_permission", "denied")
             return false
         case .undetermined:
-            return await withCheckedContinuation { continuation in
+            let granted = await withCheckedContinuation { continuation in
                 session.requestRecordPermission { continuation.resume(returning: $0) }
             }
+            emit("microphone_permission", granted ? "requested_granted" : "requested_denied")
+            return granted
         @unknown default:
+            emit("microphone_permission", "unknown")
             return false
         }
     }
@@ -93,7 +100,7 @@ final class AudioEngine: AudioEngineHandling, @unchecked Sendable {
         #if os(watchOS)
         try session.setCategory(.playAndRecord, mode: .voiceChat, options: [])
         #else
-        try session.setCategory(.playAndRecord, mode: .voiceChat, options: [.allowBluetooth, .defaultToSpeaker])
+        try session.setCategory(.playAndRecord, mode: .voiceChat, options: [.allowBluetoothHFP, .defaultToSpeaker])
         #endif
         emit("audio_session_configured", "success")
     }
@@ -133,23 +140,41 @@ final class AudioEngine: AudioEngineHandling, @unchecked Sendable {
             let playbackConverter = AVAudioConverter(from: network, to: outputFormat)
             else { throw CallFailure.audioFailed }
 
+            captureConverter.primeMethod = .none
+            playbackConverter.primeMethod = .none
+
             networkFormat = network
             inputConverter = captureConverter
             outputConverter = playbackConverter
             engine.connect(player, to: engine.mainMixerNode, format: outputFormat)
-            try tapLifecycle.install(
-                installTap: { [weak self] in
-                    input.installTap(onBus: 0, bufferSize: 1024, format: inputFormat) { [weak self] buffer, _ in
-                        self?.capture(buffer, converter: captureConverter)
+            player.volume = 1
+            engine.mainMixerNode.outputVolume = 1
+
+            let sink = AVAudioSinkNode { [weak self] _, frameCount, inputData in
+                self?.capture(frameCount: frameCount, inputData: inputData, format: inputFormat, converter: captureConverter)
+                return noErr
+            }
+            captureSink = sink
+            do {
+                try captureLifecycle.install(
+                    installSource: { [engine] in
+                        engine.attach(sink)
+                        engine.connect(input, to: sink, format: inputFormat)
+                    },
+                    startEngine: { [engine] in
+                        engine.prepare()
+                        try engine.start()
+                    },
+                    removeSource: { [engine] in
+                        engine.disconnectNodeInput(sink)
+                        engine.detach(sink)
                     }
-                    self?.firstMicBufferReported = false
-                },
-                startEngine: { [engine] in
-                    engine.prepare()
-                    try engine.start()
-                },
-                removeTap: { input.removeTap(onBus: 0) }
-            )
+                )
+            } catch {
+                captureSink = nil
+                throw error
+            }
+            emit("capture_source_connected", "av_audio_sink_node")
             player.play()
             starting = false
             emit("audio_engine_start_success", "success")
@@ -195,7 +220,7 @@ final class AudioEngine: AudioEngineHandling, @unchecked Sendable {
         var supplied = false
         var conversionError: NSError?
         let status = outputConverter.convert(to: converted, error: &conversionError) { _, status in
-            if supplied { status.pointee = .endOfStream; return nil }
+            if supplied { status.pointee = .noDataNow; return nil }
             supplied = true; status.pointee = .haveData; return source
         }
         guard status != .error, conversionError == nil, converted.frameLength > 0 else {
@@ -210,8 +235,22 @@ final class AudioEngine: AudioEngineHandling, @unchecked Sendable {
         }
     }
 
-    private func capture(_ buffer: AVAudioPCMBuffer, converter: AVAudioConverter) {
-        guard buffer.format.sampleRate > 0, buffer.format.channelCount > 0 else { return }
+    private func capture(
+        frameCount: AVAudioFrameCount,
+        inputData: UnsafePointer<AudioBufferList>,
+        format: AVAudioFormat,
+        converter: AVAudioConverter
+    ) {
+        guard frameCount > 0,
+              let buffer = Self.copyInput(frameCount: frameCount, inputData: inputData, format: format)
+        else {
+            reportCaptureFailure(NSError(domain: "WiFiSecureCall.AudioEngine", code: 10))
+            return
+        }
+        guard buffer.format.sampleRate > 0, buffer.format.channelCount > 0 else {
+            reportCaptureFailure(NSError(domain: "WiFiSecureCall.AudioEngine", code: 11))
+            return
+        }
         if !firstMicBufferReported {
             firstMicBufferReported = true
             emit(
@@ -219,19 +258,10 @@ final class AudioEngine: AudioEngineHandling, @unchecked Sendable {
                 "frameLength=\(buffer.frameLength) sampleRate=\(buffer.format.sampleRate) channelCount=\(buffer.format.channelCount)"
             )
         }
-        let capacity = AVAudioFrameCount(Double(buffer.frameLength) * Self.networkSampleRate / buffer.format.sampleRate) + 8
-        guard capacity > 0,
-              let destination = AVAudioPCMBuffer(pcmFormat: converter.outputFormat, frameCapacity: capacity)
-        else { return }
-        var supplied = false
-        var error: NSError?
-        let status = converter.convert(to: destination, error: &error) { _, status in
-            if supplied { status.pointee = .endOfStream; return nil }
-            supplied = true; status.pointee = .haveData; return buffer
+        guard var data = Self.convertToNetworkPCM(buffer, converter: converter) else {
+            reportCaptureFailure(NSError(domain: "WiFiSecureCall.AudioEngine", code: 12))
+            return
         }
-        guard status != .error, error == nil, destination.frameLength > 0,
-              let channel = destination.int16ChannelData?[0] else { return }
-        var data = Data(bytes: channel, count: Int(destination.frameLength) * MemoryLayout<Int16>.size)
         queue.async { [weak self] in
             guard let self else { return }
             if self.muted { data.resetBytes(in: 0..<data.count) }
@@ -248,11 +278,56 @@ final class AudioEngine: AudioEngineHandling, @unchecked Sendable {
         }
     }
 
+    static func convertToNetworkPCM(_ buffer: AVAudioPCMBuffer, converter: AVAudioConverter) -> Data? {
+        guard buffer.format.sampleRate > 0, buffer.format.channelCount > 0 else { return nil }
+        let capacity = AVAudioFrameCount(Double(buffer.frameLength) * networkSampleRate / buffer.format.sampleRate) + 8
+        guard capacity > 0,
+              let destination = AVAudioPCMBuffer(pcmFormat: converter.outputFormat, frameCapacity: capacity)
+        else { return nil }
+        var supplied = false
+        var error: NSError?
+        let status = converter.convert(to: destination, error: &error) { _, status in
+            if supplied { status.pointee = .noDataNow; return nil }
+            supplied = true
+            status.pointee = .haveData
+            return buffer
+        }
+        guard status != .error, error == nil, destination.frameLength > 0,
+              let channel = destination.int16ChannelData?[0]
+        else { return nil }
+        return Data(bytes: channel, count: Int(destination.frameLength) * MemoryLayout<Int16>.size)
+    }
+
+    private static func copyInput(
+        frameCount: AVAudioFrameCount,
+        inputData: UnsafePointer<AudioBufferList>,
+        format: AVAudioFormat
+    ) -> AVAudioPCMBuffer? {
+        guard let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: frameCount) else { return nil }
+        buffer.frameLength = frameCount
+        let source = UnsafeMutableAudioBufferListPointer(UnsafeMutablePointer(mutating: inputData))
+        let destination = UnsafeMutableAudioBufferListPointer(buffer.mutableAudioBufferList)
+        guard source.count == destination.count else { return nil }
+        for index in source.indices {
+            guard let sourceData = source[index].mData, let destinationData = destination[index].mData else { return nil }
+            let byteCount = min(Int(source[index].mDataByteSize), Int(destination[index].mDataByteSize))
+            guard byteCount > 0 else { return nil }
+            memcpy(destinationData, sourceData, byteCount)
+            destination[index].mDataByteSize = UInt32(byteCount)
+        }
+        return buffer
+    }
+
     private func cleanupGraph() {
-        let input = engine.inputNode
-        tapLifecycle.remove { input.removeTap(onBus: 0) }
         player.stop()
         if engine.isRunning { engine.stop() }
+        let sink = captureSink
+        captureLifecycle.remove { [engine] in
+            guard let sink else { return }
+            engine.disconnectNodeInput(sink)
+            engine.detach(sink)
+        }
+        captureSink = nil
         engine.disconnectNodeOutput(player)
         engine.reset()
         inputConverter = nil
@@ -275,6 +350,7 @@ final class AudioEngine: AudioEngineHandling, @unchecked Sendable {
     private func resetFirstEventFlags() {
         firstMicBufferReported = false
         firstNetworkFrameReported = false
+        firstCaptureFailureReported = false
         firstPlaybackReported = false
         firstPlaybackFailureReported = false
     }
@@ -283,6 +359,12 @@ final class AudioEngine: AudioEngineHandling, @unchecked Sendable {
         guard !firstPlaybackFailureReported else { return }
         firstPlaybackFailureReported = true
         emit("first_playback_failure", "failed", error: error)
+    }
+
+    private func reportCaptureFailure(_ error: NSError) {
+        guard !firstCaptureFailureReported else { return }
+        firstCaptureFailureReported = true
+        emit("first_capture_conversion_failure", "failed", error: error)
     }
 
     private func emit(_ event: String, _ status: String, error: NSError? = nil) {

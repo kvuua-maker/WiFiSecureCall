@@ -1,3 +1,4 @@
+import AVFoundation
 import XCTest
 
 final class WiFiSecureCallTests: XCTestCase {
@@ -67,27 +68,42 @@ final class WiFiSecureCallTests: XCTestCase {
         XCTAssertFalse(CallState.active(UUID()).isTerminal)
     }
 
-    func testPartialTapStartFailureRemovesInstalledTap() {
-        var lifecycle = InputTapLifecycle(), installs = 0, removes = 0
+    func testPartialCaptureStartFailureRemovesInstalledSource() {
+        var lifecycle = CaptureSourceLifecycle(), installs = 0, removes = 0
         XCTAssertThrowsError(try lifecycle.install(
-            installTap: { installs += 1 },
+            installSource: { installs += 1 },
             startEngine: { throw CallFailure.audioFailed },
-            removeTap: { removes += 1 }
+            removeSource: { removes += 1 }
         ))
         XCTAssertEqual(installs, 1)
         XCTAssertEqual(removes, 1)
         XCTAssertFalse(lifecycle.isInstalled)
     }
 
-    func testRepeatedTapStartStopCannotDuplicateTapAndCleanupIsIdempotent() throws {
-        var lifecycle = InputTapLifecycle(), installs = 0, removes = 0
-        try lifecycle.install(installTap: { installs += 1 }, startEngine: {}, removeTap: { removes += 1 })
-        XCTAssertThrowsError(try lifecycle.install(installTap: { installs += 1 }, startEngine: {}, removeTap: { removes += 1 }))
+    func testRepeatedCaptureStartStopCannotDuplicateSourceAndCleanupIsIdempotent() throws {
+        var lifecycle = CaptureSourceLifecycle(), installs = 0, removes = 0
+        try lifecycle.install(installSource: { installs += 1 }, startEngine: {}, removeSource: { removes += 1 })
+        XCTAssertThrowsError(try lifecycle.install(installSource: { installs += 1 }, startEngine: {}, removeSource: { removes += 1 }))
         lifecycle.remove { removes += 1 }
         lifecycle.remove { removes += 1 }
         XCTAssertEqual(installs, 1)
         XCTAssertEqual(removes, 1)
         XCTAssertFalse(lifecycle.isInstalled)
+    }
+
+    func testMicrophonePCMConvertsToCanonicalNetworkFrame() throws {
+        let inputFormat = try XCTUnwrap(AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: 48_000, channels: 1, interleaved: false))
+        let networkFormat = try XCTUnwrap(AVAudioFormat(commonFormat: .pcmFormatInt16, sampleRate: 16_000, channels: 1, interleaved: true))
+        let converter = try XCTUnwrap(AVAudioConverter(from: inputFormat, to: networkFormat))
+        converter.primeMethod = .none
+        let input = try XCTUnwrap(AVAudioPCMBuffer(pcmFormat: inputFormat, frameCapacity: 960))
+        input.frameLength = 960
+        let samples = try XCTUnwrap(input.floatChannelData?[0])
+        for index in 0..<Int(input.frameLength) { samples[index] = sin(Float(index) * 0.04) * 0.25 }
+
+        let data = try XCTUnwrap(AudioEngine.convertToNetworkPCM(input, converter: converter))
+
+        XCTAssertEqual(data.count, AudioEngine.bytesPerFrame)
     }
 
     func testRuntimeDiagnosticPayloadContainsNoTokenOrRawAudio() throws {
@@ -368,11 +384,69 @@ final class WiFiSecureCallTests: XCTestCase {
     }
 
     @MainActor
-    private func makeSession(capture: RequestCapture, audio: AudioEngineHandling = AudioEngineMock(), media: MediaTransport? = nil) -> CallSession {
+    func testWatchOutgoingGrantedPermissionReachesCallKitAndServerCreate() async throws {
+        let capture = RequestCapture()
+        let audio = AudioEngineMock()
+        audio.permission = true
+        let session = makeSession(capture: capture, role: .A, audio: audio)
+        let adapter = RetainedCallKitMock()
+        session.attach(callKit: adapter)
+
+        await session.startCall()
+        let localID = try XCTUnwrap(adapter.startedIDs.first)
+        XCTAssertNotEqual(localID, session.state.callID)
+        adapter.onStartApproved?(localID)
+
+        await eventually { capture.createdCallID == session.state.callID }
+        XCTAssertEqual(capture.createdCallID, session.state.callID)
+    }
+
+    @MainActor
+    func testTerminalIncomingCleanupCannotBlockNextOutgoingCall() async throws {
+        let capture = RequestCapture()
+        capture.mutationState = .ended
+        let session = makeSession(capture: capture, role: .A)
+        let adapter = RetainedCallKitMock()
+        session.attach(callKit: adapter)
+
+        await session.handleIncomingVoIP(callID: UUID())
+        let incomingLocalID = try XCTUnwrap(adapter.incomingIDs.first)
+        adapter.onEndApproved?(incomingLocalID)
+        await eventually { session.state.isTerminal }
+
+        await session.startCall()
+
+        XCTAssertEqual(adapter.startedIDs.count, 1)
+        guard case .outgoingRinging = session.state else { return XCTFail("Expected fresh outgoing call") }
+        XCTAssertNotEqual(adapter.startedIDs.first, incomingLocalID)
+    }
+
+    @MainActor
+    func testTerminalFailureDoesNotLeaveStaleCallKitUUIDForSecondCall() async throws {
+        let capture = RequestCapture()
+        let session = makeSession(capture: capture, role: .A)
+        let adapter = RetainedCallKitMock()
+        adapter.startError = NSError(domain: "first-call", code: 1)
+        session.attach(callKit: adapter)
+
+        await session.startCall()
+        XCTAssertTrue(session.state.isTerminal)
+        let firstLocalID = try XCTUnwrap(adapter.startedIDs.first)
+        adapter.startError = nil
+
+        await session.startCall()
+
+        XCTAssertEqual(adapter.startedIDs.count, 2)
+        XCTAssertNotEqual(adapter.startedIDs.last, firstLocalID)
+        XCTAssertEqual(session.activeCallKitUUID, adapter.startedIDs.last)
+    }
+
+    @MainActor
+    private func makeSession(capture: RequestCapture, role: DeviceRole = .B, audio: AudioEngineHandling = AudioEngineMock(), media: MediaTransport? = nil) -> CallSession {
         let config = AppConfig(
             apiBaseURL: URL(string: "https://unit.test/v1")!,
             mediaURL: URL(string: "wss://unit.test/media")!,
-            role: .B,
+            role: role,
             bearerToken: String(repeating: "a", count: 64)
         )
         let urlConfiguration = URLSessionConfiguration.ephemeral
@@ -468,7 +542,9 @@ private final class RequestCapture: @unchecked Sendable {
         let requestBody = bodyData(from: request)
         if path.hasSuffix("/devices/diagnostics"), let body = requestBody,
            let value = try JSONSerialization.jsonObject(with: body) as? [String: Any] {
-            lock.withLock { _callKitDiagnostic = value }
+            if value["event"] as? String == "callkit_error" {
+                lock.withLock { _callKitDiagnostic = value }
+            }
             return (response(request, 204), Data())
         }
         if path.hasSuffix("/calls"), request.httpMethod == "POST", let body = requestBody,

@@ -36,6 +36,7 @@ final class CallSession: ObservableObject {
     private var watchdogTask: Task<Void, Never>?
     private var durationTask: Task<Void, Never>?
     private var mediaConnectTask: Task<Void, Never>?
+    private var mediaCloseTask: Task<Void, Never>?
     private var mediaToken: String?
     private var sequence: UInt64 = 0
     private var jitter = JitterBuffer()
@@ -43,7 +44,9 @@ final class CallSession: ObservableObject {
     private var audioStartedForCallKitUUID: UUID?
     private var isOutgoingCall = false
     private var firstSentFrameReported = false
+    private var firstSendFailureReported = false
     private var firstRemoteFrameReported = false
+    private var firstPollFailureReported = false
     private var endMutationSent = false
     private(set) var activeCallKitUUID: UUID?
 
@@ -72,6 +75,7 @@ final class CallSession: ObservableObject {
         }
         callKit.onStartApproved = { [weak self] id in Task { @MainActor in
             guard let self, let serverID = self.serverCallID(for: id) else { return }
+            self.recordRuntimeDiagnostic("callkit_start_approved", status: "success", callID: serverID)
             self.callKit?.reportOutgoingStartedConnecting(id: id)
             await self.createServerCall(serverID)
         } }
@@ -90,12 +94,17 @@ final class CallSession: ObservableObject {
     }
 
     func startCall() async {
-        guard case .idle = state else { return }
+        recordRuntimeDiagnostic("start_call_entered", status: "started", callID: state.callID)
+        guard await prepareForIndependentCall() else {
+            recordRuntimeDiagnostic("new_call_blocked", status: "state=\(String(describing: state))", callID: state.callID)
+            return
+        }
         guard await audio.ensureRecordPermission() else { transition(.failed(nil, .permissionDenied)); return }
         prepareNewCall(isOutgoing: true)
         let serverID = UUID(), localID = distinctLocalCallKitUUID(from: serverID)
         activeCallKitUUID = localID
         transition(.outgoingRinging(serverID))
+        recordRuntimeDiagnostic("callkit_start_requested", status: "started", callID: serverID)
         do { try await callKit?.startOutgoing(id: localID) }
         catch { recordCallKitError(stage: "startOutgoing", callID: serverID, error: error); fail(serverID, .callKitRejected) }
     }
@@ -105,7 +114,10 @@ final class CallSession: ObservableObject {
             if requestAnswer, case .incomingRinging = state, let local = activeCallKitUUID { await requestAnswerForCurrent(id: callID, local: local) }
             return
         }
-        guard case .idle = state else { return }
+        guard await prepareForIndependentCall() else {
+            recordRuntimeDiagnostic("new_call_blocked", status: "incoming_active_call", callID: callID)
+            return
+        }
         let current: CallResponse
         do { current = try await api.call(callID) }
         catch { fail(callID, .serverUnavailable); return }
@@ -115,7 +127,10 @@ final class CallSession: ObservableObject {
 
     func handleIncomingVoIP(callID: UUID) async {
         if state.callID == callID { return }
-        guard case .idle = state else { return }
+        guard await prepareForIndependentCall() else {
+            recordRuntimeDiagnostic("new_call_blocked", status: "incoming_voip_active_call", callID: callID)
+            return
+        }
         guard await reportIncoming(callID: callID, requestAnswer: false) else { return }
         Task { [weak self] in await self?.validateIncomingCall(callID) }
     }
@@ -179,11 +194,17 @@ final class CallSession: ObservableObject {
 
     private func createServerCall(_ id: UUID) async {
         guard state.callID == id else { return }
+        recordRuntimeDiagnostic("server_call_create_started", status: "started", callID: id)
         do {
             let response = try await api.create(callID: id, requestID: UUID())
             guard response.state == .ringing else { fail(id, .invalidServerState); return }
+            recordRuntimeDiagnostic("server_call_create_succeeded", status: "success", callID: id)
             pollingTask = Task { [weak self] in await self?.poll(id) }
-        } catch { fail(id, .serverUnavailable) }
+        } catch {
+            let value = error as NSError
+            recordRuntimeDiagnostic("server_call_create_failed", status: "failed", callID: id, domain: value.domain, code: value.code)
+            fail(id, .serverUnavailable)
+        }
     }
 
     private func poll(_ id: UUID) async {
@@ -199,7 +220,13 @@ final class CallSession: ObservableObject {
                 case .ended: transition(.ending(id)); await end(id); return
                 case .ringing: break
                 }
-            } catch { }
+            } catch {
+                if !firstPollFailureReported {
+                    firstPollFailureReported = true
+                    let value = error as NSError
+                    recordRuntimeDiagnostic("call_state_poll_failure", status: "failed", callID: id, domain: value.domain, code: value.code)
+                }
+            }
             try? await Task.sleep(nanoseconds: 500_000_000)
         }
         if !Task.isCancelled, state.callID == id { fail(id, .callExpired) }
@@ -269,7 +296,14 @@ final class CallSession: ObservableObject {
                     guard let self, self.state.callID == id, !self.firstSentFrameReported else { return }
                     self.firstSentFrameReported = true; self.recordRuntimeDiagnostic("first_network_audio_frame_sent", status: "bytes=\(payload.count)", callID: id)
                 }
-            } catch { }
+            } catch {
+                await MainActor.run {
+                    guard let self, self.state.callID == id, !self.firstSendFailureReported else { return }
+                    self.firstSendFailureReported = true
+                    let value = error as NSError
+                    self.recordRuntimeDiagnostic("first_network_audio_frame_send_failure", status: "failed", callID: id, domain: value.domain, code: value.code)
+                }
+            }
         }
     }
 
@@ -297,8 +331,8 @@ final class CallSession: ObservableObject {
     }
 
     private func finishFromSystem(_ id: UUID) async { guard state.callID == id else { return }; await sendEndOnce(id); await end(id) }
-    private func end(_ id: UUID) async { cancelWork(); if !state.isTerminal { transition(.ending(id)) }; await media.close(); audio.stop(); reportCallKitEnded(); transition(.ended(id)); clearCallIdentity() }
-    private func fail(_ id: UUID?, _ failure: CallFailure) { cancelWork(); audio.stop(); Task { await media.close() }; reportCallKitEnded(); transition(.failed(id, failure)); clearCallIdentity() }
+    private func end(_ id: UUID) async { cancelWork(); if !state.isTerminal { transition(.ending(id)) }; await closeMedia(); audio.stop(); reportCallKitEnded(); transition(.ended(id)); clearCallIdentity() }
+    private func fail(_ id: UUID?, _ failure: CallFailure) { cancelWork(); audio.stop(); scheduleMediaClose(); reportCallKitEnded(); transition(.failed(id, failure)); clearCallIdentity() }
 
     private func providerReset(callKitUUID: UUID?) {
         guard callKitUUID == nil || callKitUUID == activeCallKitUUID else { return }
@@ -307,7 +341,7 @@ final class CallSession: ObservableObject {
             endMutationSent = true
             Task { [api] in do { _ = try await api.mutate("end", callID: id) } catch { } }
         }
-        cancelWork(); audio.stop(); Task { await media.close() }
+        cancelWork(); audio.stop(); scheduleMediaClose()
         if !state.isTerminal && state != .idle { transition(.failed(id, .callKitRejected)) }
         clearCallIdentity()
     }
@@ -320,7 +354,35 @@ final class CallSession: ObservableObject {
     private func prepareNewCall(isOutgoing: Bool) {
         cancelWork(); audio.stop(); activatedCallKitUUID = nil; audioStartedForCallKitUUID = nil
         mediaToken = nil; sequence = 0; jitter = JitterBuffer(); isMuted = false; elapsedSeconds = 0
-        firstSentFrameReported = false; firstRemoteFrameReported = false; endMutationSent = false; self.isOutgoingCall = isOutgoing
+        firstSentFrameReported = false; firstSendFailureReported = false; firstRemoteFrameReported = false; firstPollFailureReported = false; endMutationSent = false; self.isOutgoingCall = isOutgoing
+    }
+
+    private func prepareForIndependentCall() async -> Bool {
+        if state.isTerminal {
+            cancelWork()
+            audio.stop()
+            await closeMedia()
+            clearCallIdentity()
+            transition(.idle)
+            recordRuntimeDiagnostic("previous_terminal_reset", status: "success", callID: nil)
+        }
+        guard case .idle = state else { return false }
+        return true
+    }
+
+    private func scheduleMediaClose() {
+        let previous = mediaCloseTask
+        let transport = media
+        mediaCloseTask = Task {
+            if let previous { await previous.value }
+            await transport.close()
+        }
+    }
+
+    private func closeMedia() async {
+        if let mediaCloseTask { await mediaCloseTask.value }
+        mediaCloseTask = nil
+        await media.close()
     }
 
     private func transition(_ next: CallState) { guard CallStateTransition.isLegal(from: state, to: next) else { return }; diagnostics.record(role: config.role, callID: next.callID, category: "state", value: String(describing: next)); state = next }
