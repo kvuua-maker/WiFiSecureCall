@@ -81,17 +81,47 @@ final class WiFiSecureCallTests: XCTestCase {
         session.attach(callKit: adapter!)
         adapter = nil
         XCTAssertNotNil(retained)
+        XCTAssertNotNil(retained?.onPrepareAudio)
+        XCTAssertNotNil(retained?.onActionFailed)
+    }
+
+    @MainActor
+    func testCallKitStartRejectionMapsToTerminalFailureAndDiagnostic() async {
+        let config = AppConfig(
+            apiBaseURL: URL(string: "https://example.invalid/v1")!,
+            mediaURL: URL(string: "wss://example.invalid/media")!,
+            role: .B,
+            bearerToken: String(repeating: "a", count: 64)
+        )
+        let adapter = RetainedCallKitMock()
+        adapter.startError = NSError(domain: "CallKitUnitTest", code: 42)
+        let session = CallSession(config: config)
+        session.attach(callKit: adapter)
+        let eventCount = Diagnostics.shared.events.count
+
+        await session.startCall()
+
+        guard case .failed(_, .callKitRejected) = session.state else {
+            return XCTFail("Expected callKitRejected terminal state")
+        }
+        XCTAssertTrue(Diagnostics.shared.events.dropFirst(eventCount).contains {
+            $0.category == "callKitError" &&
+            $0.value == "stage=startOutgoing domain=CallKitUnitTest code=42"
+        })
     }
 }
 
 @MainActor
 private final class RetainedCallKitMock: CallKitHandling {
+    var onPrepareAudio: (() throws -> Void)?
+    var onActionFailed: ((UUID, String, Error) -> Void)?
     var onStartApproved: ((UUID) -> Void)?
     var onAnswerApproved: ((UUID) -> Void)?
     var onEndApproved: ((UUID) -> Void)?
     var onAudioActivated: (() -> Void)?
     var onAudioDeactivated: (() -> Void)?
-    func startOutgoing(id: UUID) async throws {}
+    var startError: Error?
+    func startOutgoing(id: UUID) async throws { if let startError { throw startError } }
     func reportIncoming(id: UUID) async throws {}
     func requestAnswer(id: UUID) async throws {}
     func requestEnd(id: UUID) async throws {}

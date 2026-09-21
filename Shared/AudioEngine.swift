@@ -27,7 +27,6 @@ final class AudioEngine: @unchecked Sendable {
         #else
         try session.setCategory(.playAndRecord, mode: .voiceChat, options: [.allowBluetooth, .defaultToSpeaker])
         #endif
-        try session.setActive(true)
     }
 
     func start() throws {
@@ -51,7 +50,6 @@ final class AudioEngine: @unchecked Sendable {
         guard engine.isRunning else { return }
         engine.inputNode.removeTap(onBus: 0)
         player.stop(); engine.stop(); pendingInput.removeAll(keepingCapacity: false)
-        try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
     }
 
     func play(_ payload: Data) {

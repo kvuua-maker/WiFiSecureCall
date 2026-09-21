@@ -4,6 +4,8 @@ import Foundation
 
 @MainActor
 final class WatchCallKitAdapter: NSObject, CallKitHandling, CXProviderDelegate {
+    var onPrepareAudio: (() throws -> Void)?
+    var onActionFailed: ((UUID, String, Error) -> Void)?
     var onStartApproved: ((UUID) -> Void)?
     var onAnswerApproved: ((UUID) -> Void)?
     var onEndApproved: ((UUID) -> Void)?
@@ -33,10 +35,31 @@ final class WatchCallKitAdapter: NSObject, CallKitHandling, CXProviderDelegate {
     private func request(_ action: CXAction) async throws { try await withCheckedThrowingContinuation { continuation in controller.request(CXTransaction(action: action)) { error in error.map { continuation.resume(throwing: $0) } ?? continuation.resume(returning: ()) } } }
 
     nonisolated func providerDidReset(_ provider: CXProvider) {}
-    nonisolated func provider(_ provider: CXProvider, perform action: CXStartCallAction) { Task { @MainActor in onStartApproved?(action.callUUID); action.fulfill() } }
-    nonisolated func provider(_ provider: CXProvider, perform action: CXAnswerCallAction) { Task { @MainActor in onAnswerApproved?(action.callUUID); action.fulfill() } }
+    nonisolated func provider(_ provider: CXProvider, perform action: CXStartCallAction) {
+        Task { @MainActor in
+            do {
+                try onPrepareAudio?()
+                onStartApproved?(action.callUUID)
+                action.fulfill()
+            } catch {
+                action.fail()
+                onActionFailed?(action.callUUID, "prepareStart", error)
+            }
+        }
+    }
+    nonisolated func provider(_ provider: CXProvider, perform action: CXAnswerCallAction) {
+        Task { @MainActor in
+            do {
+                try onPrepareAudio?()
+                onAnswerApproved?(action.callUUID)
+                action.fulfill()
+            } catch {
+                action.fail()
+                onActionFailed?(action.callUUID, "prepareAnswer", error)
+            }
+        }
+    }
     nonisolated func provider(_ provider: CXProvider, perform action: CXEndCallAction) { Task { @MainActor in onEndApproved?(action.callUUID); action.fulfill() } }
     nonisolated func provider(_ provider: CXProvider, didActivate audioSession: AVAudioSession) { Task { @MainActor in onAudioActivated?() } }
     nonisolated func provider(_ provider: CXProvider, didDeactivate audioSession: AVAudioSession) { Task { @MainActor in onAudioDeactivated?() } }
 }
-
