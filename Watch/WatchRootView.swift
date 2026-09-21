@@ -24,7 +24,7 @@ struct WatchRootView: View {
     }
     @ViewBuilder private var controls: some View {
         switch session.state {
-        case .idle: Button("Call iPhone") { Task { await session.startCall() } }
+        case .idle: Button("Call iPhone") { Task { await NotificationRuntime.shared.startCall() } }
         case .outgoingRinging: Button("Cancel", role: .destructive) { Task { await session.cancel() } }
         case .incomingRinging:
             HStack { Button("Reject", role: .destructive) { Task { await session.reject() } }; Button("Accept") { Task { await session.accept() } } }

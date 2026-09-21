@@ -3,20 +3,61 @@ import Foundation
 @MainActor
 final class NotificationRuntime {
     static let shared = NotificationRuntime()
-    private(set) var callSession: CallSession?
+    let callSession: CallSession
     let api: APIClient
+    private var callKitFactory: (() -> CallKitHandling)?
+    private var callKit: CallKitHandling?
+    private(set) var callKitCreationCount = 0
 
-    private init() {
-        api = APIClient(config: AppConfig.load())
+    init(
+        config: AppConfig = AppConfig.load(),
+        api: APIClient? = nil,
+        audio: AudioEngineHandling = AudioEngine(),
+        media: MediaTransport? = nil
+    ) {
+        let effectiveAPI = api ?? APIClient(config: config)
+        self.api = effectiveAPI
+        callSession = CallSession(config: config, api: effectiveAPI, audio: audio, media: media)
+    }
+
+    func configureCallKitFactory(_ factory: @escaping () -> CallKitHandling) {
+        guard callKitFactory == nil else { return }
+        callKitFactory = factory
     }
 
     @discardableResult
-    func install(callKit: CallKitHandling) -> CallSession {
-        if let callSession { return callSession }
-        let session = CallSession(config: AppConfig.load(), api: api)
-        session.attach(callKit: callKit)
-        callSession = session
-        return session
+    func ensureCallKit() -> CallKitHandling? {
+        if let callKit { return callKit }
+        guard let factory = callKitFactory else { return nil }
+        let created = factory()
+        callKit = created
+        callKitCreationCount += 1
+        callSession.attach(callKit: created)
+        callSession.recordLifecycleDiagnostic(
+            "callkit_provider_created",
+            status: "instance=\(created.diagnosticInstanceID.uuidString)",
+            callID: nil
+        )
+        return created
+    }
+
+    func startCall() async {
+        _ = ensureCallKit()
+        await callSession.startCall()
+    }
+
+    func handleIncomingVoIP(callID: UUID) async {
+        callSession.recordLifecycleDiagnostic("push_received", status: "voip", callID: callID)
+        guard ensureCallKit() != nil else {
+            callSession.recordLifecycleDiagnostic("incoming_callkit_report_started", status: "provider_unavailable", callID: callID)
+            return
+        }
+        await callSession.handleIncomingVoIP(callID: callID)
+    }
+
+    func handleIncomingAlert(callID: UUID, requestAnswer: Bool) async {
+        guard ensureCallKit() != nil else { return }
+        await callSession.handleIncoming(callID: callID, requestAnswer: requestAnswer)
     }
 }
 

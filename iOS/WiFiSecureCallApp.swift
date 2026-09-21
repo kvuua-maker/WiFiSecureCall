@@ -6,8 +6,9 @@ struct WiFiSecureCallApp: App {
     @StateObject private var session: CallSession
 
     init() {
-        let callSession = NotificationRuntime.shared.install(callKit: IOSCallKitAdapter())
-        _session = StateObject(wrappedValue: callSession)
+        let runtime = NotificationRuntime.shared
+        runtime.configureCallKitFactory { IOSCallKitAdapter() }
+        _session = StateObject(wrappedValue: runtime.callSession)
     }
 
     var body: some Scene { WindowGroup { IOSRootView(session: session) } }

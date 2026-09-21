@@ -29,7 +29,7 @@ struct IOSRootView: View {
     @ViewBuilder private var controls: some View {
         switch session.state {
         case .idle:
-            Button("Call Watch") { Task { await session.startCall() } }.buttonStyle(.borderedProminent)
+            Button("Call Watch") { Task { await NotificationRuntime.shared.startCall() } }.buttonStyle(.borderedProminent)
         case .outgoingRinging:
             Button("Cancel", role: .destructive) { Task { await session.cancel() } }
         case .incomingRinging:

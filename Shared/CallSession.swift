@@ -5,6 +5,8 @@ enum CallKitCoordinatorError: Error { case missingCoordinator, actionTimedOut, i
 
 @MainActor
 protocol CallKitHandling: AnyObject {
+    var diagnosticInstanceID: UUID { get }
+    var onLifecycleDiagnostic: ((String, UUID?) -> Void)? { get set }
     var onPrepareAudio: (() throws -> Void)? { get set }
     var onActionFailed: ((UUID, String, Error) -> Void)? { get set }
     var onStartRequested: ((UUID, Date) async throws -> Void)? { get set }
@@ -137,6 +139,14 @@ final class CallSession: ObservableObject {
 
     func attach(callKit: CallKitHandling) {
         self.callKit = callKit
+        callKit.onLifecycleDiagnostic = { [weak self, weak callKit] event, localID in
+            guard let self else { return }
+            let current = self.generation
+            guard localID == nil || current?.localCallKitUUID == localID else { return }
+            let instance = callKit?.diagnosticInstanceID.uuidString ?? "unknown"
+            let generation = current?.id.uuidString ?? "none"
+            self.recordLifecycleDiagnostic(event, status: "instance=\(instance) generation=\(generation)", callID: current?.serverCallID)
+        }
         callKit.onPrepareAudio = { [weak self] in guard let self else { throw CallKitCoordinatorError.missingCoordinator }; try self.audio.configureSession() }
         callKit.onStartRequested = { [weak self] localID, deadline in
             guard let self else { throw CallKitCoordinatorError.missingCoordinator }
@@ -212,14 +222,23 @@ final class CallSession: ObservableObject {
         let localID = distinctLocalCallKitUUID(from: callID)
         let current = beginGeneration(serverID: callID, localID: localID, outgoing: false)
         transition(.incomingRinging(callID))
+        let validation: Task<CallResponse, Error>?
+        if validateBeforeReport {
+            validation = nil
+        } else {
+            recordLifecycleDiagnostic("incoming_validation_started", status: "parallel", callID: callID)
+            validation = Task { [api] in try await api.call(callID) }
+        }
         do {
+            recordLifecycleDiagnostic("incoming_callkit_report_started", status: "prompt", callID: callID)
             try await callKit.reportIncoming(id: localID)
             guard isCurrent(current) else { return }
             callKitReported = true
             recordRuntimeDiagnostic("incoming_callkit_reported", status: "success", callID: callID)
             if requestAnswer { await accept() }
-            if !validateBeforeReport { validateIncoming(current) }
+            if let validation { reconcileIncoming(current, validation: validation) }
         } catch {
+            validation?.cancel()
             guard isCurrent(current) else { return }
             recordCallKitError(stage: "reportIncoming", callID: callID, error: error)
             await terminalMutationForIncomingFailure(current)
@@ -227,13 +246,17 @@ final class CallSession: ObservableObject {
         }
     }
 
-    private func validateIncoming(_ current: CallGeneration) {
+    private func reconcileIncoming(_ current: CallGeneration, validation: Task<CallResponse, Error>) {
         spawn { [weak self] in
             guard let self else { return }
             do {
-                let response = try await self.api.call(current.serverCallID)
+                let response = try await validation.value
                 guard self.isCurrent(current) else { return }
-                if response.state != .ringing && response.state != .accepted { await self.remoteTerminal(response, generation: current) }
+                self.recordLifecycleDiagnostic("validation_result", status: response.state.rawValue, callID: current.serverCallID)
+                if response.state != .ringing && response.state != .accepted {
+                    self.recordLifecycleDiagnostic("stale_incoming_ended", status: response.state.rawValue, callID: current.serverCallID)
+                    await self.remoteTerminal(response, generation: current)
+                }
             } catch {
                 guard self.isCurrent(current) else { return }
                 self.recordRuntimeDiagnostic("incoming_reconcile_failed", status: "transient", callID: current.serverCallID)
@@ -273,14 +296,22 @@ final class CallSession: ObservableObject {
         callKit?.reportOutgoingStartedConnecting(id: localID)
         let requestID = createRequestID ?? UUID(); createRequestID = requestID
         let response: CallResponse
+        recordRuntimeDiagnostic("server_call_create_started", status: "started", callID: current.serverCallID)
         do { response = try await api.create(callID: current.serverCallID, requestID: requestID) }
         catch { guard isCurrent(current) else { throw CancellationError() }; recordRuntimeDiagnostic("server_call_create_failed", status: "failed", callID: current.serverCallID, domain: (error as NSError).domain, code: (error as NSError).code); throw error }
-        guard isCurrent(current) else { await deliverTerminalCompensation(current); throw CancellationError() }
-        guard Date() < deadline, response.callID == current.serverCallID, response.caller == config.role, response.state == .ringing else {
+        guard response.callID == current.serverCallID, response.caller == config.role, response.state == .ringing else {
+            throw CallKitCoordinatorError.invalidAction
+        }
+        guard isCurrent(current) else {
+            registerTerminalCompensation(current, mutation: .cancel, requestID: UUID())
+            await deliverTerminalCompensation(current)
+            throw CancellationError()
+        }
+        serverCallCreated = true
+        guard Date() < deadline else {
             await compensateAfterStart(current)
             throw CallKitCoordinatorError.actionTimedOut
         }
-        serverCallCreated = true
         callKitReported = true
         recordRuntimeDiagnostic("server_call_create_succeeded", status: response.createdNew == false ? "reconciled" : "created", callID: current.serverCallID)
         startRingingPoll(current, ringExpiresAt: response.ringExpiresAt ?? response.expiresAt)
@@ -568,10 +599,10 @@ final class CallSession: ObservableObject {
         Task { @MainActor [weak self] in await self?.deliverTerminalCompensation(current) }
     }
 
-    private func registerTerminalCompensation(_ current: CallGeneration, mutation: CallMutation) {
+    private func registerTerminalCompensation(_ current: CallGeneration, mutation: CallMutation, requestID: UUID? = nil) {
         if terminalCompensations[current.id] == nil {
             if terminalCompensations.count >= 8, let oldest = terminalCompensations.keys.first { terminalCompensations.removeValue(forKey: oldest) }
-            terminalCompensations[current.id] = (mutation, terminalRequestID ?? UUID())
+            terminalCompensations[current.id] = (mutation, requestID ?? terminalRequestID ?? UUID())
         }
     }
 
@@ -661,6 +692,18 @@ final class CallSession: ObservableObject {
     private func distinctLocalCallKitUUID(from server: UUID) -> UUID { var value = UUID(); while value == server { value = UUID() }; return value }
     private func spawn(_ operation: @escaping @MainActor () async -> Void) { let task = Task { @MainActor in await operation() }; tasks.append(task) }
     private func recordCallKitError(stage: String, callID: UUID, error: Error) { let value = error as NSError; diagnostics.record(role: config.role, callID: callID, category: "callKitError", value: "stage=\(stage) domain=\(value.domain) code=\(value.code)"); diagnosticContinuation?.yield(.callKit(stage, callID, value)) }
+    func recordLifecycleDiagnostic(_ event: String, status: String, callID: UUID?) {
+        diagnostics.record(role: config.role, callID: callID, category: event, value: status)
+        let serverEvent: String
+        switch event {
+        case "callkit_provider_created", "start_transaction_submitted": serverEvent = "callkit_start_requested"
+        case "start_transaction_accepted", "provider_perform_start_received", "start_action_fulfilled": serverEvent = "callkit_start_approved"
+        case "start_action_timed_out", "provider_reset": serverEvent = "callkit_action_timeout"
+        case "push_received", "incoming_validation_started", "incoming_callkit_report_started", "validation_result", "stale_incoming_ended": serverEvent = "incoming_callkit_reported"
+        default: serverEvent = event
+        }
+        diagnosticContinuation?.yield(.runtime(serverEvent, "\(event) \(status)", callID, nil, nil))
+    }
     private func recordRuntimeDiagnostic(_ event: String, status: String, callID: UUID?, domain: String? = nil, code: Int? = nil) { diagnostics.record(role: config.role, callID: callID, category: event, value: status); diagnosticContinuation?.yield(.runtime(event, status, callID, domain, code)) }
 }
 

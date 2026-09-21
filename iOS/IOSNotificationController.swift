@@ -11,7 +11,7 @@ final class IOSNotificationController: NSObject, UIApplicationDelegate, UNUserNo
     private var notificationsAuthorized = false
 
     func application(_ application: UIApplication, didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]? = nil) -> Bool {
-        _ = NotificationRuntime.shared.install(callKit: IOSCallKitAdapter())
+        NotificationRuntime.shared.configureCallKitFactory { IOSCallKitAdapter() }
         let center = UNUserNotificationCenter.current(); center.delegate = self
         center.setNotificationCategories([UNNotificationCategory(identifier: "INCOMING_CALL", actions: [
             UNNotificationAction(identifier: "ACCEPT", title: "Accept", options: .foreground),
@@ -63,16 +63,16 @@ final class IOSNotificationController: NSObject, UIApplicationDelegate, UNUserNo
     nonisolated func userNotificationCenter(_ center: UNUserNotificationCenter, willPresent notification: UNNotification, withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void) {
         switch ForegroundIncomingNotification.outcome(from: notification.request.content.userInfo) {
         case let .incoming(callID):
-            Task { @MainActor in await NotificationRuntime.shared.callSession?.handleIncoming(callID: callID, requestAnswer: false) }
+            Task { @MainActor in await NotificationRuntime.shared.handleIncomingAlert(callID: callID, requestAnswer: false) }
             completionHandler([])
         case .invalidCallID, .unrelated: completionHandler([.banner, .sound])
         }
     }
 
     nonisolated func userNotificationCenter(_ center: UNUserNotificationCenter, didReceive response: UNNotificationResponse) async {
-        guard let callID = VoIPIncomingNotification.callID(from: response.notification.request.content.userInfo) ?? ForegroundIncomingNotification.callID(from: response.notification.request.content.userInfo),
-              let session = await MainActor.run(body: { NotificationRuntime.shared.callSession }) else { return }
-        await session.handleIncoming(callID: callID, requestAnswer: false)
+        guard let callID = VoIPIncomingNotification.callID(from: response.notification.request.content.userInfo) ?? ForegroundIncomingNotification.callID(from: response.notification.request.content.userInfo) else { return }
+        await NotificationRuntime.shared.handleIncomingAlert(callID: callID, requestAnswer: false)
+        let session = await MainActor.run { NotificationRuntime.shared.callSession }
         if response.actionIdentifier == "REJECT" { await session.reject() }
         else if response.actionIdentifier == "ACCEPT" { await session.accept() }
     }
@@ -83,11 +83,11 @@ extension IOSNotificationController: PKPushRegistryDelegate {
     nonisolated func pushRegistry(_ registry: PKPushRegistry, didInvalidatePushTokenFor type: PKPushType) { guard type == .voIP else { return }; Task { @MainActor in let token = self.lastVoIPToken; self.lastVoIPToken = nil; self.voipRegistrationTask?.cancel(); await NotificationRuntime.shared.api.invalidateDevice(pushType: .voip, expectedToken: token) } }
     nonisolated func pushRegistry(_ registry: PKPushRegistry, didReceiveIncomingPushWith payload: PKPushPayload, for type: PKPushType, completion: @escaping () -> Void) {
         guard type == .voIP, let callID = VoIPIncomingNotification.callID(from: payload.dictionaryPayload) else { completion(); return }
-        Task { @MainActor in let session = NotificationRuntime.shared.callSession ?? NotificationRuntime.shared.install(callKit: IOSCallKitAdapter()); await session.handleIncomingVoIP(callID: callID); completion() }
+        Task { @MainActor in await NotificationRuntime.shared.handleIncomingVoIP(callID: callID); completion() }
     }
     @available(iOS 26.4, *)
     nonisolated func pushRegistry(_ registry: PKPushRegistry, didReceiveIncomingVoIPPushWith payload: PKPushPayload, metadata: PKVoIPPushMetadata, withCompletionHandler completion: @escaping @Sendable () -> Void) {
         guard let callID = VoIPIncomingNotification.callID(from: payload.dictionaryPayload) else { completion(); return }
-        Task { @MainActor in let session = NotificationRuntime.shared.callSession ?? NotificationRuntime.shared.install(callKit: IOSCallKitAdapter()); await session.handleIncomingVoIP(callID: callID); completion() }
+        Task { @MainActor in await NotificationRuntime.shared.handleIncomingVoIP(callID: callID); completion() }
     }
 }

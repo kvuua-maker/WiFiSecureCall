@@ -201,6 +201,83 @@ final class WiFiSecureCallTests: XCTestCase {
     }
 
     @MainActor
+    func testAppLaunchRegistersFactoryWithoutCreatingProvider() {
+        let capture = RequestCapture()
+        let runtime = makeRuntime(capture: capture)
+        var creations = 0
+        runtime.configureCallKitFactory { creations += 1; return RetainedCallKitMock() }
+
+        XCTAssertEqual(creations, 0)
+        XCTAssertEqual(runtime.callKitCreationCount, 0)
+    }
+
+    @MainActor
+    func testAppAndDelegateFactoryRegistrationCreateOnlyOneAdapter() {
+        let runtime = makeRuntime(capture: RequestCapture())
+        var appCreations = 0, delegateCreations = 0
+        runtime.configureCallKitFactory { appCreations += 1; return RetainedCallKitMock() }
+        runtime.configureCallKitFactory { delegateCreations += 1; return RetainedCallKitMock() }
+
+        _ = runtime.ensureCallKit()
+        _ = runtime.ensureCallKit()
+
+        XCTAssertEqual(appCreations, 1)
+        XCTAssertEqual(delegateCreations, 0)
+        XCTAssertEqual(runtime.callKitCreationCount, 1)
+    }
+
+    @MainActor
+    func testFirstOutgoingCreatesProviderAndSecondOutgoingReusesIt() async {
+        let runtime = makeRuntime(capture: RequestCapture())
+        let adapter = RetainedCallKitMock()
+        adapter.startError = NSError(domain: "CallKitUnitTest", code: 1)
+        var creations = 0
+        runtime.configureCallKitFactory { creations += 1; return adapter }
+
+        await runtime.startCall()
+        runtime.callSession.reset()
+        await runtime.startCall()
+
+        XCTAssertEqual(creations, 1)
+        XCTAssertEqual(runtime.callKitCreationCount, 1)
+        XCTAssertEqual(adapter.startedIDs.count, 2)
+    }
+
+    @MainActor
+    func testFirstPushKitIncomingCreatesExactlyOneProviderAndDuplicateReusesIt() async {
+        let capture = RequestCapture()
+        let runtime = makeRuntime(capture: capture)
+        let adapter = RetainedCallKitMock()
+        var creations = 0
+        runtime.configureCallKitFactory { creations += 1; return adapter }
+        let callID = UUID()
+
+        await runtime.handleIncomingVoIP(callID: callID)
+        await runtime.handleIncomingVoIP(callID: callID)
+        await eventually { capture.paths.contains { $0.hasSuffix("/calls/\(callID.uuidString.lowercased())") } }
+
+        XCTAssertEqual(creations, 1)
+        XCTAssertEqual(adapter.incomingIDs.count, 1)
+    }
+
+    @MainActor
+    func testSimultaneousEnsureCallKitCreatesExactlyOneProvider() async {
+        let runtime = makeRuntime(capture: RequestCapture())
+        var creations = 0
+        runtime.configureCallKitFactory { creations += 1; return RetainedCallKitMock() }
+
+        await withTaskGroup(of: ObjectIdentifier?.self) { group in
+            for _ in 0..<20 {
+                group.addTask { @MainActor in runtime.ensureCallKit().map { ObjectIdentifier($0) } }
+            }
+            var identities: [ObjectIdentifier] = []
+            for await value in group { if let value { identities.append(value) } }
+            XCTAssertEqual(Set(identities).count, 1)
+        }
+        XCTAssertEqual(creations, 1)
+    }
+
+    @MainActor
     func testCallKitStartRejectionMapsToTerminalFailureAndDiagnostic() async {
         let config = AppConfig(
             apiBaseURL: URL(string: "https://example.invalid/v1")!,
@@ -263,7 +340,7 @@ final class WiFiSecureCallTests: XCTestCase {
     }
 
     @MainActor
-    func testIncomingPushCreatesOneDistinctLocalCallKitUUIDAndReportsBeforeGET() async throws {
+    func testIncomingPushReportsPromptlyWhileValidationRunsAndDeduplicates() async throws {
         let capture = RequestCapture()
         let session = makeSession(capture: capture)
         let adapter = RetainedCallKitMock()
@@ -281,8 +358,40 @@ final class WiFiSecureCallTests: XCTestCase {
         let localCallKitUUID = try XCTUnwrap(adapter.incomingIDs.first)
         XCTAssertNotEqual(serverCallID, localCallKitUUID)
         XCTAssertEqual(adapter.incomingIDs.count, 1)
-        XCTAssertEqual(Array(capture.events.prefix(2)), ["report", "get"])
+        XCTAssertTrue(capture.events.contains("report"))
+        XCTAssertTrue(capture.events.contains("get"))
         XCTAssertEqual(adapter.answerIDs.count, 0)
+    }
+
+    @MainActor
+    func testDelayedPushForCancelledCallIsPromptlyReportedThenEnded() async throws {
+        let capture = RequestCapture(); capture.getState = .cancelled
+        let runtime = makeRuntime(capture: capture)
+        let adapter = RetainedCallKitMock()
+        runtime.configureCallKitFactory { adapter }
+        let callID = UUID()
+
+        await runtime.handleIncomingVoIP(callID: callID)
+        await eventually { adapter.endedIDs.count == 1 }
+
+        XCTAssertEqual(adapter.incomingIDs.count, 1)
+        XCTAssertEqual(adapter.endedIDs, adapter.incomingIDs)
+        XCTAssertTrue(runtime.callSession.state.isTerminal)
+    }
+
+    @MainActor
+    func testLateStartApprovalAfterGenerationEndedCannotCreateServerCall() async throws {
+        let capture = RequestCapture()
+        let session = makeSession(capture: capture)
+        let adapter = RetainedCallKitMock(); session.attach(callKit: adapter)
+        await session.startCall()
+        let staleLocalID = try XCTUnwrap(adapter.startedIDs.first)
+        try await adapter.approveEnd(staleLocalID)
+        do {
+            try await adapter.approveStart(staleLocalID)
+            XCTFail("Stale start approval must fail")
+        } catch { }
+        XCTAssertFalse(capture.paths.contains { $0 == "/v1/calls" })
     }
 
     @MainActor
@@ -569,6 +678,22 @@ final class WiFiSecureCallTests: XCTestCase {
     }
 
     @MainActor
+    private func makeRuntime(capture: RequestCapture, role: DeviceRole = .B) -> NotificationRuntime {
+        let config = AppConfig(
+            apiBaseURL: URL(string: "https://unit.test/v1")!,
+            mediaURL: URL(string: "wss://unit.test/media")!,
+            role: role,
+            bearerToken: String(repeating: "a", count: 64)
+        )
+        let urlConfiguration = URLSessionConfiguration.ephemeral
+        urlConfiguration.protocolClasses = [CallSessionURLProtocol.self]
+        CallSessionURLProtocol.capture = capture
+        capture.clientRole = role
+        let api = APIClient(config: config, session: URLSession(configuration: urlConfiguration))
+        return NotificationRuntime(config: config, api: api, audio: AudioEngineMock(), media: MediaTransportMock())
+    }
+
+    @MainActor
     private func eventually(_ predicate: @escaping () -> Bool) async {
         for _ in 0..<100 where !predicate() {
             try? await Task.sleep(nanoseconds: 10_000_000)
@@ -578,6 +703,8 @@ final class WiFiSecureCallTests: XCTestCase {
 
 @MainActor
 private final class RetainedCallKitMock: CallKitHandling {
+    let diagnosticInstanceID = UUID()
+    var onLifecycleDiagnostic: ((String, UUID?) -> Void)?
     var onPrepareAudio: (() throws -> Void)?
     var onActionFailed: ((UUID, String, Error) -> Void)?
     var onStartRequested: ((UUID, Date) async throws -> Void)?
