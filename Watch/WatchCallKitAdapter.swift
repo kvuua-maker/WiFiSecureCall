@@ -16,7 +16,7 @@ final class WatchCallKitAdapter: NSObject, CallKitHandling, CXProviderDelegate {
     var onProviderReset: ((UUID?) -> Void)?
 
     private let provider: CXProvider
-    private let controller = CXCallController()
+    private let controller = CXCallController(queue: .main)
     private var currentCallUUID: UUID?
     private var pendingAudioCallUUID: UUID?
     private var activatedAudioCallUUID: UUID?
@@ -27,7 +27,11 @@ final class WatchCallKitAdapter: NSObject, CallKitHandling, CXProviderDelegate {
         provider.setDelegate(self, queue: .main)
     }
 
-    func startOutgoing(id: UUID) async throws { provider.configuration = Self.configuration(); try await request(CXStartCallAction(call: id, handle: CXHandle(type: .generic, value: "Wi-Fi call"))); currentCallUUID = id }
+    func startOutgoing(id: UUID) async throws {
+        provider.configuration = Self.configuration(); currentCallUUID = id
+        do { try await request(CXStartCallAction(call: id, handle: CXHandle(type: .generic, value: "Wi-Fi call"))) }
+        catch { clear(id); throw error }
+    }
     func reportIncoming(id: UUID) async throws {
         provider.configuration = Self.configuration()
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
@@ -43,7 +47,13 @@ final class WatchCallKitAdapter: NSObject, CallKitHandling, CXProviderDelegate {
     func reportOutgoingStartedConnecting(id: UUID) { provider.reportOutgoingCall(with: id, startedConnectingAt: Date()) }
     func reportOutgoingConnected(id: UUID) { provider.reportOutgoingCall(with: id, connectedAt: Date()) }
     func reportEnded(id: UUID, reason: CallEndReason) { provider.reportCall(with: id, endedAt: Date(), reason: Self.cxReason(reason)); clear(id) }
-    private func request(_ action: CXAction) async throws { try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in controller.request(CXTransaction(action: action)) { error in if let error { continuation.resume(throwing: error) } else { continuation.resume(returning: ()) } } } }
+    private func request(_ action: CXAction) async throws {
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+            let completion = WatchCallKitRequestCompletion(continuation)
+            controller.request(CXTransaction(action: action)) { error in completion.finish(error) }
+            DispatchQueue.main.asyncAfter(deadline: .now() + CallTimeouts.httpRequest) { completion.finish(NSError(domain: "WiFiSecureCall.CallKitTransaction", code: 1)) }
+        }
+    }
 
     private static func configuration() -> CXProviderConfiguration {
         let configuration = CXProviderConfiguration()
@@ -69,4 +79,19 @@ final class WatchCallKitAdapter: NSObject, CallKitHandling, CXProviderDelegate {
     nonisolated func provider(_ provider: CXProvider, timedOutPerforming action: CXAction) { Task { @MainActor in onActionTimedOut?((action as? CXCallAction)?.callUUID ?? action.uuid, String(describing: type(of: action))) } }
     nonisolated func provider(_ provider: CXProvider, didActivate audioSession: AVAudioSession) { Task { @MainActor in guard let id = pendingAudioCallUUID ?? currentCallUUID else { return }; activatedAudioCallUUID = id; pendingAudioCallUUID = nil; onAudioActivated?(id) } }
     nonisolated func provider(_ provider: CXProvider, didDeactivate audioSession: AVAudioSession) { Task { @MainActor in let id = activatedAudioCallUUID; activatedAudioCallUUID = nil; onAudioDeactivated?(id) } }
+}
+
+private final class WatchCallKitRequestCompletion: @unchecked Sendable {
+    private let lock = NSLock()
+    private var continuation: CheckedContinuation<Void, Error>?
+    init(_ continuation: CheckedContinuation<Void, Error>) { self.continuation = continuation }
+    func finish(_ error: Error?) {
+        let value = lock.withLock { () -> CheckedContinuation<Void, Error>? in let result = continuation; continuation = nil; return result }
+        guard let value else { return }
+        if let error { value.resume(throwing: error) } else { value.resume(returning: ()) }
+    }
+}
+
+private extension NSLock {
+    func withLock<T>(_ body: () -> T) -> T { lock(); defer { unlock() }; return body() }
 }

@@ -226,6 +226,23 @@ final class WiFiSecureCallTests: XCTestCase {
     }
 
     @MainActor
+    func testUnapprovedCallKitStartNeverCreatesServerCall() async {
+        let capture = RequestCapture()
+        let session = makeSession(capture: capture)
+        let adapter = RetainedCallKitMock()
+        adapter.startError = NSError(domain: "WiFiSecureCall.CallKitTransaction", code: 1)
+        session.attach(callKit: adapter)
+
+        await session.startCall()
+
+        guard case .failed(_, .callKitRejected) = session.state else {
+            return XCTFail("Expected callKitRejected terminal state")
+        }
+        XCTAssertFalse(capture.paths.contains { $0 == "/v1/calls" })
+        XCTAssertNil(session.activeCallKitUUID)
+    }
+
+    @MainActor
     func testOutgoingUsesDistinctLocalCallKitUUIDAndServerAPIReceivesServerCallID() async throws {
         let capture = RequestCapture()
         let session = makeSession(capture: capture)

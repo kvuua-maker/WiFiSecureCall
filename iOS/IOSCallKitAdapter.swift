@@ -16,7 +16,7 @@ final class IOSCallKitAdapter: NSObject, CallKitHandling, CXProviderDelegate {
     var onProviderReset: ((UUID?) -> Void)?
 
     private let provider: CXProvider
-    private let controller = CXCallController()
+    private let controller = CXCallController(queue: .main)
     private var currentCallUUID: UUID?
     private var pendingAudioCallUUID: UUID?
     private var activatedAudioCallUUID: UUID?
@@ -29,8 +29,13 @@ final class IOSCallKitAdapter: NSObject, CallKitHandling, CXProviderDelegate {
 
     func startOutgoing(id: UUID) async throws {
         provider.configuration = Self.configuration()
-        try await request(CXStartCallAction(call: id, handle: CXHandle(type: .generic, value: "Wi-Fi call")))
         currentCallUUID = id
+        do {
+            try await request(CXStartCallAction(call: id, handle: CXHandle(type: .generic, value: "Wi-Fi call")))
+        } catch {
+            clear(id)
+            throw error
+        }
     }
 
     func reportIncoming(id: UUID) async throws {
@@ -56,9 +61,12 @@ final class IOSCallKitAdapter: NSObject, CallKitHandling, CXProviderDelegate {
 
     private func request(_ action: CXAction) async throws {
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+            let completion = IOSCallKitRequestCompletion(continuation)
             controller.request(CXTransaction(action: action)) { error in
-                if let error { continuation.resume(throwing: error) }
-                else { continuation.resume(returning: ()) }
+                completion.finish(error)
+            }
+            DispatchQueue.main.asyncAfter(deadline: .now() + CallTimeouts.httpRequest) {
+                completion.finish(NSError(domain: "WiFiSecureCall.CallKitTransaction", code: 1))
             }
         }
     }
@@ -171,4 +179,26 @@ final class IOSCallKitAdapter: NSObject, CallKitHandling, CXProviderDelegate {
     nonisolated func provider(_ provider: CXProvider, didDeactivate audioSession: AVAudioSession) {
         Task { @MainActor in let id = activatedAudioCallUUID; activatedAudioCallUUID = nil; onAudioDeactivated?(id) }
     }
+}
+
+private final class IOSCallKitRequestCompletion: @unchecked Sendable {
+    private let lock = NSLock()
+    private var continuation: CheckedContinuation<Void, Error>?
+
+    init(_ continuation: CheckedContinuation<Void, Error>) { self.continuation = continuation }
+
+    func finish(_ error: Error?) {
+        let value = lock.withLock { () -> CheckedContinuation<Void, Error>? in
+            let result = continuation
+            continuation = nil
+            return result
+        }
+        guard let value else { return }
+        if let error { value.resume(throwing: error) }
+        else { value.resume(returning: ()) }
+    }
+}
+
+private extension NSLock {
+    func withLock<T>(_ body: () -> T) -> T { lock(); defer { unlock() }; return body() }
 }
