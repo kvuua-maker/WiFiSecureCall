@@ -67,6 +67,46 @@ final class WiFiSecureCallTests: XCTestCase {
         XCTAssertFalse(CallState.active(UUID()).isTerminal)
     }
 
+    func testValidForegroundIncomingNotificationDispatchesOnceWithoutAutoAnswer() {
+        let id = UUID()
+        var invocations: [(UUID, Bool)] = []
+
+        let outcome = ForegroundIncomingNotification.dispatch(
+            userInfo: ["event": "incoming_call", "callID": id.uuidString]
+        ) { callID, requestAnswer in
+            invocations.append((callID, requestAnswer))
+        }
+
+        XCTAssertEqual(outcome, .incoming(id))
+        XCTAssertEqual(invocations.count, 1)
+        XCTAssertEqual(invocations.first?.0, id)
+        XCTAssertEqual(invocations.first?.1, false)
+    }
+
+    func testForegroundIncomingNotificationRejectsInvalidOrMissingCallID() {
+        var invocations = 0
+        let invalid = ForegroundIncomingNotification.dispatch(
+            userInfo: ["event": "incoming_call", "callID": "not-a-uuid"]
+        ) { _, _ in invocations += 1 }
+        let missing = ForegroundIncomingNotification.dispatch(
+            userInfo: ["event": "incoming_call"]
+        ) { _, _ in invocations += 1 }
+
+        XCTAssertEqual(invalid, .invalidCallID)
+        XCTAssertEqual(missing, .invalidCallID)
+        XCTAssertEqual(invocations, 0)
+    }
+
+    func testUnrelatedForegroundNotificationIsNotDispatchedAsCall() {
+        var invoked = false
+        let outcome = ForegroundIncomingNotification.dispatch(
+            userInfo: ["event": "something_else", "callID": UUID().uuidString]
+        ) { _, _ in invoked = true }
+
+        XCTAssertEqual(outcome, .unrelated)
+        XCTAssertFalse(invoked)
+    }
+
     @MainActor
     func testCallSessionRetainsCallKitAdapter() {
         let config = AppConfig(

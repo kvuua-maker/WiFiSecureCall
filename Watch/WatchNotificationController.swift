@@ -78,6 +78,47 @@ final class WatchNotificationController: NSObject, WKApplicationDelegate, UNUser
         return "\(value.domain):\(value.code)"
     }
 
+    nonisolated func userNotificationCenter(
+        _ center: UNUserNotificationCenter,
+        willPresent notification: UNNotification,
+        withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void
+    ) {
+        let outcome = ForegroundIncomingNotification.dispatch(
+            userInfo: notification.request.content.userInfo
+        ) { callID, requestAnswer in
+            Task { @MainActor in
+                Diagnostics.shared.record(
+                    role: .A,
+                    callID: callID,
+                    category: "incomingNotification",
+                    value: "foreground_received"
+                )
+                guard let callSession = NotificationRuntime.shared.callSession else {
+                    Diagnostics.shared.record(
+                        role: .A,
+                        callID: callID,
+                        category: "incomingNotification",
+                        value: "call_session_unavailable"
+                    )
+                    return
+                }
+                await callSession.handleIncoming(callID: callID, requestAnswer: requestAnswer)
+            }
+        }
+
+        switch outcome {
+        case .incoming:
+            completionHandler([])
+        case .invalidCallID:
+            Task { @MainActor in
+                Diagnostics.shared.record(role: .A, category: "incomingNotification", value: "invalid_call_id")
+            }
+            completionHandler([.banner, .sound])
+        case .unrelated:
+            completionHandler([.banner, .sound])
+        }
+    }
+
     nonisolated func userNotificationCenter(_ center: UNUserNotificationCenter, didReceive response: UNNotificationResponse) async {
         guard let value = response.notification.request.content.userInfo["callID"] as? String, let id = UUID(uuidString: value) else { return }
         await MainActor.run {
