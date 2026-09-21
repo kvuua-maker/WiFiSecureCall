@@ -11,16 +11,18 @@ final class IOSNotificationController: NSObject, UIApplicationDelegate, UNUserNo
         let accept = UNNotificationAction(identifier: "ACCEPT", title: "Accept", options: .foreground)
         let reject = UNNotificationAction(identifier: "REJECT", title: "Reject")
         center.setNotificationCategories([UNNotificationCategory(identifier: "INCOMING_CALL", actions: [accept, reject], intentIdentifiers: [])])
+        Diagnostics.shared.record(role: .B, category: "iPhoneAPNsRegistrationStarted", value: "started")
+        Task { await NotificationRuntime.shared.api.reportNotificationDiagnostic(event: "apns_registration_started", status: "started") }
+        application.registerForRemoteNotifications()
         center.requestAuthorization(options: [.alert, .sound, .badge]) { _, error in
             center.getNotificationSettings { settings in
                 Task { @MainActor in
                     let status = Self.authorizationStatus(settings.authorizationStatus, error: error)
                     Diagnostics.shared.record(role: .B, category: "iPhoneNotificationPermission", value: status)
                     await NotificationRuntime.shared.api.reportNotificationDiagnostic(event: "notification_permission", status: status)
-                    guard Self.canRegister(settings.authorizationStatus), error == nil else { return }
-                    Diagnostics.shared.record(role: .B, category: "iPhoneAPNsRegistrationStarted", value: "started")
-                    await NotificationRuntime.shared.api.reportNotificationDiagnostic(event: "apns_registration_started", status: "started")
-                    application.registerForRemoteNotifications()
+                    if settings.authorizationStatus == .denied {
+                        Diagnostics.shared.record(role: .B, category: "notificationCapability", value: CallFailure.notificationUnavailable.rawValue)
+                    }
                 }
             }
         }
@@ -59,10 +61,6 @@ final class IOSNotificationController: NSObject, UIApplicationDelegate, UNUserNo
                 }
             }
         }
-    }
-
-    private static func canRegister(_ status: UNAuthorizationStatus) -> Bool {
-        status == .authorized || status == .provisional || status == .ephemeral
     }
 
     private static func authorizationStatus(_ status: UNAuthorizationStatus, error: Error?) -> String {

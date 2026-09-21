@@ -11,16 +11,18 @@ final class WatchNotificationController: NSObject, WKApplicationDelegate, UNUser
         let accept = UNNotificationAction(identifier: "ACCEPT", title: "Accept", options: .foreground)
         let reject = UNNotificationAction(identifier: "REJECT", title: "Reject")
         center.setNotificationCategories([UNNotificationCategory(identifier: "INCOMING_CALL", actions: [accept, reject], intentIdentifiers: [])])
+        Diagnostics.shared.record(role: .A, category: "watchAPNsRegistrationStarted", value: "started")
+        Task { await NotificationRuntime.shared.api.reportNotificationDiagnostic(event: "apns_registration_started", status: "started") }
+        WKApplication.shared().registerForRemoteNotifications()
         center.requestAuthorization(options: [.alert, .sound]) { _, error in
             center.getNotificationSettings { settings in
                 Task { @MainActor in
                     let status = Self.authorizationStatus(settings.authorizationStatus, error: error)
                     Diagnostics.shared.record(role: .A, category: "watchNotificationPermission", value: status)
                     await NotificationRuntime.shared.api.reportNotificationDiagnostic(event: "notification_permission", status: status)
-                    guard Self.canRegister(settings.authorizationStatus), error == nil else { return }
-                    Diagnostics.shared.record(role: .A, category: "watchAPNsRegistrationStarted", value: "started")
-                    await NotificationRuntime.shared.api.reportNotificationDiagnostic(event: "apns_registration_started", status: "started")
-                    WKApplication.shared().registerForRemoteNotifications()
+                    if settings.authorizationStatus == .denied {
+                        Diagnostics.shared.record(role: .A, category: "notificationCapability", value: CallFailure.notificationUnavailable.rawValue)
+                    }
                 }
             }
         }
@@ -58,10 +60,6 @@ final class WatchNotificationController: NSObject, WKApplicationDelegate, UNUser
         let value = Self.failureValue(error)
         Diagnostics.shared.record(role: .A, category: "watchAPNsRegistrationFailed", value: value)
         Task { await NotificationRuntime.shared.api.reportNotificationDiagnostic(event: "apns_registration_failed", status: value) }
-    }
-
-    private static func canRegister(_ status: UNAuthorizationStatus) -> Bool {
-        status == .authorized || status == .provisional
     }
 
     private static func authorizationStatus(_ status: UNAuthorizationStatus, error: Error?) -> String {
