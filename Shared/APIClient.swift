@@ -21,10 +21,28 @@ struct APIClient: Sendable {
 
     func health() async throws -> HealthResponse { try await request("health", method: "GET", body: Optional<Data>.none) }
 
-    func registerDevice(token: Data) async throws {
+    func registerDevice(token: Data, pushType: DevicePushType = .alert) async throws {
         let value = token.map { String(format: "%02x", $0) }.joined()
-        let body = DeviceRegistrationRequest(requestID: UUID(), role: config.role, token: value, platform: config.role == .A ? "watchOS" : "iOS")
+        let body = DeviceRegistrationRequest(
+            requestID: UUID(),
+            role: config.role,
+            token: value,
+            platform: config.role == .A ? "watchOS" : "iOS",
+            pushType: pushType
+        )
         let _: EmptyResponse = try await request("devices/register", body: try encoder.encode(body))
+    }
+
+    func invalidateDevice(pushType: DevicePushType) async {
+        let body = DeviceRegistrationRequest(
+            requestID: UUID(),
+            role: config.role,
+            token: "",
+            platform: config.role == .A ? "watchOS" : "iOS",
+            pushType: pushType
+        )
+        guard let data = try? encoder.encode(body) else { return }
+        let _: EmptyResponse? = try? await request("devices/register", body: data)
     }
 
     func reportNotificationDiagnostic(event: String, status: String, tokenPrefix: String? = nil, tokenLength: Int? = nil) async {
@@ -35,7 +53,29 @@ struct APIClient: Sendable {
             event: event,
             status: status,
             tokenPrefix: tokenPrefix,
-            tokenLength: tokenLength
+            tokenLength: tokenLength,
+            stage: nil,
+            errorDomain: nil,
+            errorCode: nil
+        )
+        guard let data = try? encoder.encode(body) else { return }
+        let _: EmptyResponse? = try? await request("devices/diagnostics", body: data)
+    }
+
+
+    func reportCallKitError(stage: String, error: Error) async {
+        let value = error as NSError
+        let body = NotificationDiagnosticRequest(
+            requestID: UUID(),
+            role: config.role,
+            platform: config.role == .A ? "watchOS" : "iOS",
+            event: "callkit_error",
+            status: "failed",
+            tokenPrefix: nil,
+            tokenLength: nil,
+            stage: stage,
+            errorDomain: value.domain,
+            errorCode: value.code
         )
         guard let data = try? encoder.encode(body) else { return }
         let _: EmptyResponse? = try? await request("devices/diagnostics", body: data)

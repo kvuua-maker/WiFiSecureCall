@@ -1,9 +1,12 @@
+import PushKit
 import UIKit
 import UserNotifications
 
 @MainActor
 final class IOSNotificationController: NSObject, UIApplicationDelegate, UNUserNotificationCenterDelegate {
-    private var registrationTask: Task<Void, Never>?
+    private var alertRegistrationTask: Task<Void, Never>?
+    private var voipRegistrationTask: Task<Void, Never>?
+    private var voipRegistry: PKPushRegistry?
 
     func application(_ application: UIApplication, didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]? = nil) -> Bool {
         let center = UNUserNotificationCenter.current()
@@ -14,6 +17,7 @@ final class IOSNotificationController: NSObject, UIApplicationDelegate, UNUserNo
         Diagnostics.shared.record(role: .B, category: "iPhoneAPNsRegistrationStarted", value: "started")
         Task { await NotificationRuntime.shared.api.reportNotificationDiagnostic(event: "apns_registration_started", status: "started") }
         application.registerForRemoteNotifications()
+        configureVoIPPushes()
         center.requestAuthorization(options: [.alert, .sound, .badge]) { _, error in
             center.getNotificationSettings { settings in
                 Task { @MainActor in
@@ -43,18 +47,53 @@ final class IOSNotificationController: NSObject, UIApplicationDelegate, UNUserNo
         let hex = deviceToken.map { String(format: "%02x", $0) }.joined()
         let prefix = String(hex.prefix(8))
         Diagnostics.shared.record(role: .B, category: "iPhoneAPNsRegistrationSucceeded", value: "prefix=\(prefix) length=\(hex.count)")
-        registrationTask?.cancel()
-        registrationTask = Task { @MainActor in
+        alertRegistrationTask?.cancel()
+        alertRegistrationTask = Task { @MainActor in
             await NotificationRuntime.shared.api.reportNotificationDiagnostic(event: "apns_registration_succeeded", status: "callback", tokenPrefix: prefix, tokenLength: hex.count)
             for attempt in 1...3 {
                 do {
-                    try await NotificationRuntime.shared.api.registerDevice(token: deviceToken)
+                    try await NotificationRuntime.shared.api.registerDevice(token: deviceToken, pushType: .alert)
                     Diagnostics.shared.record(role: .B, category: "iPhoneAPNsServerRegistrationSucceeded", value: "registered")
                     return
                 } catch {
                     if attempt == 3 {
                         Diagnostics.shared.record(role: .B, category: "iPhoneAPNsRegistrationFailed", value: "serverRegistrationFailed")
                         await NotificationRuntime.shared.api.reportNotificationDiagnostic(event: "apns_registration_failed", status: "serverRegistrationFailed")
+                        return
+                    }
+                    try? await Task.sleep(nanoseconds: 1_000_000_000)
+                }
+            }
+        }
+    }
+
+    private func configureVoIPPushes() {
+        let registry = PKPushRegistry(queue: .main)
+        registry.delegate = self
+        registry.desiredPushTypes = [.voIP]
+        voipRegistry = registry
+    }
+
+    private func uploadVoIPToken(_ token: Data) {
+        let hex = token.map { String(format: "%02x", $0) }.joined()
+        let prefix = String(hex.prefix(8))
+        Diagnostics.shared.record(role: .B, category: "iPhoneVoIPRegistrationSucceeded", value: "prefix=\(prefix) length=\(hex.count)")
+        voipRegistrationTask?.cancel()
+        voipRegistrationTask = Task { @MainActor in
+            await NotificationRuntime.shared.api.reportNotificationDiagnostic(
+                event: "apns_registration_succeeded",
+                status: "voip_callback",
+                tokenPrefix: prefix,
+                tokenLength: hex.count
+            )
+            for attempt in 1...3 {
+                do {
+                    try await NotificationRuntime.shared.api.registerDevice(token: token, pushType: .voip)
+                    Diagnostics.shared.record(role: .B, category: "iPhoneVoIPServerRegistrationSucceeded", value: "registered")
+                    return
+                } catch {
+                    if attempt == 3 {
+                        Diagnostics.shared.record(role: .B, category: "iPhoneVoIPRegistrationFailed", value: "serverRegistrationFailed")
                         return
                     }
                     try? await Task.sleep(nanoseconds: 1_000_000_000)
@@ -122,10 +161,48 @@ final class IOSNotificationController: NSObject, UIApplicationDelegate, UNUserNo
     }
 
     nonisolated func userNotificationCenter(_ center: UNUserNotificationCenter, didReceive response: UNNotificationResponse) async {
-        guard let value = response.notification.request.content.userInfo["callID"] as? String, let id = UUID(uuidString: value) else { return }
+        guard let id = VoIPIncomingNotification.callID(from: response.notification.request.content.userInfo)
+                ?? ForegroundIncomingNotification.callID(from: response.notification.request.content.userInfo)
+        else { return }
         await MainActor.run {
             if response.actionIdentifier == "REJECT" { Task { _ = try? await NotificationRuntime.shared.api.mutate("reject", callID: id) } }
             else { Task { await NotificationRuntime.shared.callSession?.handleIncoming(callID: id, requestAnswer: response.actionIdentifier == "ACCEPT") } }
+        }
+    }
+}
+
+extension IOSNotificationController: PKPushRegistryDelegate {
+    nonisolated func pushRegistry(_ registry: PKPushRegistry, didUpdate pushCredentials: PKPushCredentials, for type: PKPushType) {
+        guard type == .voIP else { return }
+        let token = pushCredentials.token
+        Task { @MainActor in self.uploadVoIPToken(token) }
+    }
+
+    nonisolated func pushRegistry(_ registry: PKPushRegistry, didInvalidatePushTokenFor type: PKPushType) {
+        guard type == .voIP else { return }
+        Task { @MainActor in
+            Diagnostics.shared.record(role: .B, category: "iPhoneVoIPRegistrationInvalidated", value: "invalidated")
+            await NotificationRuntime.shared.api.invalidateDevice(pushType: .voip)
+        }
+    }
+
+    nonisolated func pushRegistry(
+        _ registry: PKPushRegistry,
+        didReceiveIncomingPushWith payload: PKPushPayload,
+        for type: PKPushType,
+        completion: @escaping () -> Void
+    ) {
+        guard type == .voIP,
+              let serverCallID = VoIPIncomingNotification.callID(from: payload.dictionaryPayload)
+        else { completion(); return }
+        Task { @MainActor in
+            guard let callSession = NotificationRuntime.shared.callSession else {
+                Diagnostics.shared.record(role: .B, callID: serverCallID, category: "incomingVoIP", value: "call_session_unavailable")
+                completion()
+                return
+            }
+            await callSession.handleIncomingVoIP(callID: serverCallID)
+            completion()
         }
     }
 }

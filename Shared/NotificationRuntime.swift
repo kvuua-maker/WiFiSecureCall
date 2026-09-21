@@ -23,12 +23,17 @@ enum ForegroundIncomingNotification {
             return .unrelated
         }
         guard
-            let value = userInfo["callID"] as? String,
+            let value = (userInfo["serverCallID"] as? String) ?? (userInfo["callID"] as? String),
             let callID = UUID(uuidString: value)
         else {
             return .invalidCallID
         }
         return .incoming(callID)
+    }
+
+    static func callID(from userInfo: [AnyHashable: Any]) -> UUID? {
+        guard case .incoming(let callID) = outcome(from: userInfo) else { return nil }
+        return callID
     }
 
     @discardableResult
@@ -41,5 +46,14 @@ enum ForegroundIncomingNotification {
             incoming(callID, false)
         }
         return result
+    }
+}
+
+enum VoIPIncomingNotification {
+    static func callID(from payload: [AnyHashable: Any]) -> UUID? {
+        guard payload["event"] as? String == "incoming_call",
+              let value = payload["serverCallID"] as? String
+        else { return nil }
+        return UUID(uuidString: value)
     }
 }

@@ -36,6 +36,7 @@ final class CallSession: ObservableObject {
     private var sequence: UInt64 = 0
     private var jitter = JitterBuffer()
     private var audioActivated = false
+    private(set) var activeCallKitUUID: UUID?
 
     init(config: AppConfig, api: APIClient? = nil, audio: AudioEngine = AudioEngine(), media: MediaTransport? = nil) {
         self.config = config
@@ -55,52 +56,113 @@ final class CallSession: ObservableObject {
         }
         callKit.onActionFailed = { [weak self] id, stage, error in
             guard let self else { return }
-            self.recordCallKitError(stage: stage, callID: id, error: error)
-            self.fail(id, .callKitRejected)
+            guard let serverCallID = self.serverCallID(for: id) else { return }
+            self.recordCallKitError(stage: stage, callID: serverCallID, error: error)
+            self.fail(serverCallID, .callKitRejected)
         }
-        callKit.onStartApproved = { [weak self] id in Task { @MainActor in await self?.createServerCall(id) } }
-        callKit.onAnswerApproved = { [weak self] id in Task { @MainActor in await self?.acceptServerCall(id) } }
-        callKit.onEndApproved = { [weak self] id in Task { @MainActor in await self?.finishFromSystem(id) } }
+        callKit.onStartApproved = { [weak self] id in
+            Task { @MainActor in
+                guard let serverCallID = self?.serverCallID(for: id) else { return }
+                await self?.createServerCall(serverCallID)
+            }
+        }
+        callKit.onAnswerApproved = { [weak self] id in
+            Task { @MainActor in
+                guard let serverCallID = self?.serverCallID(for: id) else { return }
+                await self?.acceptServerCall(serverCallID)
+            }
+        }
+        callKit.onEndApproved = { [weak self] id in
+            Task { @MainActor in
+                guard let serverCallID = self?.serverCallID(for: id) else { return }
+                await self?.finishFromSystem(serverCallID)
+            }
+        }
         callKit.onAudioActivated = { [weak self] in Task { @MainActor in self?.activateAudio() } }
         callKit.onAudioDeactivated = { [weak self] in Task { @MainActor in self?.audio.stop() } }
     }
 
     func startCall() async {
         guard case .idle = state else { return }
-        let id = UUID()
-        transition(.outgoingRinging(id))
-        do { try await callKit?.startOutgoing(id: id) }
+        let serverCallID = UUID()
+        let localCallKitUUID = distinctLocalCallKitUUID(from: serverCallID)
+        activeCallKitUUID = localCallKitUUID
+        transition(.outgoingRinging(serverCallID))
+        do { try await callKit?.startOutgoing(id: localCallKitUUID) }
         catch {
-            recordCallKitError(stage: "startOutgoing", callID: id, error: error)
-            fail(id, .callKitRejected)
+            recordCallKitError(stage: "startOutgoing", callID: serverCallID, error: error)
+            fail(serverCallID, .callKitRejected)
         }
     }
 
     func handleIncoming(callID: UUID, requestAnswer: Bool) async {
+        if state.callID == callID {
+            if requestAnswer, case .incomingRinging = state, let localCallKitUUID = activeCallKitUUID {
+                do { try await callKit?.requestAnswer(id: localCallKitUUID) }
+                catch {
+                    recordCallKitError(stage: "requestAnswer", callID: callID, error: error)
+                    fail(callID, .callKitRejected)
+                }
+            }
+            return
+        }
         guard case .idle = state else { return }
         let current: CallResponse
         do { current = try await api.call(callID) }
         catch { fail(callID, .serverUnavailable); return }
         guard current.state == .ringing else { fail(callID, current.state == .expired ? .callExpired : .invalidServerState); return }
+        await reportIncoming(callID: callID, requestAnswer: requestAnswer)
+    }
+
+    func handleIncomingVoIP(callID: UUID) async {
+        if state.callID == callID { return }
+        guard case .idle = state else { return }
+        let reported = await reportIncoming(callID: callID, requestAnswer: false)
+        guard reported else { return }
+        Task { [weak self] in await self?.validateIncomingCall(callID) }
+    }
+
+    @discardableResult
+    private func reportIncoming(callID: UUID, requestAnswer: Bool) async -> Bool {
+        let localCallKitUUID = distinctLocalCallKitUUID(from: callID)
+        activeCallKitUUID = localCallKitUUID
         transition(.incomingRinging(callID))
-        do { try await callKit?.reportIncoming(id: callID) }
+        do { try await callKit?.reportIncoming(id: localCallKitUUID) }
         catch {
             recordCallKitError(stage: "reportIncoming", callID: callID, error: error)
             fail(callID, .callKitRejected)
-            return
+            return false
         }
         if requestAnswer {
-            do { try await callKit?.requestAnswer(id: callID) }
+            do { try await callKit?.requestAnswer(id: localCallKitUUID) }
             catch {
                 recordCallKitError(stage: "requestAnswer", callID: callID, error: error)
                 fail(callID, .callKitRejected)
+                return false
             }
+        }
+        return true
+    }
+
+    private func validateIncomingCall(_ callID: UUID) async {
+        do {
+            let current = try await api.call(callID)
+            guard state.callID == callID else { return }
+            switch current.state {
+            case .ringing, .accepted: return
+            case .expired: fail(callID, .callExpired)
+            default: fail(callID, .invalidServerState)
+            }
+        } catch {
+            guard state.callID == callID else { return }
+            fail(callID, .serverUnavailable)
         }
     }
 
     func accept() async {
         guard case let .incomingRinging(id) = state else { return }
-        do { try await callKit?.requestAnswer(id: id) }
+        guard let localCallKitUUID = activeCallKitUUID else { fail(id, .callKitRejected); return }
+        do { try await callKit?.requestAnswer(id: localCallKitUUID) }
         catch {
             recordCallKitError(stage: "requestAnswer", callID: id, error: error)
             fail(id, .callKitRejected)
@@ -109,7 +171,13 @@ final class CallSession: ObservableObject {
 
     func reject() async {
         guard case let .incomingRinging(id) = state else { return }
-        do { _ = try await api.mutate("reject", callID: id); transition(.ending(id)); callKit?.reportEnded(id: id); transition(.ended(id)) }
+        do {
+            _ = try await api.mutate("reject", callID: id)
+            transition(.ending(id))
+            reportCallKitEnded()
+            transition(.ended(id))
+            clearCallIdentity()
+        }
         catch { fail(id, .serverUnavailable) }
     }
 
@@ -121,7 +189,8 @@ final class CallSession: ObservableObject {
 
     func endCall() async {
         guard let id = state.callID else { return }
-        do { try await callKit?.requestEnd(id: id) }
+        guard let localCallKitUUID = activeCallKitUUID else { await finishFromSystem(id); return }
+        do { try await callKit?.requestEnd(id: localCallKitUUID) }
         catch {
             recordCallKitError(stage: "requestEnd", callID: id, error: error)
             await finishFromSystem(id)
@@ -130,6 +199,7 @@ final class CallSession: ObservableObject {
 
     func reset() {
         guard state.isTerminal else { return }
+        clearCallIdentity()
         transition(.idle)
     }
 
@@ -137,7 +207,7 @@ final class CallSession: ObservableObject {
 
     private func createServerCall(_ id: UUID) async {
         do {
-            let response = try await api.create(callID: id, requestID: id)
+            let response = try await api.create(callID: id, requestID: UUID())
             guard response.state == .ringing else { fail(id, .invalidServerState); return }
             pollingTask = Task { [weak self] in await self?.poll(id) }
         } catch { fail(id, .serverUnavailable) }
@@ -236,14 +306,16 @@ final class CallSession: ObservableObject {
     private func end(_ id: UUID) async {
         pollingTask?.cancel(); reconnectTask?.cancel(); watchdogTask?.cancel(); durationTask?.cancel()
         if !state.isTerminal { transition(.ending(id)) }
-        await media.close(); audio.stop(); callKit?.reportEnded(id: id)
+        await media.close(); audio.stop(); reportCallKitEnded()
         transition(.ended(id))
+        clearCallIdentity()
     }
 
     private func fail(_ id: UUID?, _ failure: CallFailure) {
         pollingTask?.cancel(); reconnectTask?.cancel(); watchdogTask?.cancel(); durationTask?.cancel()
-        audio.stop(); Task { await media.close() }
+        audio.stop(); Task { await media.close() }; reportCallKitEnded()
         transition(.failed(id, failure))
+        clearCallIdentity()
     }
 
     private func transition(_ next: CallState) {
@@ -260,6 +332,27 @@ final class CallSession: ObservableObject {
             category: "callKitError",
             value: "stage=\(stage) domain=\(value.domain) code=\(value.code)"
         )
+        Task { await api.reportCallKitError(stage: stage, error: error) }
+    }
+
+    private func serverCallID(for localCallKitUUID: UUID) -> UUID? {
+        guard activeCallKitUUID == localCallKitUUID else { return nil }
+        return state.callID
+    }
+
+    private func distinctLocalCallKitUUID(from serverCallID: UUID) -> UUID {
+        var value = UUID()
+        while value == serverCallID { value = UUID() }
+        return value
+    }
+
+    private func reportCallKitEnded() {
+        guard let localCallKitUUID = activeCallKitUUID else { return }
+        callKit?.reportEnded(id: localCallKitUUID)
+    }
+
+    private func clearCallIdentity() {
+        activeCallKitUUID = nil
     }
 
     private func startDurationTimer() {

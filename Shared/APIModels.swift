@@ -2,11 +2,14 @@ import Foundation
 
 enum DeviceRole: String, Codable, Sendable { case A, B }
 
+enum DevicePushType: String, Codable, Sendable { case alert, voip }
+
 struct DeviceRegistrationRequest: Codable, Sendable {
     let requestID: UUID
     let role: DeviceRole
     let token: String
     let platform: String
+    let pushType: DevicePushType
 }
 
 struct NotificationDiagnosticRequest: Codable, Sendable {
@@ -17,6 +20,9 @@ struct NotificationDiagnosticRequest: Codable, Sendable {
     let status: String
     let tokenPrefix: String?
     let tokenLength: Int?
+    let stage: String?
+    let errorDomain: String?
+    let errorCode: Int?
 }
 
 struct CallMutationRequest: Codable, Sendable { let requestID: UUID }
