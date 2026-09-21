@@ -1,8 +1,17 @@
 import Foundation
 
+struct MediaTransportDiagnostic: Sendable {
+    let event: String
+    let status: String
+    let callID: UUID
+    let errorDomain: String?
+    let errorCode: Int?
+}
+
 protocol MediaTransport: AnyObject, Sendable {
     var onPacket: (@Sendable (AudioPacket) -> Void)? { get set }
-    var onDisconnect: (@Sendable () -> Void)? { get set }
+    var onDisconnect: (@Sendable (UUID) -> Void)? { get set }
+    var onDiagnostic: (@Sendable (MediaTransportDiagnostic) -> Void)? { get set }
     func connect(callID: UUID, role: DeviceRole, token: String) async throws
     func send(_ packet: AudioPacket) async throws
     func close() async

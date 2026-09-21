@@ -56,14 +56,15 @@ struct APIClient: Sendable {
             tokenLength: tokenLength,
             stage: nil,
             errorDomain: nil,
-            errorCode: nil
+            errorCode: nil,
+            callID: nil
         )
         guard let data = try? encoder.encode(body) else { return }
         let _: EmptyResponse? = try? await request("devices/diagnostics", body: data)
     }
 
 
-    func reportCallKitError(stage: String, error: Error) async {
+    func reportCallKitError(stage: String, callID: UUID, error: Error) async {
         let value = error as NSError
         let body = NotificationDiagnosticRequest(
             requestID: UUID(),
@@ -75,7 +76,32 @@ struct APIClient: Sendable {
             tokenLength: nil,
             stage: stage,
             errorDomain: value.domain,
-            errorCode: value.code
+            errorCode: value.code,
+            callID: callID
+        )
+        guard let data = try? encoder.encode(body) else { return }
+        let _: EmptyResponse? = try? await request("devices/diagnostics", body: data)
+    }
+
+    func reportRuntimeDiagnostic(
+        event: String,
+        status: String,
+        callID: UUID?,
+        errorDomain: String? = nil,
+        errorCode: Int? = nil
+    ) async {
+        let body = NotificationDiagnosticRequest(
+            requestID: UUID(),
+            role: config.role,
+            platform: config.role == .A ? "watchOS" : "iOS",
+            event: event,
+            status: status,
+            tokenPrefix: nil,
+            tokenLength: nil,
+            stage: nil,
+            errorDomain: errorDomain,
+            errorCode: errorCode,
+            callID: callID
         )
         guard let data = try? encoder.encode(body) else { return }
         let _: EmptyResponse? = try? await request("devices/diagnostics", body: data)

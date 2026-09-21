@@ -23,6 +23,7 @@ struct NotificationDiagnosticRequest: Codable, Sendable {
     let stage: String?
     let errorDomain: String?
     let errorCode: Int?
+    let callID: UUID?
 }
 
 struct CallMutationRequest: Codable, Sendable { let requestID: UUID }
