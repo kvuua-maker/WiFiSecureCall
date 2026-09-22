@@ -55,6 +55,35 @@ final class NotificationRuntime {
         await callSession.handleIncomingVoIP(callID: callID)
     }
 
+    func handleIncomingBackgroundNotification(callID: UUID) async -> Bool {
+        callSession.recordLifecycleDiagnostic("watch_background_notification_received", status: "received", callID: callID)
+        if callSession.state.callID == callID {
+            callSession.recordLifecycleDiagnostic("duplicate_incoming_suppressed", status: "same_server_call_id", callID: callID)
+            switch callSession.state {
+            case .incomingRinging, .connecting, .active, .reconnecting:
+                return true
+            default:
+                return false
+            }
+        }
+        guard ensureCallKit() != nil else {
+            callSession.recordLifecycleDiagnostic("watch_background_callkit_handoff", status: "provider_unavailable", callID: callID)
+            return false
+        }
+        callSession.recordLifecycleDiagnostic("watch_background_callkit_handoff", status: "started", callID: callID)
+        await callSession.handleIncomingVoIP(callID: callID)
+        let reported: Bool
+        switch callSession.state {
+        case let .incomingRinging(currentCallID), let .connecting(currentCallID),
+             let .active(currentCallID), let .reconnecting(currentCallID):
+            reported = currentCallID == callID
+        default:
+            reported = false
+        }
+        callSession.recordLifecycleDiagnostic("watch_background_callkit_handoff", status: reported ? "success" : "not_reported", callID: callID)
+        return reported
+    }
+
     func handleIncomingAlert(callID: UUID, requestAnswer: Bool) async {
         guard ensureCallKit() != nil else { return }
         await callSession.handleIncoming(callID: callID, requestAnswer: requestAnswer)

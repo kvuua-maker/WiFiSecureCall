@@ -393,6 +393,74 @@ final class WiFiSecureCallTests: XCTestCase {
     }
 
     @MainActor
+    func testBackgroundIncomingCreatesSingleCallKitIncoming() async throws {
+        let capture = RequestCapture()
+        let runtime = makeRuntime(capture: capture, role: .A)
+        let adapter = RetainedCallKitMock()
+        runtime.configureCallKitFactory { adapter }
+        let serverCallID = UUID()
+
+        let handled = await runtime.handleIncomingBackgroundNotification(callID: serverCallID)
+
+        XCTAssertTrue(handled)
+        let localCallKitUUID = try XCTUnwrap(adapter.incomingIDs.first)
+        XCTAssertEqual(adapter.incomingIDs.count, 1)
+        XCTAssertNotEqual(localCallKitUUID, serverCallID)
+        XCTAssertEqual(runtime.callSession.state.callID, serverCallID)
+    }
+
+    @MainActor
+    func testDuplicateBackgroundIncomingSameCallIsSuppressed() async {
+        let runtime = makeRuntime(capture: RequestCapture(), role: .A)
+        let adapter = RetainedCallKitMock()
+        runtime.configureCallKitFactory { adapter }
+        let callID = UUID()
+
+        let firstHandled = await runtime.handleIncomingBackgroundNotification(callID: callID)
+        let secondHandled = await runtime.handleIncomingBackgroundNotification(callID: callID)
+        XCTAssertTrue(firstHandled)
+        XCTAssertTrue(secondHandled)
+
+        XCTAssertEqual(adapter.incomingIDs.count, 1)
+        XCTAssertEqual(runtime.callSession.state.callID, callID)
+    }
+
+    @MainActor
+    func testBackgroundIncomingCannotReplaceDifferentBusyCall() async {
+        let runtime = makeRuntime(capture: RequestCapture(), role: .A)
+        let adapter = RetainedCallKitMock()
+        runtime.configureCallKitFactory { adapter }
+        let firstCallID = UUID(), secondCallID = UUID()
+
+        let firstHandled = await runtime.handleIncomingBackgroundNotification(callID: firstCallID)
+        let secondHandled = await runtime.handleIncomingBackgroundNotification(callID: secondCallID)
+        XCTAssertTrue(firstHandled)
+        XCTAssertFalse(secondHandled)
+
+        XCTAssertEqual(adapter.incomingIDs.count, 1)
+        XCTAssertEqual(runtime.callSession.state.callID, firstCallID)
+    }
+
+    @MainActor
+    func testTerminalSameCallBackgroundDuplicateDoesNotResurrectCall() async {
+        let capture = RequestCapture()
+        capture.getState = .cancelled
+        let runtime = makeRuntime(capture: capture, role: .A)
+        let adapter = RetainedCallKitMock()
+        runtime.configureCallKitFactory { adapter }
+        let callID = UUID()
+
+        _ = await runtime.handleIncomingBackgroundNotification(callID: callID)
+        await eventually { runtime.callSession.state.isTerminal }
+        let reportsBeforeDuplicate = adapter.incomingIDs.count
+
+        let duplicateHandled = await runtime.handleIncomingBackgroundNotification(callID: callID)
+        XCTAssertFalse(duplicateHandled)
+        XCTAssertTrue(runtime.callSession.state.isTerminal)
+        XCTAssertEqual(adapter.incomingIDs.count, reportsBeforeDuplicate)
+    }
+
+    @MainActor
     func testSimultaneousEnsureCallKitCreatesExactlyOneProvider() async {
         let runtime = makeRuntime(capture: RequestCapture())
         var creations = 0

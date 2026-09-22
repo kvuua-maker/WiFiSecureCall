@@ -7,6 +7,7 @@ final class WatchNotificationController: NSObject, WKApplicationDelegate, UNUser
     private var alertRegistrationTask: Task<Void, Never>?
     private var voipRegistrationTask: Task<Void, Never>?
     private var voipRegistry: PKPushRegistry?
+    private var lastAlertToken: Data?
     private var lastVoIPToken: Data?
     private var notificationsAuthorized = false
 
@@ -20,12 +21,22 @@ final class WatchNotificationController: NSObject, WKApplicationDelegate, UNUser
         WKApplication.shared().registerForRemoteNotifications(); configureVoIPPushes()
         Task { await NotificationRuntime.shared.api.reportNotificationDiagnostic(event: "apns_registration_started", status: "started") }
         center.requestAuthorization(options: [.alert, .sound]) { _, error in
-            center.getNotificationSettings { settings in Task { @MainActor in
-                self.notificationsAuthorized = settings.authorizationStatus == .authorized || settings.authorizationStatus == .provisional
-                let status = Self.authorizationStatus(settings.authorizationStatus, error: error)
-                Diagnostics.shared.record(role: .A, category: "notificationPermission", value: status)
-                await NotificationRuntime.shared.api.reportNotificationDiagnostic(event: "notification_permission", status: status)
-            } }
+            Task { @MainActor in await self.refreshNotificationAuthorization(requestError: error) }
+        }
+    }
+
+    func applicationDidBecomeActive() {
+        Task { await refreshNotificationAuthorization() }
+    }
+
+    nonisolated func didReceiveRemoteNotification(_ userInfo: [AnyHashable: Any], fetchCompletionHandler completionHandler: @escaping (WKBackgroundFetchResult) -> Void) {
+        guard let callID = ForegroundIncomingNotification.callID(from: userInfo) else {
+            completionHandler(.noData)
+            return
+        }
+        Task { @MainActor in
+            let handled = await NotificationRuntime.shared.handleIncomingBackgroundNotification(callID: callID)
+            completionHandler(handled ? .newData : .noData)
         }
     }
 
@@ -34,7 +45,8 @@ final class WatchNotificationController: NSObject, WKApplicationDelegate, UNUser
     private func configureVoIPPushes() { let registry = PKPushRegistry(queue: .main); registry.delegate = self; registry.desiredPushTypes = [.voIP]; voipRegistry = registry }
 
     private func upload(_ token: Data, pushType: DevicePushType) {
-        if pushType == .voip { lastVoIPToken = token }
+        if pushType == .alert { lastAlertToken = token }
+        else { lastVoIPToken = token }
         let task = Task { @MainActor in
             await NotificationRuntime.shared.api.reportNotificationDiagnostic(event: "apns_registration_succeeded", status: "\(pushType.rawValue)_callback")
             for attempt in 1...3 {
@@ -54,9 +66,33 @@ final class WatchNotificationController: NSObject, WKApplicationDelegate, UNUser
         else { voipRegistrationTask?.cancel(); voipRegistrationTask = task }
     }
 
+    private func refreshNotificationAuthorization(requestError: Error? = nil) async {
+        let settings = await withCheckedContinuation { continuation in
+            UNUserNotificationCenter.current().getNotificationSettings { continuation.resume(returning: $0) }
+        }
+        let previous = notificationsAuthorized
+        let current: Bool
+        switch settings.authorizationStatus {
+        case .authorized, .provisional, .ephemeral: current = true
+        case .notDetermined, .denied: current = false
+        @unknown default: current = false
+        }
+        notificationsAuthorized = current
+        let status = Self.authorizationStatus(settings.authorizationStatus, error: requestError)
+        Diagnostics.shared.record(role: .A, category: "notificationPermission", value: status)
+        await NotificationRuntime.shared.api.reportNotificationDiagnostic(event: "notification_permission", status: status)
+        guard previous != current else { return }
+        await NotificationRuntime.shared.api.reportNotificationDiagnostic(event: "watch_notification_capabilities_refreshed", status: current ? "authorized" : "unauthorized")
+        if let lastAlertToken {
+            upload(lastAlertToken, pushType: .alert)
+        } else {
+            WKApplication.shared().registerForRemoteNotifications()
+        }
+    }
+
     private func capabilities() -> DeviceCapabilities { .init(voipPush: true, alertPush: true, notificationsAuthorized: notificationsAuthorized, microphoneReady: true) }
     private func registrationFailed(_ error: Error) { let value = error as NSError; Diagnostics.shared.record(role: .A, category: "pushRegistration", value: "failed \(value.domain):\(value.code)"); Task { await NotificationRuntime.shared.api.reportNotificationDiagnostic(event: "apns_registration_failed", status: "domain=\(value.domain) code=\(value.code)") } }
-    private static func authorizationStatus(_ status: UNAuthorizationStatus, error: Error?) -> String { if error != nil { return "error" }; switch status { case .notDetermined: return "notDetermined"; case .denied: return "denied"; case .authorized: return "authorized"; case .provisional: return "provisional"; @unknown default: return "unknown" } }
+    private static func authorizationStatus(_ status: UNAuthorizationStatus, error: Error?) -> String { if error != nil { return "error" }; switch status { case .notDetermined: return "notDetermined"; case .denied: return "denied"; case .authorized: return "authorized"; case .provisional: return "provisional"; case .ephemeral: return "ephemeral"; @unknown default: return "unknown" } }
 
     nonisolated func userNotificationCenter(_ center: UNUserNotificationCenter, willPresent notification: UNNotification, withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void) {
         switch ForegroundIncomingNotification.outcome(from: notification.request.content.userInfo) {
@@ -67,6 +103,11 @@ final class WatchNotificationController: NSObject, WKApplicationDelegate, UNUser
 
     nonisolated func userNotificationCenter(_ center: UNUserNotificationCenter, didReceive response: UNNotificationResponse) async {
         guard let callID = VoIPIncomingNotification.callID(from: response.notification.request.content.userInfo) ?? ForegroundIncomingNotification.callID(from: response.notification.request.content.userInfo) else { return }
+        let actionStatus: String
+        if response.actionIdentifier == "REJECT" { actionStatus = "reject" }
+        else if response.actionIdentifier == "ACCEPT" { actionStatus = "accept" }
+        else { actionStatus = "default" }
+        await MainActor.run { NotificationRuntime.shared.callSession.recordLifecycleDiagnostic("watch_alert_action_received", status: actionStatus, callID: callID) }
         await NotificationRuntime.shared.handleIncomingAlert(callID: callID, requestAnswer: false)
         let session = await MainActor.run { NotificationRuntime.shared.callSession }
         if response.actionIdentifier == "REJECT" { await session.reject() }
