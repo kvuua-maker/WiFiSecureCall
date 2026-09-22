@@ -23,7 +23,6 @@ struct PCMSignalMetrics: Equatable, Sendable {
 enum AudioFlowFailureStage: String, Equatable, Sendable {
     case noMicCallback = "no_mic_callback"
     case conversionFailure = "conversion_failure"
-    case zeroSignal = "zero_signal"
     case sendFailure = "send_failure"
     case receiveAbsent = "receive_absent"
     case playbackScheduleFailure = "playback_schedule_failure"
@@ -33,7 +32,6 @@ enum AudioFlowFailureStage: String, Equatable, Sendable {
 struct AudioFlowMilestones: Equatable, Sendable {
     var micCallback = false
     var networkPCMGenerated = false
-    var localNonzeroPCM = false
     var networkFrameSent = false
     var remoteFrameReceived = false
     var playbackScheduled = false
@@ -42,12 +40,26 @@ struct AudioFlowMilestones: Equatable, Sendable {
     var failureStage: AudioFlowFailureStage? {
         if !micCallback { return .noMicCallback }
         if !networkPCMGenerated { return .conversionFailure }
-        if !localNonzeroPCM { return .zeroSignal }
         if !networkFrameSent { return .sendFailure }
         if !remoteFrameReceived { return .receiveAbsent }
         if !playbackScheduled { return .playbackScheduleFailure }
         if !playbackRendered { return .renderFailure }
         return nil
+    }
+
+    func isOperational(transportActive: Bool) -> Bool {
+        transportActive && micCallback && networkPCMGenerated && networkFrameSent &&
+            remoteFrameReceived && playbackRendered
+    }
+}
+
+enum AudioWatchdogAction: Equatable, Sendable { case recover, preserveCall }
+
+enum AudioWatchdogPolicy {
+    static func action(for stage: AudioFlowFailureStage, recoveryAvailable: Bool) -> AudioWatchdogAction {
+        let structural = stage == .noMicCallback || stage == .conversionFailure ||
+            stage == .playbackScheduleFailure || stage == .renderFailure
+        return structural && recoveryAvailable ? .recover : .preserveCall
     }
 }
 
@@ -217,6 +229,8 @@ final class AudioEngine: AudioEngineHandling, @unchecked Sendable {
     private var firstPlaybackNonzeroReported = false
     private var firstPlaybackRenderedReported = false
     private var firstPlaybackFailureReported = false
+    private var playbackOverflowReported = false
+    private var peakScheduledBuffers = 0
     private var observers: [NSObjectProtocol] = []
 
     init() { engine.attach(player); installObservers() }
@@ -454,7 +468,10 @@ final class AudioEngine: AudioEngineHandling, @unchecked Sendable {
             let error = NSError(domain: "WiFiSecureCall.AudioEngine", code: 32)
             reportPlaybackFailure(error); onFailure?(.playbackConversion); return
         }
-        guard scheduledBuffers < maximumScheduledBuffers else { emit("playback_overflow", "dropped"); return }
+        guard scheduledBuffers < maximumScheduledBuffers else {
+            if !playbackOverflowReported { playbackOverflowReported = true; emit("playback_overflow", "dropped depth=\(scheduledBuffers)") }
+            return
+        }
         if let metrics = Self.signalMetrics(forCanonicalPCM: payload), metrics.hasNonzeroSignal, !firstPlaybackNonzeroReported {
             firstPlaybackNonzeroReported = true
             emit("first_playback_nonzero_input", metricsDescription(metrics))
@@ -466,6 +483,7 @@ final class AudioEngine: AudioEngineHandling, @unchecked Sendable {
         guard status != .error, error == nil, converted.frameLength > 0 else { reportPlaybackFailure(error ?? NSError(domain: "WiFiSecureCall.AudioEngine", code: 35)); onFailure?(.playbackConversion); return }
         if !player.isPlaying { player.play() }
         scheduledBuffers += 1
+        peakScheduledBuffers = max(peakScheduledBuffers, scheduledBuffers)
         player.scheduleBuffer(converted, completionCallbackType: .dataRendered) { [weak self] _ in
             guard let self else { return }
             self.playbackQueue.async {
@@ -473,7 +491,7 @@ final class AudioEngine: AudioEngineHandling, @unchecked Sendable {
                 if !self.firstPlaybackRenderedReported { self.firstPlaybackRenderedReported = true; self.emit("first_playback_buffer_rendered", "rendered") }
             }
         }
-        if !firstPlaybackScheduledReported { firstPlaybackScheduledReported = true; emit("first_playback_buffer_scheduled", "frameLength=\(converted.frameLength)") }
+        if !firstPlaybackScheduledReported { firstPlaybackScheduledReported = true; emit("first_playback_buffer_scheduled", "frameLength=\(converted.frameLength) depth=\(scheduledBuffers) peak=\(peakScheduledBuffers)") }
     }
 
     private func cleanupGraph() {
@@ -510,7 +528,7 @@ final class AudioEngine: AudioEngineHandling, @unchecked Sendable {
     }
     private func formatDescription(_ format: AVAudioFormat) -> String { "sampleRate=\(format.sampleRate) channelCount=\(format.channelCount) commonFormat=\(format.commonFormat.rawValue) interleaved=\(format.isInterleaved)" }
     private func metricsDescription(_ metrics: PCMSignalMetrics) -> String { "frames=\(metrics.frameCount) rms=\(metrics.rms) peak=\(metrics.peak) nonzero=\(metrics.nonzeroCount)" }
-    private func resetFirstFlags() { firstMicBufferReported = false; firstMicNonzeroReported = false; firstNetworkFrameReported = false; firstNetworkNonzeroReported = false; firstCaptureFailureReported = false; firstPlaybackScheduledReported = false; firstPlaybackNonzeroReported = false; firstPlaybackRenderedReported = false; firstPlaybackFailureReported = false }
+    private func resetFirstFlags() { firstMicBufferReported = false; firstMicNonzeroReported = false; firstNetworkFrameReported = false; firstNetworkNonzeroReported = false; firstCaptureFailureReported = false; firstPlaybackScheduledReported = false; firstPlaybackNonzeroReported = false; firstPlaybackRenderedReported = false; firstPlaybackFailureReported = false; playbackOverflowReported = false; peakScheduledBuffers = 0 }
     private func reportCaptureFailure(_ error: NSError) { guard !firstCaptureFailureReported else { return }; firstCaptureFailureReported = true; emit("first_capture_conversion_failure", "failed", error: error); onFailure?(.captureConversion) }
     private func reportPlaybackFailure(_ error: NSError) { guard !firstPlaybackFailureReported else { return }; firstPlaybackFailureReported = true; emit("first_playback_failure", "failed", error: error) }
     private func emit(_ event: String, _ status: String, error: NSError? = nil) { onDiagnostic?(.init(event: event, status: status, errorDomain: error?.domain, errorCode: error?.code)) }

@@ -43,7 +43,7 @@ final class WiFiSecureCallTests: XCTestCase {
 
     func testJitterBufferIsBoundedAndFillsMissingFrameWithNil() {
         let id = UUID(); var buffer = JitterBuffer(initialMilliseconds: 60, maximumMilliseconds: 120)
-        for value in 1...20 { buffer.insert(AudioPacket(type: .audio, callID: id, sequence: UInt64(value), timestampMicroseconds: 0, payload: Data())) }
+        for value in 1...20 { buffer.insert(AudioPacket(type: .audio, callID: id, sequence: UInt64(value), timestampMicroseconds: 0, payload: Data(repeating: UInt8(value), count: 640))) }
         XCTAssertLessThanOrEqual(buffer.packets.count, 6)
         var missing = JitterBuffer(initialMilliseconds: 40); missing.insert(AudioPacket(type: .audio, callID: id, sequence: 4, timestampMicroseconds: 0, payload: Data(repeating: 1, count: 640)))
         missing.insert(AudioPacket(type: .audio, callID: id, sequence: 6, timestampMicroseconds: 0, payload: Data(repeating: 2, count: 640)))
@@ -145,18 +145,100 @@ final class WiFiSecureCallTests: XCTestCase {
     func testAudioFlowWatchdogClassifiesEveryMissingStage() {
         XCTAssertEqual(AudioFlowMilestones().failureStage, .noMicCallback)
         XCTAssertEqual(AudioFlowMilestones(micCallback: true).failureStage, .conversionFailure)
-        XCTAssertEqual(AudioFlowMilestones(micCallback: true, networkPCMGenerated: true).failureStage, .zeroSignal)
-        XCTAssertEqual(AudioFlowMilestones(micCallback: true, networkPCMGenerated: true, localNonzeroPCM: true).failureStage, .sendFailure)
-        XCTAssertEqual(AudioFlowMilestones(micCallback: true, networkPCMGenerated: true, localNonzeroPCM: true, networkFrameSent: true).failureStage, .receiveAbsent)
-        XCTAssertEqual(AudioFlowMilestones(micCallback: true, networkPCMGenerated: true, localNonzeroPCM: true, networkFrameSent: true, remoteFrameReceived: true).failureStage, .playbackScheduleFailure)
-        XCTAssertEqual(AudioFlowMilestones(micCallback: true, networkPCMGenerated: true, localNonzeroPCM: true, networkFrameSent: true, remoteFrameReceived: true, playbackScheduled: true).failureStage, .renderFailure)
-        XCTAssertNil(AudioFlowMilestones(micCallback: true, networkPCMGenerated: true, localNonzeroPCM: true, networkFrameSent: true, remoteFrameReceived: true, playbackScheduled: true, playbackRendered: true).failureStage)
+        XCTAssertEqual(AudioFlowMilestones(micCallback: true, networkPCMGenerated: true).failureStage, .sendFailure)
+        XCTAssertEqual(AudioFlowMilestones(micCallback: true, networkPCMGenerated: true, networkFrameSent: true).failureStage, .receiveAbsent)
+        XCTAssertEqual(AudioFlowMilestones(micCallback: true, networkPCMGenerated: true, networkFrameSent: true, remoteFrameReceived: true).failureStage, .playbackScheduleFailure)
+        XCTAssertEqual(AudioFlowMilestones(micCallback: true, networkPCMGenerated: true, networkFrameSent: true, remoteFrameReceived: true, playbackScheduled: true).failureStage, .renderFailure)
+        let complete = AudioFlowMilestones(micCallback: true, networkPCMGenerated: true, networkFrameSent: true, remoteFrameReceived: true, playbackScheduled: true, playbackRendered: true)
+        XCTAssertNil(complete.failureStage)
+        XCTAssertTrue(complete.isOperational(transportActive: true), "Silence is valid; operational state must not require nonzero voice energy")
+        XCTAssertFalse(complete.isOperational(transportActive: false))
     }
 
     func testAudioRecoveryBudgetAllowsExactlyOneRecoveryPerGeneration() {
         var budget = AudioRecoveryBudget()
         XCTAssertTrue(budget.claim())
         XCTAssertFalse(budget.claim())
+    }
+
+    func testAudioWatchdogPreservesCallAfterRecoveryBudgetAndForTransportStages() {
+        XCTAssertEqual(AudioWatchdogPolicy.action(for: .noMicCallback, recoveryAvailable: true), .recover)
+        XCTAssertEqual(AudioWatchdogPolicy.action(for: .noMicCallback, recoveryAvailable: false), .preserveCall)
+        XCTAssertEqual(AudioWatchdogPolicy.action(for: .sendFailure, recoveryAvailable: true), .preserveCall)
+        XCTAssertEqual(AudioWatchdogPolicy.action(for: .receiveAbsent, recoveryAvailable: true), .preserveCall)
+    }
+
+    func testJitterBufferReordersDropsDuplicatesAndLatePackets() {
+        let id = UUID()
+        func packet(_ sequence: UInt64) -> AudioPacket {
+            AudioPacket(type: .audio, callID: id, sequence: sequence, timestampMicroseconds: sequence * 20_000, payload: Data(repeating: UInt8(sequence), count: 640))
+        }
+        var jitter = JitterBuffer(initialMilliseconds: 100, maximumMilliseconds: 240)
+        [2, 1, 3, 5, 4].forEach { jitter.insert(packet(UInt64($0))) }
+        XCTAssertEqual(jitter.stats.reordered, 2)
+        jitter.insert(packet(4))
+        XCTAssertEqual(jitter.stats.duplicateDropped, 1)
+        for sequence in 1...5 { XCTAssertEqual(jitter.nextPayload(), packet(UInt64(sequence)).payload) }
+        jitter.insert(packet(3))
+        XCTAssertEqual(jitter.stats.lateDropped, 1)
+    }
+
+    func testJitterMissingFrameUsesBoundedGraceThenConcealment() {
+        let id = UUID()
+        func packet(_ sequence: UInt64, byte: UInt8) -> AudioPacket {
+            AudioPacket(type: .audio, callID: id, sequence: sequence, timestampMicroseconds: sequence * 20_000, payload: Data(repeating: byte, count: 640))
+        }
+        var jitter = JitterBuffer(initialMilliseconds: 40, maximumMilliseconds: 200, lateGraceMilliseconds: 20)
+        jitter.insert(packet(10, byte: 10)); jitter.insert(packet(12, byte: 12))
+        XCTAssertEqual(jitter.nextPayload(), packet(10, byte: 10).payload)
+        XCTAssertEqual(jitter.nextPayload(), Data(repeating: 0, count: 640))
+        XCTAssertEqual(jitter.stats.missingConcealed, 0)
+        XCTAssertEqual(jitter.nextPayload(), Data(repeating: 0, count: 640))
+        XCTAssertEqual(jitter.stats.missingConcealed, 1)
+        XCTAssertEqual(jitter.nextPayload(), packet(12, byte: 12).payload)
+    }
+
+    func testJitterLargeDiscontinuityRebasesDeterministically() {
+        let id = UUID(), payload = Data(repeating: 1, count: 640)
+        var jitter = JitterBuffer(initialMilliseconds: 40, maximumMilliseconds: 200)
+        jitter.insert(AudioPacket(type: .audio, callID: id, sequence: 1, timestampMicroseconds: 0, payload: payload))
+        jitter.insert(AudioPacket(type: .audio, callID: id, sequence: 2, timestampMicroseconds: 20_000, payload: payload))
+        XCTAssertEqual(jitter.nextPayload(), payload)
+        jitter.insert(AudioPacket(type: .audio, callID: id, sequence: 1_000, timestampMicroseconds: 40_000, payload: payload))
+        XCTAssertEqual(jitter.stats.rebased, 1)
+        XCTAssertEqual(jitter.nextSequence, 1_000)
+    }
+
+    func testPlayoutSchedulerRunsOutsideMainThread() {
+        let controller = AudioPlayoutController()
+        let expectation = expectation(description: "playout")
+        let once = LockedOnce()
+        controller.start(onFrame: { _ in
+            guard once.claim() else { return }
+            XCTAssertFalse(Thread.isMainThread)
+            expectation.fulfill()
+        }, onDiagnostic: { _ in })
+        let id = UUID()
+        for sequence in 1...5 {
+            controller.insert(AudioPacket(type: .audio, callID: id, sequence: UInt64(sequence), timestampMicroseconds: UInt64(sequence * 20_000), payload: Data(repeating: UInt8(sequence), count: 640)))
+        }
+        wait(for: [expectation], timeout: 2)
+        controller.stop()
+    }
+
+    func testLowLatencySendQueueDropsOldestAndKeepsNewest() async {
+        var continuation: AsyncStream<Int>.Continuation?
+        let stream = AsyncStream<Int>(bufferingPolicy: .bufferingNewest(AudioSendQueuePolicy.maximumFrames)) { continuation = $0 }
+        var dropped = 0
+        for value in 0..<10 {
+            if case .dropped = continuation?.yield(value) { dropped += 1 }
+        }
+        continuation?.finish()
+        var values: [Int] = []
+        for await value in stream { values.append(value) }
+        XCTAssertEqual(AudioSendQueuePolicy.maximumFrames, 6)
+        XCTAssertEqual(dropped, 4)
+        XCTAssertEqual(values, [4, 5, 6, 7, 8, 9])
     }
 
     func testRuntimeDiagnosticPayloadContainsNoTokenOrRawAudio() throws {
@@ -527,6 +609,8 @@ final class WiFiSecureCallTests: XCTestCase {
         media.onPacket?(AudioPacket(type: .audio, callID: serverID, sequence: 1, timestampMicroseconds: 1, payload: remoteFrame), epoch)
         media.onPacket?(AudioPacket(type: .audio, callID: serverID, sequence: 2, timestampMicroseconds: 20_001, payload: remoteFrame), epoch)
         media.onPacket?(AudioPacket(type: .audio, callID: serverID, sequence: 3, timestampMicroseconds: 40_001, payload: remoteFrame), epoch)
+        media.onPacket?(AudioPacket(type: .audio, callID: serverID, sequence: 4, timestampMicroseconds: 60_001, payload: remoteFrame), epoch)
+        media.onPacket?(AudioPacket(type: .audio, callID: serverID, sequence: 5, timestampMicroseconds: 80_001, payload: remoteFrame), epoch)
         await eventually { audio.played.contains(remoteFrame) }
         XCTAssertTrue(audio.played.contains(remoteFrame))
     }
@@ -547,6 +631,33 @@ final class WiFiSecureCallTests: XCTestCase {
         XCTAssertEqual(audio.mutedValues, [true])
         XCTAssertEqual(audio.startMutedValues, [true])
         XCTAssertTrue(session.isMuted)
+    }
+
+    @MainActor
+    func testRepeatedAudioHealthFailureUsesOneRecoveryAndPreservesActiveCall() async throws {
+        let capture = RequestCapture(); capture.getState = .accepted
+        let audio = AudioEngineMock(), media = MediaTransportMock()
+        let session = makeSession(capture: capture, audio: audio, media: media)
+        let adapter = RetainedCallKitMock(); session.attach(callKit: adapter)
+        await session.startCall()
+        let localID = try XCTUnwrap(adapter.startedIDs.first)
+        let serverID = try XCTUnwrap(session.state.callID)
+        try await adapter.approveStart(localID)
+        await eventually { if case .connecting = session.state { return true }; return false }
+        adapter.onAudioActivated?(localID)
+        await eventually { audio.startCount == 1 && !media.connectionIDs.isEmpty }
+        let epoch = try XCTUnwrap(media.connectionIDs.last)
+        media.onPeerReady?(serverID, epoch)
+        await eventually { session.state == .active(serverID) }
+
+        audio.onFailure?(.configurationChanged)
+        await eventually { audio.startCount == 2 }
+        audio.onFailure?(.configurationChanged)
+        try? await Task.sleep(nanoseconds: 50_000_000)
+
+        XCTAssertEqual(audio.startCount, 2)
+        XCTAssertEqual(session.state, .active(serverID))
+        XCTAssertFalse(session.state.isTerminal)
     }
 
     @MainActor
@@ -767,6 +878,17 @@ final class WiFiSecureCallTests: XCTestCase {
         for _ in 0..<100 where !predicate() {
             try? await Task.sleep(nanoseconds: 10_000_000)
         }
+    }
+}
+
+private final class LockedOnce: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value = false
+    func claim() -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        guard !value else { return false }
+        value = true
+        return true
     }
 }
 
