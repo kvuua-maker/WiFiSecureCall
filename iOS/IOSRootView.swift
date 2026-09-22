@@ -2,6 +2,8 @@ import SwiftUI
 
 struct IOSRootView: View {
     @ObservedObject var session: CallSession
+    @StateObject private var accountStore = AccountSessionStore()
+    @State private var showAccount = false
 
     var body: some View {
         VStack(spacing: 24) {
@@ -10,6 +12,7 @@ struct IOSRootView: View {
             controls
         }
         .padding(32)
+        .sheet(isPresented: $showAccount) { AccountView(store: accountStore) }
     }
 
     private var status: String {
@@ -29,7 +32,10 @@ struct IOSRootView: View {
     @ViewBuilder private var controls: some View {
         switch session.state {
         case .idle:
-            Button("Call Watch") { Task { await NotificationRuntime.shared.startCall() } }.buttonStyle(.borderedProminent)
+            VStack {
+                Button("Call Watch") { Task { await NotificationRuntime.shared.startCall() } }.buttonStyle(.borderedProminent)
+                Button(accountStore.activeAccount?.phoneNumber ?? "Account") { showAccount = true }.font(.footnote)
+            }
         case .outgoingRinging:
             Button("Cancel", role: .destructive) { Task { await session.cancel() } }
         case .incomingRinging:

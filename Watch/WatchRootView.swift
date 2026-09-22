@@ -2,12 +2,14 @@ import SwiftUI
 
 struct WatchRootView: View {
     @ObservedObject var session: CallSession
+    @StateObject private var accountStore = AccountSessionStore()
+    @State private var showAccount = false
     var body: some View {
         VStack(spacing: 8) {
             Text("WiFi Secure Call").font(.headline)
             Text(status).font(.caption).multilineTextAlignment(.center)
             controls
-        }.padding(4)
+        }.padding(4).sheet(isPresented: $showAccount) { WatchAccountLinkView(store: accountStore) }
     }
     private var status: String {
         switch session.state {
@@ -24,7 +26,11 @@ struct WatchRootView: View {
     }
     @ViewBuilder private var controls: some View {
         switch session.state {
-        case .idle: Button("Call iPhone") { Task { await NotificationRuntime.shared.startCall() } }
+        case .idle:
+            VStack {
+                Button("Call iPhone") { Task { await NotificationRuntime.shared.startCall() } }
+                Button(accountStore.activeAccount == nil ? "Link account" : "Account") { showAccount = true }.font(.caption2)
+            }
         case .outgoingRinging: Button("Cancel", role: .destructive) { Task { await session.cancel() } }
         case .incomingRinging:
             HStack { Button("Reject", role: .destructive) { Task { await session.reject() } }; Button("Accept") { Task { await session.accept() } } }
