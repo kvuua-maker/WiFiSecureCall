@@ -106,7 +106,57 @@ final class WiFiSecureCallTests: XCTestCase {
         let data = try XCTUnwrap(AudioEngine.convertToNetworkPCM(input, converter: converter))
 
         XCTAssertEqual(data.count, AudioEngine.bytesPerFrame)
-        XCTAssertTrue(data.contains { $0 != 0 }, "Conversion must preserve nonzero signal energy")
+        let metrics = try XCTUnwrap(AudioEngine.signalMetrics(forCanonicalPCM: data))
+        XCTAssertEqual(metrics.frameCount, 320)
+        XCTAssertTrue(metrics.hasNonzeroSignal, "Conversion must preserve nonzero signal energy")
+        XCTAssertGreaterThan(metrics.rms, 0)
+        XCTAssertGreaterThan(metrics.peak, 0)
+    }
+
+    func testCanonicalPCMFormatCopyAndMalformedFrames() throws {
+        let format = try XCTUnwrap(AVAudioFormat(commonFormat: .pcmFormatInt16, sampleRate: 16_000, channels: 1, interleaved: true))
+        XCTAssertTrue(AudioEngine.isCanonicalNetworkFormat(format))
+        var payload = Data(count: AudioEngine.bytesPerFrame)
+        payload[0] = 1
+        let buffer = try XCTUnwrap(AudioEngine.canonicalBuffer(from: payload, format: format))
+        XCTAssertEqual(buffer.frameLength, 320)
+        XCTAssertEqual(AudioEngine.pcmData(from: buffer), payload)
+        XCTAssertNil(AudioEngine.canonicalBuffer(from: Data(count: 639), format: format))
+        buffer.frameLength = 319
+        XCTAssertNil(AudioEngine.pcmData(from: buffer))
+    }
+
+    func testCanonicalPCMSignalMetricsDetectZeroAndNonzero() throws {
+        let zero = try XCTUnwrap(AudioEngine.signalMetrics(forCanonicalPCM: Data(count: AudioEngine.bytesPerFrame)))
+        XCTAssertFalse(zero.hasNonzeroSignal)
+        XCTAssertEqual(zero.rms, 0)
+        XCTAssertEqual(zero.peak, 0)
+
+        var nonzero = Data(count: AudioEngine.bytesPerFrame)
+        nonzero[10] = 0xff
+        nonzero[11] = 0x7f
+        let metrics = try XCTUnwrap(AudioEngine.signalMetrics(forCanonicalPCM: nonzero))
+        XCTAssertTrue(metrics.hasNonzeroSignal)
+        XCTAssertEqual(metrics.nonzeroCount, 1)
+        XCTAssertGreaterThan(metrics.rms, 0)
+        XCTAssertGreaterThan(metrics.peak, 0.99)
+    }
+
+    func testAudioFlowWatchdogClassifiesEveryMissingStage() {
+        XCTAssertEqual(AudioFlowMilestones().failureStage, .noMicCallback)
+        XCTAssertEqual(AudioFlowMilestones(micCallback: true).failureStage, .conversionFailure)
+        XCTAssertEqual(AudioFlowMilestones(micCallback: true, networkPCMGenerated: true).failureStage, .zeroSignal)
+        XCTAssertEqual(AudioFlowMilestones(micCallback: true, networkPCMGenerated: true, localNonzeroPCM: true).failureStage, .sendFailure)
+        XCTAssertEqual(AudioFlowMilestones(micCallback: true, networkPCMGenerated: true, localNonzeroPCM: true, networkFrameSent: true).failureStage, .receiveAbsent)
+        XCTAssertEqual(AudioFlowMilestones(micCallback: true, networkPCMGenerated: true, localNonzeroPCM: true, networkFrameSent: true, remoteFrameReceived: true).failureStage, .playbackScheduleFailure)
+        XCTAssertEqual(AudioFlowMilestones(micCallback: true, networkPCMGenerated: true, localNonzeroPCM: true, networkFrameSent: true, remoteFrameReceived: true, playbackScheduled: true).failureStage, .renderFailure)
+        XCTAssertNil(AudioFlowMilestones(micCallback: true, networkPCMGenerated: true, localNonzeroPCM: true, networkFrameSent: true, remoteFrameReceived: true, playbackScheduled: true, playbackRendered: true).failureStage)
+    }
+
+    func testAudioRecoveryBudgetAllowsExactlyOneRecoveryPerGeneration() {
+        var budget = AudioRecoveryBudget()
+        XCTAssertTrue(budget.claim())
+        XCTAssertFalse(budget.claim())
     }
 
     func testRuntimeDiagnosticPayloadContainsNoTokenOrRawAudio() throws {
@@ -457,6 +507,7 @@ final class WiFiSecureCallTests: XCTestCase {
         adapter.onAudioActivated?(localID)
         await eventually { media.connectedCallIDs.contains(serverID) }
         XCTAssertEqual(audio.startCount, 1)
+        XCTAssertEqual(audio.startMutedValues, [false])
         XCTAssertEqual(media.connectedCallIDs, [serverID])
         XCTAssertEqual(adapter.startedConnectingIDs, [localID])
         XCTAssertTrue(adapter.connectedIDs.isEmpty)
@@ -478,6 +529,24 @@ final class WiFiSecureCallTests: XCTestCase {
         media.onPacket?(AudioPacket(type: .audio, callID: serverID, sequence: 3, timestampMicroseconds: 40_001, payload: remoteFrame), epoch)
         await eventually { audio.played.contains(remoteFrame) }
         XCTAssertTrue(audio.played.contains(remoteFrame))
+    }
+
+    @MainActor
+    func testExplicitCallKitMuteRemainsMutedWhenAudioStarts() async throws {
+        let capture = RequestCapture(); capture.getState = .accepted
+        let audio = AudioEngineMock(), media = MediaTransportMock()
+        let session = makeSession(capture: capture, audio: audio, media: media)
+        let adapter = RetainedCallKitMock(); session.attach(callKit: adapter)
+        await session.startCall()
+        let localID = try XCTUnwrap(adapter.startedIDs.first)
+        try await adapter.approveStart(localID)
+        await eventually { if case .connecting = session.state { return true }; return false }
+        try adapter.onMutedRequested?(localID, true)
+        adapter.onAudioActivated?(localID)
+        await eventually { audio.startCount == 1 }
+        XCTAssertEqual(audio.mutedValues, [true])
+        XCTAssertEqual(audio.startMutedValues, [true])
+        XCTAssertTrue(session.isMuted)
     }
 
     @MainActor
@@ -746,12 +815,14 @@ private final class AudioEngineMock: AudioEngineHandling, @unchecked Sendable {
     var permission = true
     var startCount = 0
     var stopCount = 0
+    var startMutedValues: [Bool] = []
+    var mutedValues: [Bool] = []
     var played: [Data] = []
     func ensureRecordPermission() async -> Bool { permission }
     func configureSession() throws {}
-    func start() throws { startCount += 1 }
+    func start(muted: Bool) throws { startCount += 1; startMutedValues.append(muted) }
     func stop() { stopCount += 1 }
-    func setMuted(_ value: Bool) throws {}
+    func setMuted(_ value: Bool) throws { mutedValues.append(value); onMuteChanged?(value) }
     func play(_ payload: Data) { played.append(payload) }
 }
 

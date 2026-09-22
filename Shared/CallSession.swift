@@ -82,6 +82,7 @@ final class CallSession: ObservableObject {
     private var durationTask: Task<Void, Never>?
     private var activationWatchdog: Task<Void, Never>?
     private var peerWatchdog: Task<Void, Never>?
+    private var audioFlowWatchdog: Task<Void, Never>?
     private var terminalObserver: Task<Void, Never>?
     private var diagnosticContinuation: AsyncStream<DiagnosticUpload>.Continuation?
     private var diagnosticTask: Task<Void, Never>?
@@ -93,7 +94,13 @@ final class CallSession: ObservableObject {
     private var firstSentFrameReported = false
     private var firstRemoteFrameReported = false
     private var firstSendFailureReported = false
-    private var captureRecoveryAttempted = false
+    private var transportActive = false
+    private var audioOperational = false
+    private var audioFlow = AudioFlowMilestones()
+    private var audioRecoveryBudget = AudioRecoveryBudget()
+    private var localNonzeroFrameSent = false
+    private var remoteNonzeroFrameReceived = false
+    private var firstRemoteNonzeroReported = false
     private(set) var activeCallKitUUID: UUID?
 
     init(config: AppConfig, api: APIClient? = nil, audio: AudioEngineHandling = AudioEngine(), media: MediaTransport? = nil) {
@@ -118,6 +125,7 @@ final class CallSession: ObservableObject {
                 case let .mediaDiagnostic(value): self.recordRuntimeDiagnostic(value.event, status: value.status, callID: value.callID, domain: value.errorDomain, code: value.errorCode)
                 case let .audioDiagnostic(generationID, value):
                     guard let current = self.generation, current.id == generationID else { continue }
+                    self.observeAudioDiagnostic(value, generation: current)
                     self.recordRuntimeDiagnostic(value.event, status: value.status, callID: current.serverCallID, domain: value.errorDomain, code: value.errorCode)
                 case let .audioFailure(generationID, value): if self.generation?.id == generationID { self.audioFailed(value) }
                 case let .muteChanged(generationID, value): if self.generation?.id == generationID { self.isMuted = value }
@@ -389,6 +397,10 @@ final class CallSession: ObservableObject {
         guard let current = generation, localID == nil || current.localCallKitUUID == localID else { return }
         activatedCallKitUUID = nil
         audioStartedForCallKitUUID = nil
+        playoutTask?.cancel(); playoutTask = nil
+        audioFlowWatchdog?.cancel(); audioFlowWatchdog = nil
+        audioFlow = AudioFlowMilestones(); audioOperational = false
+        localNonzeroFrameSent = false; remoteNonzeroFrameReceived = false
         audio.stop()
         recordRuntimeDiagnostic("callkit_did_deactivate", status: "success", callID: current.serverCallID)
     }
@@ -444,8 +456,13 @@ final class CallSession: ObservableObject {
         mediaConnectTask = Task { [weak self] in
             guard let self, self.isCurrent(current) else { return }
             do {
-                try self.audio.start()
+                try self.audio.start(muted: self.isMuted)
                 guard self.isCurrent(current), self.activatedCallKitUUID == current.localCallKitUUID else { return }
+                if let existingEpoch = self.mediaEpoch {
+                    self.startPlayout(current, mediaEpoch: existingEpoch)
+                    if self.transportActive { self.beginAudioFlowWatchdog(current) }
+                    return
+                }
                 let epoch = try await self.media.connect(callID: current.serverCallID, role: self.config.role, token: token)
                 guard self.isCurrent(current) else { await self.media.close(connectionID: epoch); return }
                 self.mediaEpoch = epoch
@@ -461,8 +478,10 @@ final class CallSession: ObservableObject {
     private func peerReady(callID: UUID, mediaEpoch: UUID) {
         guard let current = generation, current.serverCallID == callID, self.mediaEpoch == mediaEpoch else { return }
         peerWatchdog?.cancel()
+        transportActive = true
         if state != .active(callID) { transition(.active(callID)); startDuration(current); if isOutgoingCall { callKit?.reportOutgoingConnected(id: current.localCallKitUUID) } }
         recordRuntimeDiagnostic("media_peer_ready", status: "ready", callID: callID)
+        beginAudioFlowWatchdog(current)
     }
 
     private func beginPeerWatchdog(_ current: CallGeneration, mediaEpoch: UUID) {
@@ -477,7 +496,7 @@ final class CallSession: ObservableObject {
 
     private func mediaDisconnected(_ event: MediaDisconnect) {
         guard let current = generation, current.serverCallID == event.callID, mediaEpoch == event.connectionID, state.isAcceptedLifecycle, let token = mediaToken else { return }
-        mediaEpoch = nil; playoutTask?.cancel(); jitter.resetForReconnect()
+        mediaEpoch = nil; transportActive = false; audioOperational = false; audioFlowWatchdog?.cancel(); playoutTask?.cancel(); jitter.resetForReconnect()
         transition(.reconnecting(current.serverCallID))
         reconnectTask?.cancel()
         reconnectTask = Task { [weak self] in
@@ -514,7 +533,18 @@ final class CallSession: ObservableObject {
                 do {
                     try await self.media.send(packet, connectionID: epoch)
                     guard self.generation?.id == generationID else { continue }
-                    if !self.firstSentFrameReported { self.firstSentFrameReported = true; self.recordRuntimeDiagnostic("first_network_audio_frame_sent", status: "bytes=\(data.count)", callID: callID) }
+                    self.audioFlow.networkFrameSent = true
+                    self.updateAudioOperational()
+                    if !self.firstSentFrameReported {
+                        self.firstSentFrameReported = true
+                        let metrics = AudioEngine.signalMetrics(forCanonicalPCM: data)
+                        self.recordRuntimeDiagnostic("first_network_audio_frame_sent", status: "bytes=\(data.count) rms=\(metrics?.rms ?? 0) peak=\(metrics?.peak ?? 0) nonzero=\(metrics?.nonzeroCount ?? 0)", callID: callID)
+                    }
+                    if let metrics = AudioEngine.signalMetrics(forCanonicalPCM: data), metrics.hasNonzeroSignal {
+                        self.localNonzeroFrameSent = true
+                        self.audioFlow.localNonzeroPCM = true
+                        self.updateAudioOperational()
+                    }
                 } catch {
                     guard self.generation?.id == generationID else { continue }
                     if !self.firstSendFailureReported { self.firstSendFailureReported = true; self.recordRuntimeDiagnostic("first_network_audio_frame_send_failure", status: "failed", callID: callID, domain: (error as NSError).domain, code: (error as NSError).code) }
@@ -526,7 +556,21 @@ final class CallSession: ObservableObject {
 
     private func receive(_ packet: AudioPacket, mediaEpoch: UUID) {
         guard let current = generation, packet.callID == current.serverCallID, self.mediaEpoch == mediaEpoch, packet.type == .audio, packet.payload.count == AudioEngine.bytesPerFrame else { return }
-        if !firstRemoteFrameReported { firstRemoteFrameReported = true; recordRuntimeDiagnostic("first_remote_audio_frame_received", status: "bytes=\(packet.payload.count)", callID: packet.callID) }
+        audioFlow.remoteFrameReceived = true
+        updateAudioOperational()
+        let metrics = AudioEngine.signalMetrics(forCanonicalPCM: packet.payload)
+        if let metrics, metrics.hasNonzeroSignal {
+            remoteNonzeroFrameReceived = true
+            if !firstRemoteNonzeroReported {
+                firstRemoteNonzeroReported = true
+                recordRuntimeDiagnostic("first_remote_audio_nonzero", status: "sequence=\(packet.sequence) bytes=\(packet.payload.count) rms=\(metrics.rms) peak=\(metrics.peak) nonzero=\(metrics.nonzeroCount)", callID: packet.callID)
+            }
+            updateAudioOperational()
+        }
+        if !firstRemoteFrameReported {
+            firstRemoteFrameReported = true
+            recordRuntimeDiagnostic("first_remote_audio_frame_received", status: "sequence=\(packet.sequence) bytes=\(packet.payload.count) rms=\(metrics?.rms ?? 0) peak=\(metrics?.peak ?? 0) nonzero=\(metrics?.nonzeroCount ?? 0)", callID: packet.callID)
+        }
         jitter.insert(packet)
     }
 
@@ -573,10 +617,73 @@ final class CallSession: ObservableObject {
 
     private func audioFailed(_ failure: AudioEngineRuntimeFailure) {
         guard let current = generation, state.isAcceptedLifecycle else { return }
-        if (failure == .captureStalled || failure == .configurationChanged), !captureRecoveryAttempted, activatedCallKitUUID == current.localCallKitUUID {
-            captureRecoveryAttempted = true; audio.stop(); audioStartedForCallKitUUID = nil; startMediaIfReady(current); return
+        if activatedCallKitUUID == current.localCallKitUUID {
+            if audioRecoveryBudget.claim() {
+                recoverAudioOnly(current)
+            } else {
+                recordRuntimeDiagnostic("audio_recovery", status: "already_used failure=\(String(describing: failure))", callID: current.serverCallID)
+            }
+            return
         }
         spawn { [weak self] in guard let self else { return }; await self.fail(current, .audioFailed) }
+    }
+
+    private func observeAudioDiagnostic(_ value: AudioEngineDiagnostic, generation current: CallGeneration) {
+        guard isCurrent(current) else { return }
+        switch value.event {
+        case "first_mic_callback", "first_mic_buffer": audioFlow.micCallback = true
+        case "first_network_pcm_generated", "first_network_audio_frame_generated": audioFlow.networkPCMGenerated = true
+        case "first_network_pcm_nonzero": audioFlow.localNonzeroPCM = true
+        case "first_playback_buffer_scheduled": audioFlow.playbackScheduled = true
+        case "first_playback_buffer_rendered": audioFlow.playbackRendered = true
+        default: break
+        }
+        updateAudioOperational()
+    }
+
+    private func updateAudioOperational() {
+        let wasOperational = audioOperational
+        audioOperational = transportActive && localNonzeroFrameSent && remoteNonzeroFrameReceived && audioFlow.playbackRendered
+        if audioOperational, !wasOperational, let callID = generation?.serverCallID {
+            recordRuntimeDiagnostic("audio_operational", status: "transport=ready audio=ready", callID: callID)
+            audioFlowWatchdog?.cancel()
+        }
+    }
+
+    private func beginAudioFlowWatchdog(_ current: CallGeneration) {
+        audioFlowWatchdog?.cancel()
+        audioFlowWatchdog = Task { [weak self] in
+            do { try await Task.sleep(nanoseconds: 2_000_000_000) } catch { return }
+            guard let self, self.isCurrent(current), self.transportActive, !self.audioOperational else { return }
+            guard let stage = self.audioFlow.failureStage else { self.updateAudioOperational(); return }
+            self.recordRuntimeDiagnostic("audio_flow_watchdog", status: stage.rawValue, callID: current.serverCallID)
+            if self.audioRecoveryBudget.claim() {
+                self.recoverAudioOnly(current)
+            } else {
+                await self.fail(current, .audioFailed)
+            }
+        }
+    }
+
+    private func recoverAudioOnly(_ current: CallGeneration) {
+        guard isCurrent(current), activatedCallKitUUID == current.localCallKitUUID else { return }
+        playoutTask?.cancel(); playoutTask = nil
+        audio.stop()
+        audioFlow = AudioFlowMilestones()
+        audioOperational = false
+        localNonzeroFrameSent = false
+        remoteNonzeroFrameReceived = false
+        do {
+            try audio.start(muted: isMuted)
+            guard isCurrent(current), activatedCallKitUUID == current.localCallKitUUID else { audio.stop(); return }
+            audioStartedForCallKitUUID = current.localCallKitUUID
+            if let epoch = mediaEpoch { startPlayout(current, mediaEpoch: epoch) }
+            recordRuntimeDiagnostic("audio_recovery", status: "succeeded", callID: current.serverCallID)
+            if transportActive { beginAudioFlowWatchdog(current) }
+        } catch {
+            recordRuntimeDiagnostic("audio_recovery", status: "failed", callID: current.serverCallID, domain: (error as NSError).domain, code: (error as NSError).code)
+            spawn { [weak self] in guard let self else { return }; await self.fail(current, .audioFailed) }
+        }
     }
 
     private func compensateAfterStart(_ current: CallGeneration) async {
@@ -630,7 +737,7 @@ final class CallSession: ObservableObject {
         guard isCurrent(current) else { return }
         cancelCallTasks()
         let epoch = mediaEpoch; mediaEpoch = nil
-        audio.stop(); audioStartedForCallKitUUID = nil; activatedCallKitUUID = nil
+        audio.stop(); audioStartedForCallKitUUID = nil; activatedCallKitUUID = nil; transportActive = false; audioOperational = false
         if let epoch { await media.close(connectionID: epoch) }
         guard isCurrent(current) else { return }
         if let reportReason, callKitReported || isOutgoingCall { callKit?.reportEnded(id: current.localCallKitUUID, reason: reportReason) }
@@ -659,7 +766,9 @@ final class CallSession: ObservableObject {
         audio.onMuteChanged = { value in events?.yield(.muteChanged(next.id, value)) }
         mediaToken = nil; mediaEpoch = nil; createRequestID = nil; acceptRequestID = nil; terminalRequestID = nil; terminalMutation = nil
         activatedCallKitUUID = nil; audioStartedForCallKitUUID = nil; serverCallCreated = false; serverCallAccepted = false; sequence = 0; jitter = JitterBuffer(); isMuted = false; elapsedSeconds = 0
-        firstSentFrameReported = false; firstRemoteFrameReported = false; firstSendFailureReported = false; captureRecoveryAttempted = false
+        firstSentFrameReported = false; firstRemoteFrameReported = false; firstSendFailureReported = false
+        transportActive = false; audioOperational = false; audioFlow = AudioFlowMilestones(); audioRecoveryBudget = AudioRecoveryBudget()
+        localNonzeroFrameSent = false; remoteNonzeroFrameReceived = false; firstRemoteNonzeroReported = false
         return next
     }
 
@@ -671,8 +780,8 @@ final class CallSession: ObservableObject {
 
     private func cancelCallTasks() {
         for task in tasks { task.cancel() }; tasks.removeAll(keepingCapacity: true)
-        mediaConnectTask?.cancel(); reconnectTask?.cancel(); playoutTask?.cancel(); durationTask?.cancel(); activationWatchdog?.cancel(); peerWatchdog?.cancel(); terminalObserver?.cancel()
-        mediaConnectTask = nil; reconnectTask = nil; playoutTask = nil; durationTask = nil; activationWatchdog = nil; peerWatchdog = nil; terminalObserver = nil
+        mediaConnectTask?.cancel(); reconnectTask?.cancel(); playoutTask?.cancel(); durationTask?.cancel(); activationWatchdog?.cancel(); peerWatchdog?.cancel(); audioFlowWatchdog?.cancel(); terminalObserver?.cancel()
+        mediaConnectTask = nil; reconnectTask = nil; playoutTask = nil; durationTask = nil; activationWatchdog = nil; peerWatchdog = nil; audioFlowWatchdog = nil; terminalObserver = nil
     }
 
     private func startDuration(_ current: CallGeneration) {

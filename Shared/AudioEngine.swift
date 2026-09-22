@@ -1,4 +1,5 @@
 import AVFoundation
+import Darwin
 import Foundation
 
 struct AudioEngineDiagnostic: Sendable {
@@ -10,6 +11,55 @@ struct AudioEngineDiagnostic: Sendable {
 
 enum AudioEngineRuntimeFailure: Equatable, Sendable { case captureStalled, captureConversion, playbackConversion, configurationChanged }
 
+struct PCMSignalMetrics: Equatable, Sendable {
+    let frameCount: Int
+    let rms: Double
+    let peak: Double
+    let nonzeroCount: Int
+
+    var hasNonzeroSignal: Bool { nonzeroCount > 0 }
+}
+
+enum AudioFlowFailureStage: String, Equatable, Sendable {
+    case noMicCallback = "no_mic_callback"
+    case conversionFailure = "conversion_failure"
+    case zeroSignal = "zero_signal"
+    case sendFailure = "send_failure"
+    case receiveAbsent = "receive_absent"
+    case playbackScheduleFailure = "playback_schedule_failure"
+    case renderFailure = "render_failure"
+}
+
+struct AudioFlowMilestones: Equatable, Sendable {
+    var micCallback = false
+    var networkPCMGenerated = false
+    var localNonzeroPCM = false
+    var networkFrameSent = false
+    var remoteFrameReceived = false
+    var playbackScheduled = false
+    var playbackRendered = false
+
+    var failureStage: AudioFlowFailureStage? {
+        if !micCallback { return .noMicCallback }
+        if !networkPCMGenerated { return .conversionFailure }
+        if !localNonzeroPCM { return .zeroSignal }
+        if !networkFrameSent { return .sendFailure }
+        if !remoteFrameReceived { return .receiveAbsent }
+        if !playbackScheduled { return .playbackScheduleFailure }
+        if !playbackRendered { return .renderFailure }
+        return nil
+    }
+}
+
+struct AudioRecoveryBudget: Equatable, Sendable {
+    private(set) var used = false
+    mutating func claim() -> Bool {
+        guard !used else { return false }
+        used = true
+        return true
+    }
+}
+
 protocol AudioEngineHandling: AnyObject {
     var onFrame: (@Sendable (Data) -> Void)? { get set }
     var onDiagnostic: (@Sendable (AudioEngineDiagnostic) -> Void)? { get set }
@@ -17,7 +67,7 @@ protocol AudioEngineHandling: AnyObject {
     var onMuteChanged: (@Sendable (Bool) -> Void)? { get set }
     func ensureRecordPermission() async -> Bool
     func configureSession() throws
-    func start() throws
+    func start(muted: Bool) throws
     func stop()
     func setMuted(_ value: Bool) throws
     func play(_ payload: Data)
@@ -37,45 +87,68 @@ struct CaptureSourceLifecycle {
 private final class RealtimeCaptureRing: @unchecked Sendable {
     private let slots: [AVAudioPCMBuffer]
     private let capacity: Int
-    private var writeIndex = 0
-    private var readIndex = 0
-    private(set) var callbackCount: UInt64 = 0
-    private(set) var droppedCount: UInt64 = 0
+    private let writeSequence = UnsafeMutablePointer<Int64>.allocate(capacity: 1)
+    private let readSequence = UnsafeMutablePointer<Int64>.allocate(capacity: 1)
+    private let callbacks = UnsafeMutablePointer<Int64>.allocate(capacity: 1)
+    private let drops = UnsafeMutablePointer<Int64>.allocate(capacity: 1)
+    private let frameLengths: UnsafeMutablePointer<AVAudioFrameCount>
+
+    var callbackCount: UInt64 { UInt64(max(0, OSAtomicAdd64Barrier(0, callbacks))) }
+    var droppedCount: UInt64 { UInt64(max(0, OSAtomicAdd64Barrier(0, drops))) }
 
     init?(format: AVAudioFormat, slots: Int = 12, maximumFrames: AVAudioFrameCount = 4096) {
         var buffers: [AVAudioPCMBuffer] = []
         for _ in 0..<slots { guard let value = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: maximumFrames) else { return nil }; buffers.append(value) }
         self.slots = buffers; self.capacity = slots
+        self.frameLengths = .allocate(capacity: slots)
+        writeSequence.initialize(to: 0); readSequence.initialize(to: 0)
+        callbacks.initialize(to: 0); drops.initialize(to: 0)
+        frameLengths.initialize(repeating: 0, count: slots)
+    }
+
+    deinit {
+        writeSequence.deinitialize(count: 1); writeSequence.deallocate()
+        readSequence.deinitialize(count: 1); readSequence.deallocate()
+        callbacks.deinitialize(count: 1); callbacks.deallocate()
+        drops.deinitialize(count: 1); drops.deallocate()
+        frameLengths.deinitialize(count: capacity); frameLengths.deallocate()
     }
 
     func write(frameCount: AVAudioFrameCount, inputData: UnsafePointer<AudioBufferList>) {
-        callbackCount &+= 1
-        let next = (writeIndex + 1) % capacity
-        guard next != readIndex else { droppedCount &+= 1; return }
-        let target = slots[writeIndex]
+        OSAtomicIncrement64Barrier(callbacks)
+        let write = OSAtomicAdd64Barrier(0, writeSequence)
+        let read = OSAtomicAdd64Barrier(0, readSequence)
+        guard write - read < Int64(capacity) else { OSAtomicIncrement64Barrier(drops); return }
+        let slotIndex = Int(write % Int64(capacity))
+        let target = slots[slotIndex]
         let source = UnsafeMutableAudioBufferListPointer(UnsafeMutablePointer(mutating: inputData))
         let destination = UnsafeMutableAudioBufferListPointer(target.mutableAudioBufferList)
-        guard source.count == destination.count else { droppedCount &+= 1; return }
+        guard source.count == destination.count else { OSAtomicIncrement64Barrier(drops); return }
         var validFrames = min(frameCount, target.frameCapacity)
         for index in source.indices {
-            guard let sourceData = source[index].mData, let destinationData = destination[index].mData else { droppedCount &+= 1; return }
-            let byteCount = min(Int(source[index].mDataByteSize), Int(destination[index].mDataByteSize))
-            guard byteCount > 0 else { droppedCount &+= 1; return }
+            guard let sourceData = source[index].mData, let destinationData = destination[index].mData else { OSAtomicIncrement64Barrier(drops); return }
+            let bytesPerFrame = max(1, Int(target.format.streamDescription.pointee.mBytesPerFrame))
+            let destinationCapacity = Int(target.frameCapacity) * bytesPerFrame
+            let byteCount = min(Int(source[index].mDataByteSize), destinationCapacity)
+            guard byteCount > 0 else { OSAtomicIncrement64Barrier(drops); return }
             memcpy(destinationData, sourceData, byteCount)
             destination[index].mDataByteSize = UInt32(byteCount)
-            let bytesPerFrame = max(1, Int(target.format.streamDescription.pointee.mBytesPerFrame))
             validFrames = min(validFrames, AVAudioFrameCount(byteCount / bytesPerFrame))
         }
-        guard validFrames > 0 else { droppedCount &+= 1; return }
-        target.frameLength = validFrames
-        writeIndex = next
+        guard validFrames > 0 else { OSAtomicIncrement64Barrier(drops); return }
+        frameLengths[slotIndex] = validFrames
+        OSAtomicIncrement64Barrier(writeSequence)
     }
 
-    func read() -> AVAudioPCMBuffer? {
-        guard readIndex != writeIndex else { return nil }
-        let value = slots[readIndex]
-        readIndex = (readIndex + 1) % capacity
-        return value
+    func consume(_ body: (AVAudioPCMBuffer) -> Void) -> Bool {
+        let read = OSAtomicAdd64Barrier(0, readSequence)
+        guard read < OSAtomicAdd64Barrier(0, writeSequence) else { return false }
+        let slotIndex = Int(read % Int64(capacity))
+        let value = slots[slotIndex]
+        value.frameLength = frameLengths[slotIndex]
+        body(value)
+        OSAtomicIncrement64Barrier(readSequence)
+        return true
     }
 }
 
@@ -136,9 +209,12 @@ final class AudioEngine: AudioEngineHandling, @unchecked Sendable {
     private var scheduledBuffers = 0
     private let maximumScheduledBuffers = 8
     private var firstMicBufferReported = false
+    private var firstMicNonzeroReported = false
     private var firstNetworkFrameReported = false
+    private var firstNetworkNonzeroReported = false
     private var firstCaptureFailureReported = false
     private var firstPlaybackScheduledReported = false
+    private var firstPlaybackNonzeroReported = false
     private var firstPlaybackRenderedReported = false
     private var firstPlaybackFailureReported = false
     private var observers: [NSObjectProtocol] = []
@@ -178,15 +254,15 @@ final class AudioEngine: AudioEngineHandling, @unchecked Sendable {
     }
 
     func setMuted(_ value: Bool) throws {
-        if #available(iOS 17.0, watchOS 10.0, *) { try AVAudioApplication.shared.setInputMuted(value) }
-        engine.inputNode.isVoiceProcessingInputMuted = value
-        onMuteChanged?(value)
-        emit("audio_input_mute", value ? "muted" : "unmuted")
+        try controlQueue.sync {
+            try applyMute(value)
+            emit("audio_input_mute", value ? "muted" : "unmuted")
+        }
     }
 
-    func start() throws { try controlQueue.sync { try startOnControlQueue() } }
+    func start(muted: Bool) throws { try controlQueue.sync { try startOnControlQueue(muted: muted) } }
 
-    private func startOnControlQueue() throws {
+    private func startOnControlQueue(muted: Bool) throws {
         guard !engine.isRunning, !starting else { throw CallFailure.audioFailed }
         starting = true; emit("audio_engine_start_attempt", "started")
         do {
@@ -195,10 +271,7 @@ final class AudioEngine: AudioEngineHandling, @unchecked Sendable {
             try input.setVoiceProcessingEnabled(true)
             guard input.isVoiceProcessingEnabled, output.isVoiceProcessingEnabled else { throw NSError(domain: "WiFiSecureCall.AudioEngine", code: 20) }
             emit("voice_processing_enabled", "input=YES output=YES")
-            let muted: Bool
-            if #available(iOS 17.0, watchOS 10.0, *) { muted = AVAudioApplication.shared.isInputMuted }
-            else { muted = input.isVoiceProcessingInputMuted }
-            onMuteChanged?(muted)
+            try applyMute(muted)
 
             let session = AVAudioSession.sharedInstance()
             emit("audio_route", "inputAvailable=\(session.isInputAvailable) inputs=\(session.currentRoute.inputs.map(\.portType.rawValue).joined(separator: ",")) outputs=\(session.currentRoute.outputs.map(\.portType.rawValue).joined(separator: ","))")
@@ -251,8 +324,79 @@ final class AudioEngine: AudioEngineHandling, @unchecked Sendable {
             if supplied { status.pointee = .noDataNow; return nil }
             supplied = true; status.pointee = .haveData; return buffer
         }
-        guard status != .error, error == nil, destination.frameLength > 0, let channel = destination.int16ChannelData?[0] else { return nil }
-        return Data(bytes: channel, count: Int(destination.frameLength) * MemoryLayout<Int16>.size)
+        guard status != .error, error == nil, destination.frameLength > 0 else { return nil }
+        return pcmData(from: destination, requireCanonicalFrame: false)
+    }
+
+    static func isCanonicalNetworkFormat(_ format: AVAudioFormat) -> Bool {
+        format.commonFormat == .pcmFormatInt16 && format.sampleRate == networkSampleRate &&
+            format.channelCount == 1 && format.isInterleaved
+    }
+
+    static func pcmData(from buffer: AVAudioPCMBuffer, requireCanonicalFrame: Bool = true) -> Data? {
+        guard isCanonicalNetworkFormat(buffer.format), buffer.frameLength > 0 else { return nil }
+        let byteCount = Int(buffer.frameLength) * MemoryLayout<Int16>.size
+        if requireCanonicalFrame && (buffer.frameLength != samplesPerFrame || byteCount != bytesPerFrame) { return nil }
+        let buffers = UnsafeMutableAudioBufferListPointer(buffer.mutableAudioBufferList)
+        guard buffers.count == 1, let base = buffers[0].mData, Int(buffers[0].mDataByteSize) >= byteCount else { return nil }
+        return Data(bytes: base, count: byteCount)
+    }
+
+    static func canonicalBuffer(from payload: Data, format: AVAudioFormat) -> AVAudioPCMBuffer? {
+        guard payload.count == bytesPerFrame, isCanonicalNetworkFormat(format),
+              let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: samplesPerFrame) else { return nil }
+        buffer.frameLength = samplesPerFrame
+        let buffers = UnsafeMutableAudioBufferListPointer(buffer.mutableAudioBufferList)
+        guard buffers.count == 1, let destination = buffers[0].mData,
+              Int(buffers[0].mDataByteSize) >= payload.count else { return nil }
+        payload.withUnsafeBytes { bytes in if let source = bytes.baseAddress { memcpy(destination, source, payload.count) } }
+        buffers[0].mDataByteSize = UInt32(payload.count)
+        return buffer
+    }
+
+    static func signalMetrics(forCanonicalPCM data: Data) -> PCMSignalMetrics? {
+        guard data.count == bytesPerFrame else { return nil }
+        var sum = 0.0, peak = 0.0, nonzero = 0
+        data.withUnsafeBytes { raw in
+            let bytes = raw.bindMemory(to: UInt8.self)
+            for index in stride(from: 0, to: bytes.count, by: 2) {
+                let bits = UInt16(bytes[index]) | (UInt16(bytes[index + 1]) << 8)
+                let sample = Double(Int16(bitPattern: bits)) / Double(Int16.max)
+                let magnitude = abs(sample)
+                sum += sample * sample; peak = max(peak, magnitude)
+                if bits != 0 { nonzero += 1 }
+            }
+        }
+        return PCMSignalMetrics(frameCount: Int(samplesPerFrame), rms: sqrt(sum / Double(samplesPerFrame)), peak: peak, nonzeroCount: nonzero)
+    }
+
+    static func signalMetrics(for buffer: AVAudioPCMBuffer) -> PCMSignalMetrics? {
+        guard buffer.frameLength > 0 else { return nil }
+        let list = UnsafeMutableAudioBufferListPointer(buffer.mutableAudioBufferList)
+        var sum = 0.0, peak = 0.0, nonzero = 0, sampleCount = 0
+        for audioBuffer in list {
+            guard let data = audioBuffer.mData else { continue }
+            switch buffer.format.commonFormat {
+            case .pcmFormatFloat32:
+                let count = min(Int(audioBuffer.mDataByteSize) / MemoryLayout<Float>.size, Int(buffer.frameLength) * (buffer.format.isInterleaved ? Int(buffer.format.channelCount) : 1))
+                let values = data.bindMemory(to: Float.self, capacity: count)
+                for index in 0..<count { let sample = Double(values[index]); let magnitude = abs(sample); sum += sample * sample; peak = max(peak, magnitude); if values[index] != 0 { nonzero += 1 } }
+                sampleCount += count
+            case .pcmFormatInt16:
+                let count = min(Int(audioBuffer.mDataByteSize) / MemoryLayout<Int16>.size, Int(buffer.frameLength) * (buffer.format.isInterleaved ? Int(buffer.format.channelCount) : 1))
+                let values = data.bindMemory(to: Int16.self, capacity: count)
+                for index in 0..<count { let sample = Double(values[index]) / Double(Int16.max); let magnitude = abs(sample); sum += sample * sample; peak = max(peak, magnitude); if values[index] != 0 { nonzero += 1 } }
+                sampleCount += count
+            case .pcmFormatInt32:
+                let count = min(Int(audioBuffer.mDataByteSize) / MemoryLayout<Int32>.size, Int(buffer.frameLength) * (buffer.format.isInterleaved ? Int(buffer.format.channelCount) : 1))
+                let values = data.bindMemory(to: Int32.self, capacity: count)
+                for index in 0..<count { let sample = Double(values[index]) / Double(Int32.max); let magnitude = abs(sample); sum += sample * sample; peak = max(peak, magnitude); if values[index] != 0 { nonzero += 1 } }
+                sampleCount += count
+            default: return nil
+            }
+        }
+        guard sampleCount > 0 else { return nil }
+        return PCMSignalMetrics(frameCount: Int(buffer.frameLength), rms: sqrt(sum / Double(sampleCount)), peak: peak, nonzeroCount: nonzero)
     }
 
     private func startCaptureWorker() {
@@ -265,15 +409,34 @@ final class AudioEngine: AudioEngineHandling, @unchecked Sendable {
 
     private func drainCaptureRing() {
         guard let ring = captureRing, let converter = inputConverter else { return }
-        while let buffer = ring.read() {
-            if !firstMicBufferReported { firstMicBufferReported = true; emit("first_mic_buffer", "frameLength=\(buffer.frameLength) sampleRate=\(buffer.format.sampleRate) channelCount=\(buffer.format.channelCount)") }
-            guard let converted = Self.convertToNetworkPCM(buffer, converter: converter) else { reportCaptureFailure(NSError(domain: "WiFiSecureCall.AudioEngine", code: 31)); continue }
+        while ring.consume({ [self] buffer in
+            if let metrics = Self.signalMetrics(for: buffer) {
+                if !firstMicBufferReported {
+                    firstMicBufferReported = true
+                    emit("first_mic_callback", metricsDescription(metrics))
+                    emit("first_mic_buffer", "frameLength=\(buffer.frameLength) sampleRate=\(buffer.format.sampleRate) channelCount=\(buffer.format.channelCount)")
+                }
+                if metrics.hasNonzeroSignal, !firstMicNonzeroReported {
+                    firstMicNonzeroReported = true
+                    emit("first_mic_nonzero_signal", metricsDescription(metrics))
+                }
+            }
+            guard let converted = Self.convertToNetworkPCM(buffer, converter: converter) else { reportCaptureFailure(NSError(domain: "WiFiSecureCall.AudioEngine", code: 31)); return }
             pcmRing.append(converted)
             while let frame = pcmRing.popFrame() {
-                if !firstNetworkFrameReported { firstNetworkFrameReported = true; emit("first_network_audio_frame_generated", "bytes=\(frame.count)") }
+                guard let metrics = Self.signalMetrics(forCanonicalPCM: frame) else { reportCaptureFailure(NSError(domain: "WiFiSecureCall.AudioEngine", code: 36)); continue }
+                if !firstNetworkFrameReported {
+                    firstNetworkFrameReported = true
+                    emit("first_network_pcm_generated", "bytes=\(frame.count) \(metricsDescription(metrics))")
+                    emit("first_network_audio_frame_generated", "bytes=\(frame.count)")
+                }
+                if metrics.hasNonzeroSignal, !firstNetworkNonzeroReported {
+                    firstNetworkNonzeroReported = true
+                    emit("first_network_pcm_nonzero", metricsDescription(metrics))
+                }
                 onFrame?(frame)
             }
-        }
+        }) {}
     }
 
     private func startCaptureWatchdog(_ ring: RealtimeCaptureRing) {
@@ -281,21 +444,21 @@ final class AudioEngine: AudioEngineHandling, @unchecked Sendable {
         let item = DispatchWorkItem { [weak self, weak ring] in
             guard let self, self.engine.isRunning, (ring?.callbackCount ?? 0) == 0 else { return }
             self.emit("capture_watchdog_failed", "no_callbacks")
-            self.onFailure?(.captureStalled)
         }
         watchdog = item; controlQueue.asyncAfter(deadline: .now() + 2, execute: item)
     }
 
     private func convertAndSchedule(_ payload: Data) {
         guard engine.isRunning, let networkFormat, let converter = outputConverter,
-              let source = AVAudioPCMBuffer(pcmFormat: networkFormat, frameCapacity: Self.samplesPerFrame) else {
+              let source = Self.canonicalBuffer(from: payload, format: networkFormat) else {
             let error = NSError(domain: "WiFiSecureCall.AudioEngine", code: 32)
             reportPlaybackFailure(error); onFailure?(.playbackConversion); return
         }
         guard scheduledBuffers < maximumScheduledBuffers else { emit("playback_overflow", "dropped"); return }
-        source.frameLength = Self.samplesPerFrame
-        let copied = payload.withUnsafeBytes { bytes -> Bool in guard let base = bytes.baseAddress, let channel = source.int16ChannelData?[0] else { return false }; memcpy(channel, base, payload.count); return true }
-        guard copied else { reportPlaybackFailure(NSError(domain: "WiFiSecureCall.AudioEngine", code: 33)); return }
+        if let metrics = Self.signalMetrics(forCanonicalPCM: payload), metrics.hasNonzeroSignal, !firstPlaybackNonzeroReported {
+            firstPlaybackNonzeroReported = true
+            emit("first_playback_nonzero_input", metricsDescription(metrics))
+        }
         let capacity = AVAudioFrameCount(ceil(Double(Self.samplesPerFrame) * converter.outputFormat.sampleRate / networkFormat.sampleRate)) + 16
         guard let converted = AVAudioPCMBuffer(pcmFormat: converter.outputFormat, frameCapacity: capacity) else { reportPlaybackFailure(NSError(domain: "WiFiSecureCall.AudioEngine", code: 34)); return }
         var supplied = false, error: NSError?
@@ -315,7 +478,9 @@ final class AudioEngine: AudioEngineHandling, @unchecked Sendable {
 
     private func cleanupGraph() {
         watchdog?.cancel(); watchdog = nil; captureTimer?.cancel(); captureTimer = nil
+        playbackQueue.sync {}
         player.stop(); if engine.isRunning { engine.stop() }
+        captureQueue.sync {}
         let sink = captureSink
         captureLifecycle.remove { [engine] in guard let sink else { return }; engine.disconnectNodeInput(sink); engine.detach(sink) }
         captureSink = nil; captureRing = nil; engine.disconnectNodeOutput(player); engine.reset()
@@ -332,8 +497,20 @@ final class AudioEngine: AudioEngineHandling, @unchecked Sendable {
     }
 
     private func validate(_ format: AVAudioFormat) throws { guard format.sampleRate > 0, format.channelCount > 0 else { throw CallFailure.audioFailed } }
+    private func applyMute(_ value: Bool) throws {
+        if #available(iOS 17.0, watchOS 10.0, *) {
+            try AVAudioApplication.shared.setInputMuted(value)
+            emit("app_input_muted", AVAudioApplication.shared.isInputMuted ? "YES" : "NO")
+        } else {
+            emit("app_input_muted", "NOT_SUPPORTED")
+        }
+        engine.inputNode.isVoiceProcessingInputMuted = value
+        emit("voice_processing_input_muted", engine.inputNode.isVoiceProcessingInputMuted ? "YES" : "NO")
+        onMuteChanged?(value)
+    }
     private func formatDescription(_ format: AVAudioFormat) -> String { "sampleRate=\(format.sampleRate) channelCount=\(format.channelCount) commonFormat=\(format.commonFormat.rawValue) interleaved=\(format.isInterleaved)" }
-    private func resetFirstFlags() { firstMicBufferReported = false; firstNetworkFrameReported = false; firstCaptureFailureReported = false; firstPlaybackScheduledReported = false; firstPlaybackRenderedReported = false; firstPlaybackFailureReported = false }
+    private func metricsDescription(_ metrics: PCMSignalMetrics) -> String { "frames=\(metrics.frameCount) rms=\(metrics.rms) peak=\(metrics.peak) nonzero=\(metrics.nonzeroCount)" }
+    private func resetFirstFlags() { firstMicBufferReported = false; firstMicNonzeroReported = false; firstNetworkFrameReported = false; firstNetworkNonzeroReported = false; firstCaptureFailureReported = false; firstPlaybackScheduledReported = false; firstPlaybackNonzeroReported = false; firstPlaybackRenderedReported = false; firstPlaybackFailureReported = false }
     private func reportCaptureFailure(_ error: NSError) { guard !firstCaptureFailureReported else { return }; firstCaptureFailureReported = true; emit("first_capture_conversion_failure", "failed", error: error); onFailure?(.captureConversion) }
     private func reportPlaybackFailure(_ error: NSError) { guard !firstPlaybackFailureReported else { return }; firstPlaybackFailureReported = true; emit("first_playback_failure", "failed", error: error) }
     private func emit(_ event: String, _ status: String, error: NSError? = nil) { onDiagnostic?(.init(event: event, status: status, errorDomain: error?.domain, errorCode: error?.code)) }
