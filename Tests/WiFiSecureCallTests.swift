@@ -1157,6 +1157,18 @@ final class AccountFoundationTests: XCTestCase {
         XCTAssertFalse(defaultsText.contains(first.accessToken)); XCTAssertFalse(defaultsText.contains(second.refreshToken))
     }
 
+    func testSharedAccountStoreAndCustomInjection() throws {
+        XCTAssertTrue(AccountSessionStore.shared === AccountSessionStore.shared)
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: "AccountStoreInjection.\(UUID())"))
+        let secrets = InMemorySecureTokenStore()
+        var added: UUID?
+        let store = AccountSessionStore(tokenStore: secrets, defaults: defaults, accountAdded: { added = $0 })
+        let response = accountResponse(phone: "+380501234567")
+        try store.add(response)
+        XCTAssertEqual(added, response.account.accountID)
+        XCTAssertFalse(store === AccountSessionStore.shared)
+    }
+
     func testAccountAPIRefreshesOnceForConcurrentRequests() async throws {
         let accountID = UUID(), secrets = InMemorySecureTokenStore()
         try secrets.save(AccountTokens(accessToken: "expired", accessExpiresAt: .distantPast, refreshToken: "refresh", refreshExpiresAt: .distantFuture), for: accountID)
@@ -1190,6 +1202,72 @@ final class AccountFoundationTests: XCTestCase {
         do { _ = try await client.me(accountID: first); XCTFail("refresh succeeded") } catch { }
         XCTAssertNil(try secrets.tokens(for: first))
         XCTAssertNotNil(try secrets.tokens(for: second))
+    }
+
+    func testTransientRefreshFailuresPreserveSessions() async throws {
+        for failure in [URLError(.timedOut), URLError(.notConnectedToInternet)] {
+            let accountID = UUID(), secrets = InMemorySecureTokenStore()
+            try secrets.save(AccountTokens(accessToken: "expired", accessExpiresAt: .distantPast, refreshToken: "refresh", refreshExpiresAt: .distantFuture), for: accountID)
+            let session = accountTestSession { _ in throw failure }
+            let client = AccountAPIClient(config: accountConfig(), tokenStore: secrets, session: session)
+            do { _ = try await client.me(accountID: accountID); XCTFail("transient refresh succeeded") } catch { }
+            XCTAssertNotNil(try secrets.tokens(for: accountID))
+        }
+
+        let accountID = UUID(), secrets = InMemorySecureTokenStore()
+        try secrets.save(AccountTokens(accessToken: "expired", accessExpiresAt: .distantPast, refreshToken: "refresh", refreshExpiresAt: .distantFuture), for: accountID)
+        let session = accountTestSession { _ in (500, AccountAPIErrorResponse(error: "temporary", retryAt: nil)) }
+        let client = AccountAPIClient(config: accountConfig(), tokenStore: secrets, session: session)
+        do { _ = try await client.me(accountID: accountID); XCTFail("500 refresh succeeded") } catch { }
+        XCTAssertNotNil(try secrets.tokens(for: accountID))
+    }
+
+    func testAccountPushCoordinatorRegistersEveryAccountAndInvalidatesIndependently() async throws {
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: "AccountPushCoordinator.\(UUID())"))
+        let secrets = InMemorySecureTokenStore()
+        let store = AccountSessionStore(tokenStore: secrets, defaults: defaults)
+        let first = accountResponse(phone: "+380501234567", access: "access-one", refresh: "refresh-one")
+        let second = accountResponse(phone: "+14155550123", access: "access-two", refresh: "refresh-two")
+        try store.add(first)
+        try store.add(second)
+        let requests = LockedRequests()
+        let session = accountTestSession { request in
+            requests.append(request)
+            let body = String(data: request.httpBody ?? Data(), encoding: .utf8) ?? ""
+            if request.value(forHTTPHeaderField: "Authorization") == "Bearer access-one", body.contains("\"token\":\"\"") {
+                return (500, AccountAPIErrorResponse(error: "temporary", retryAt: nil))
+            }
+            return (204, AccountAPIErrorResponse(error: "", retryAt: nil))
+        }
+        let deviceID = UUID()
+        let client = AccountAPIClient(config: accountConfig(), tokenStore: secrets, session: session, deviceID: deviceID)
+        let coordinator = AccountPushRegistrationCoordinator(store: store, client: client, platform: "iOS", generation: 7)
+        let caps = DeviceCapabilities(voipPush: true, alertPush: true, notificationsAuthorized: true, microphoneReady: true)
+
+        await coordinator.update(token: Data([0xaa, 0xbb]), pushType: .alert, capabilities: caps)
+        XCTAssertEqual(requests.values.count, 2)
+        XCTAssertEqual(Set(requests.values.compactMap { $0.value(forHTTPHeaderField: "Authorization") }), ["Bearer access-one", "Bearer access-two"])
+        for request in requests.values {
+            let body = try JSONDecoder.account.decode(AccountDeviceRegistrationRequest.self, from: try XCTUnwrap(request.httpBody))
+            XCTAssertEqual(body.deviceID, deviceID)
+            XCTAssertEqual(body.pushType, .alert)
+            XCTAssertEqual(body.token, "aabb")
+            XCTAssertEqual(body.installationGeneration, 7)
+        }
+
+        store.switchAccount(to: first.account.accountID)
+        await coordinator.update(token: Data([0xcc, 0xdd]), pushType: .voip, capabilities: caps)
+        XCTAssertEqual(requests.values.count, 4)
+
+        let linked = accountResponse(phone: "+442071838750", access: "access-watch", refresh: "refresh-watch")
+        try store.addLinkedAccount(accountID: linked.account.accountID, phoneNumber: linked.account.phoneNumber, tokens: linked.tokens)
+        await coordinator.registerKnownTokens(for: linked.account.accountID)
+        XCTAssertEqual(requests.values.count, 6)
+
+        await coordinator.invalidate(pushType: .voip, expectedToken: Data([0xcc, 0xdd]))
+        XCTAssertEqual(requests.values.count, 9)
+        let invalidations = try requests.values.suffix(3).map { try JSONDecoder.account.decode(AccountDeviceRegistrationRequest.self, from: XCTUnwrap($0.httpBody)) }
+        XCTAssertTrue(invalidations.allSatisfy { $0.token.isEmpty && $0.invalidatedToken == "ccdd" })
     }
 
     func testWatchLinkPendingExpiredAndSuccessStorage() async throws {
@@ -1244,6 +1322,13 @@ private final class LockedCounter: @unchecked Sendable {
     func increment() { lock.withLock { count += 1 } }
 }
 
+private final class LockedRequests: @unchecked Sendable {
+    private let lock = NSLock()
+    private var storage: [URLRequest] = []
+    var values: [URLRequest] { lock.withLock { storage } }
+    func append(_ request: URLRequest) { lock.withLock { storage.append(request) } }
+}
+
 private final class AccountURLProtocol: URLProtocol {
     static var handler: ((URLRequest) throws -> (Int, Encodable))?
     override class func canInit(with request: URLRequest) -> Bool { true }
@@ -1251,7 +1336,20 @@ private final class AccountURLProtocol: URLProtocol {
     override func startLoading() {
         guard let handler = Self.handler else { return }
         do {
-            let (status, body) = try handler(request)
+            var capturedRequest = request
+            if capturedRequest.httpBody == nil, let stream = capturedRequest.httpBodyStream {
+                stream.open()
+                defer { stream.close() }
+                var data = Data()
+                var buffer = [UInt8](repeating: 0, count: 4096)
+                while stream.hasBytesAvailable {
+                    let count = stream.read(&buffer, maxLength: buffer.count)
+                    if count <= 0 { break }
+                    data.append(buffer, count: count)
+                }
+                capturedRequest.httpBody = data
+            }
+            let (status, body) = try handler(capturedRequest)
             let response = HTTPURLResponse(url: request.url!, statusCode: status, httpVersion: "HTTP/1.1", headerFields: nil)!
             client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
             if status != 204 { client?.urlProtocol(self, didLoad: try JSONEncoder.account.encode(AnyEncodable(body))) }

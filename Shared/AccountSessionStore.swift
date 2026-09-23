@@ -2,16 +2,20 @@ import Foundation
 
 @MainActor
 final class AccountSessionStore: ObservableObject {
+    static let shared = AccountSessionStore()
+
     @Published private(set) var accounts: [AccountSummary]
     @Published private(set) var activeAccountID: UUID?
     let tokenStore: SecureTokenStore
     private let defaults: UserDefaults
     private let accountsKey = "WiFiSecureCall.accounts.v1"
     private let activeKey = "WiFiSecureCall.activeAccountID.v1"
+    private let accountAdded: ((UUID) -> Void)?
 
-    init(tokenStore: SecureTokenStore = KeychainSecureTokenStore(), defaults: UserDefaults = .standard) {
+    init(tokenStore: SecureTokenStore = KeychainSecureTokenStore(), defaults: UserDefaults = .standard, accountAdded: ((UUID) -> Void)? = nil) {
         self.tokenStore = tokenStore
         self.defaults = defaults
+        self.accountAdded = accountAdded
         accounts = (defaults.data(forKey: accountsKey)).flatMap { try? JSONDecoder().decode([AccountSummary].self, from: $0) } ?? []
         activeAccountID = defaults.string(forKey: activeKey).flatMap(UUID.init(uuidString:))
         if let activeAccountID, !accounts.contains(where: { $0.accountID == activeAccountID }) { self.activeAccountID = accounts.first?.accountID }
@@ -25,6 +29,7 @@ final class AccountSessionStore: ObservableObject {
         else { accounts.append(response.account) }
         activeAccountID = response.account.accountID
         persistMetadata()
+        accountAdded?(response.account.accountID)
     }
 
     func addLinkedAccount(accountID: UUID, phoneNumber: String, tokens: AccountTokens) throws {
@@ -33,6 +38,7 @@ final class AccountSessionStore: ObservableObject {
         if let index = accounts.firstIndex(where: { $0.accountID == accountID }) { accounts[index] = summary } else { accounts.append(summary) }
         activeAccountID = accountID
         persistMetadata()
+        accountAdded?(accountID)
     }
 
     func switchAccount(to accountID: UUID) {

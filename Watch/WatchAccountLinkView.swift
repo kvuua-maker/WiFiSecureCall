@@ -42,6 +42,7 @@ struct WatchAccountLinkView: View {
                        let access = status.accessToken, let accessExpiry = status.accessExpiresAt,
                        let refresh = status.refreshToken, let refreshExpiry = status.refreshExpiresAt {
                         try await MainActor.run { try store.addLinkedAccount(accountID: accountID, phoneNumber: phone, tokens: AccountTokens(accessToken: access, accessExpiresAt: accessExpiry, refreshToken: refresh, refreshExpiresAt: refreshExpiry)) }
+                        await AccountPushRegistrationCoordinator.shared.registerKnownTokens(for: accountID)
                         await MainActor.run { dismiss() }
                         return
                     }

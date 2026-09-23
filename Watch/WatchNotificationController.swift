@@ -54,6 +54,7 @@ final class WatchNotificationController: NSObject, WKApplicationDelegate, UNUser
                     try Task.checkCancellation()
                     try await NotificationRuntime.shared.api.registerDevice(token: token, pushType: pushType, capabilities: capabilities())
                     Diagnostics.shared.record(role: .A, category: "pushRegistration", value: "\(pushType.rawValue)_registered")
+                    await AccountPushRegistrationCoordinator.shared.update(token: token, pushType: pushType, capabilities: capabilities())
                     return
                 } catch is CancellationError { return }
                 catch {
@@ -117,7 +118,7 @@ final class WatchNotificationController: NSObject, WKApplicationDelegate, UNUser
 
 extension WatchNotificationController: PKPushRegistryDelegate {
     nonisolated func pushRegistry(_ registry: PKPushRegistry, didUpdate credentials: PKPushCredentials, for type: PKPushType) { guard type == .voIP else { return }; let token = credentials.token; Task { @MainActor in self.upload(token, pushType: .voip) } }
-    nonisolated func pushRegistry(_ registry: PKPushRegistry, didInvalidatePushTokenFor type: PKPushType) { guard type == .voIP else { return }; Task { @MainActor in let token = self.lastVoIPToken; self.lastVoIPToken = nil; self.voipRegistrationTask?.cancel(); await NotificationRuntime.shared.api.invalidateDevice(pushType: .voip, expectedToken: token) } }
+    nonisolated func pushRegistry(_ registry: PKPushRegistry, didInvalidatePushTokenFor type: PKPushType) { guard type == .voIP else { return }; Task { @MainActor in let token = self.lastVoIPToken; self.lastVoIPToken = nil; self.voipRegistrationTask?.cancel(); await NotificationRuntime.shared.api.invalidateDevice(pushType: .voip, expectedToken: token); await AccountPushRegistrationCoordinator.shared.invalidate(pushType: .voip, expectedToken: token) } }
     nonisolated func pushRegistry(_ registry: PKPushRegistry, didReceiveIncomingPushWith payload: PKPushPayload, for type: PKPushType, completion: @escaping () -> Void) {
         guard type == .voIP, let callID = VoIPIncomingNotification.callID(from: payload.dictionaryPayload) else { completion(); return }
         Task { @MainActor in await NotificationRuntime.shared.handleIncomingVoIP(callID: callID); completion() }

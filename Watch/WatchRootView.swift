@@ -2,7 +2,7 @@ import SwiftUI
 
 struct WatchRootView: View {
     @ObservedObject var session: CallSession
-    @StateObject private var accountStore = AccountSessionStore()
+    @StateObject private var accountStore = AccountSessionStore.shared
     @State private var showAccount = false
     var body: some View {
         VStack(spacing: 8) {

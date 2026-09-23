@@ -56,6 +56,22 @@ actor AccountAPIClient {
         try tokenStore.delete(accountID: accountID)
     }
 
+    func registerDevice(accountID: UUID, token: Data, pushType: DevicePushType, capabilities: DeviceCapabilities, installationGeneration: UInt64 = InstallationIdentity.shared.generation, environment: APNSEnvironment = .production) async throws {
+        let _: EmptyAccountResponse = try await authorized("devices/register", accountID: accountID, body: AccountDeviceRegistrationRequest(
+            requestID: UUID(), deviceID: deviceID, platform: Self.platform, pushType: pushType,
+            token: token.hexString, invalidatedToken: nil, installationGeneration: installationGeneration,
+            environment: environment, capabilities: capabilities
+        ))
+    }
+
+    func invalidateDevice(accountID: UUID, pushType: DevicePushType, expectedToken: Data?, capabilities: DeviceCapabilities, installationGeneration: UInt64 = InstallationIdentity.shared.generation, environment: APNSEnvironment = .production) async throws {
+        let _: EmptyAccountResponse = try await authorized("devices/register", accountID: accountID, body: AccountDeviceRegistrationRequest(
+            requestID: UUID(), deviceID: deviceID, platform: Self.platform, pushType: pushType,
+            token: "", invalidatedToken: expectedToken?.hexString, installationGeneration: installationGeneration,
+            environment: environment, capabilities: capabilities
+        ))
+    }
+
     private func authorized<T: Decodable, B: Encodable>(_ path: String, method: String = "POST", accountID: UUID, body: B?) async throws -> T {
         var tokens = try tokenStore.tokens(for: accountID) ?? { throw AccountAPIError.missingSession }()
         if tokens.accessExpiresAt <= Date() { tokens = try await refresh(accountID: accountID) }
@@ -81,7 +97,9 @@ actor AccountAPIClient {
             return value
         } catch {
             refreshTasks[accountID] = nil
-            try? tokenStore.delete(accountID: accountID)
+            if case let AccountAPIError.status(status, _) = error, status == 401 || status == 403 {
+                try? tokenStore.delete(accountID: accountID)
+            }
             throw error
         }
     }
@@ -100,7 +118,19 @@ actor AccountAPIClient {
         guard let decoded = try? JSONDecoder.account.decode(T.self, from: data) else { throw AccountAPIError.decoding }
         return decoded
     }
+
+    private static var platform: String {
+        #if os(watchOS)
+        "watchOS"
+        #else
+        "iOS"
+        #endif
+    }
 }
 
 private struct EmptyAccountRequest: Codable {}
 private struct EmptyAccountResponse: Codable {}
+
+private extension Data {
+    var hexString: String { map { String(format: "%02x", $0) }.joined() }
+}

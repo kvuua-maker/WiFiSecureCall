@@ -37,7 +37,12 @@ struct PhoneRegistrationView: View {
     @MainActor private func verify() async {
         guard let verificationID else { return }
         busy = true; defer { busy = false }
-        do { try store.add(try await client.verifyPhone(verificationID: verificationID, code: code)); dismiss() }
+        do {
+            let response = try await client.verifyPhone(verificationID: verificationID, code: code)
+            try store.add(response)
+            await AccountPushRegistrationCoordinator.shared.registerKnownTokens(for: response.account.accountID)
+            dismiss()
+        }
         catch { message = "Verification failed" }
     }
 }

@@ -39,6 +39,18 @@ struct PhoneVerifyRequest: Codable, Sendable { let requestID: UUID; let verifica
 struct AccountRefreshRequest: Codable, Sendable { let refreshToken: String; let deviceID: UUID }
 struct AccountDeleteRequest: Codable, Sendable { let confirm: String }
 
+struct AccountDeviceRegistrationRequest: Codable, Sendable {
+    let requestID: UUID
+    let deviceID: UUID
+    let platform: String
+    let pushType: DevicePushType
+    let token: String
+    let invalidatedToken: String?
+    let installationGeneration: UInt64
+    let environment: APNSEnvironment
+    let capabilities: DeviceCapabilities
+}
+
 struct AccountMeResponse: Codable, Sendable {
     let accountID: UUID
     let phoneNumber: String
