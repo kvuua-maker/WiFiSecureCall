@@ -4,6 +4,7 @@ struct IOSRootView: View {
     @ObservedObject var session: CallSession
     @StateObject private var accountStore = AccountSessionStore.shared
     @State private var showAccount = false
+    @State private var showDialDiagnostics = false
 
     var body: some View {
         VStack(spacing: 24) {
@@ -13,6 +14,7 @@ struct IOSRootView: View {
         }
         .padding(32)
         .sheet(isPresented: $showAccount) { AccountView(store: accountStore) }
+        .sheet(isPresented: $showDialDiagnostics) { SystemDialDiagnosticsView() }
     }
 
     private var status: String {
@@ -35,6 +37,7 @@ struct IOSRootView: View {
             VStack {
                 Button("Call Watch") { Task { await NotificationRuntime.shared.startPreferredCall(targetPlatform: "watchOS") } }.buttonStyle(.borderedProminent)
                 Button(accountStore.activeAccount?.phoneNumber ?? "Account") { showAccount = true }.font(.footnote)
+                Button("Dial diagnostics") { showDialDiagnostics = true }.font(.footnote)
             }
         case .outgoingRinging:
             Button("Cancel", role: .destructive) { Task { await session.cancel() } }

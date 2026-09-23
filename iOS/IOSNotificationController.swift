@@ -12,6 +12,7 @@ final class IOSNotificationController: NSObject, UIApplicationDelegate, UNUserNo
 
     func application(_ application: UIApplication, didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]? = nil) -> Bool {
         NotificationRuntime.shared.configureCallKitFactory { IOSCallKitAdapter() }
+        IOSSystemDialCoordinator.shared.activate()
         let center = UNUserNotificationCenter.current(); center.delegate = self
         center.setNotificationCategories([UNNotificationCategory(identifier: "INCOMING_CALL", actions: [
             UNNotificationAction(identifier: "ACCEPT", title: "Accept", options: .foreground),

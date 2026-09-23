@@ -24,6 +24,141 @@ final class WatchSystemDialerNumberTests: XCTestCase {
     }
 }
 
+@MainActor
+final class SystemDialDiagnosticTests: XCTestCase {
+    func testDiagnosticStoreKeepsTwentyAttempts() {
+        let store = makeStore()
+        for index in 0..<25 {
+            store.upsert(.make(attemptID: UUID(), startedAt: Date(timeIntervalSince1970: Double(index)), numberDigitCount: 10))
+        }
+        XCTAssertEqual(store.attempts.count, 20)
+        XCTAssertEqual(store.attempts.first?.startedAt, Date(timeIntervalSince1970: 24))
+    }
+
+    func testDiagnosticStoreKeepsFiftyEventsPerAttempt() {
+        let store = makeStore()
+        let id = UUID()
+        store.upsert(.make(attemptID: id, numberDigitCount: 10))
+        for index in 0..<55 { store.record(id: id, source: "watch", event: "event_\(index)", status: "ok") }
+        XCTAssertEqual(store.attempt(id: id)?.events.count, 50)
+        XCTAssertEqual(store.attempt(id: id)?.events.first?.event, "event_5")
+    }
+
+    func testDiagnosticPersistenceContainsNoRawPhoneNumber() throws {
+        let url = temporaryStoreURL()
+        let store = SystemDialDiagnosticStore(fileURL: url)
+        store.upsert(.make(numberDigitCount: 12))
+        let persisted = String(decoding: try Data(contentsOf: url), as: UTF8.self)
+        XCTAssertFalse(persisted.contains("+380501234567"))
+        XCTAssertFalse(persisted.contains("phoneNumber"))
+        XCTAssertTrue(persisted.contains("numberDigitCount"))
+    }
+
+    func testNonceMismatchIsIgnored() {
+        let attemptID = UUID(), nonce = UUID()
+        let reply: [String: Any] = ["attemptID": attemptID.uuidString, "nonce": UUID().uuidString]
+        XCTAssertFalse(SystemDialMessageValidator.matches(reply, attemptID: attemptID, nonce: nonce))
+    }
+
+    func testStaleAttemptReplyIsIgnored() {
+        let nonce = UUID()
+        let reply: [String: Any] = ["attemptID": UUID().uuidString, "nonce": nonce.uuidString]
+        XCTAssertFalse(SystemDialMessageValidator.matches(reply, attemptID: UUID(), nonce: nonce))
+    }
+
+    func testDuplicateCallbackCannotCompleteTwice() {
+        var values: [Int] = []
+        let gate = SystemDialOneShotCompletion<Int> { if case let .success(value) = $0 { values.append(value) } }
+        XCTAssertTrue(gate.complete(.success(1)))
+        XCTAssertFalse(gate.complete(.success(2)))
+        XCTAssertEqual(values, [1])
+    }
+
+    func testReplyWinsReplyTimeoutRace() {
+        var result = ""
+        let gate = SystemDialOneShotCompletion<String> { if case let .success(value) = $0 { result = value } }
+        XCTAssertTrue(gate.complete(.success("reply")))
+        XCTAssertFalse(gate.complete(.failure(TestSystemDialError.timeout)))
+        XCTAssertEqual(result, "reply")
+    }
+
+    func testErrorWinsErrorTimeoutRace() {
+        var completions = 0
+        let gate = SystemDialOneShotCompletion<String> { _ in completions += 1 }
+        XCTAssertTrue(gate.complete(.failure(TestSystemDialError.transport)))
+        XCTAssertFalse(gate.complete(.failure(TestSystemDialError.timeout)))
+        XCTAssertEqual(completions, 1)
+    }
+
+    func testClassificationForWCNotActivated() {
+        XCTAssertEqual(classification(activation: "notActivated"), SystemDialClassification.wcNotActivated)
+    }
+
+    func testClassificationForIPhoneNeedsUnlock() {
+        XCTAssertEqual(classification(needsUnlock: true), SystemDialClassification.iPhoneNeedsUnlock)
+    }
+
+    func testClassificationForIPhoneUnreachable() {
+        XCTAssertEqual(classification(reachable: false), SystemDialClassification.iPhoneAppUnreachable)
+    }
+
+    func testClassificationForIPhoneReady() {
+        XCTAssertEqual(classification(replied: true), SystemDialClassification.iPhoneReady)
+    }
+
+    func testNoObserverEvidenceIsNotDefinitiveRelayFailure() {
+        let value = SystemDialClassification.afterHandoff(outgoing: nil, connected: nil, ended: nil, resultReceived: true)
+        XCTAssertEqual(value, SystemDialClassification.noSystemCallEvidence)
+        XCTAssertFalse(value.lowercased().contains("relay_failed"))
+    }
+
+    func testOutgoingObservedClassification() {
+        XCTAssertEqual(SystemDialClassification.afterHandoff(outgoing: Date(), connected: nil, ended: nil, resultReceived: true), SystemDialClassification.systemCallObserved)
+    }
+
+    func testConnectedObservedClassification() {
+        XCTAssertEqual(SystemDialClassification.afterHandoff(outgoing: Date(), connected: Date(), ended: nil, resultReceived: true), SystemDialClassification.systemCallConnected)
+    }
+
+    func testEndedObservedClassification() {
+        XCTAssertEqual(SystemDialClassification.afterHandoff(outgoing: Date(), connected: Date(), ended: Date(), resultReceived: true), SystemDialClassification.systemCallEnded)
+    }
+
+    func testSecondDialCannotOverlapFirstPreflight() {
+        let admission = SystemDialAttemptAdmission()
+        XCTAssertTrue(admission.begin())
+        XCTAssertFalse(admission.begin())
+        admission.end()
+        XCTAssertTrue(admission.begin())
+    }
+
+    func testTelHandoffContinuesAfterPreflightFailure() {
+        XCTAssertTrue(SystemDialPreflightPolicy.shouldRequestTelHandoff(numberIsValid: true, preflightSucceeded: false))
+        XCTAssertFalse(SystemDialPreflightPolicy.shouldRequestTelHandoff(numberIsValid: false, preflightSucceeded: false))
+    }
+
+    private func classification(
+        activation: String = "activated",
+        reachable: Bool = true,
+        needsUnlock: Bool? = false,
+        replied: Bool = false
+    ) -> String {
+        SystemDialClassification.preflight(
+            networkStatus: "satisfied",
+            wcSupported: true,
+            activationState: activation,
+            reachable: reachable,
+            needsUnlock: needsUnlock,
+            replied: replied
+        )
+    }
+
+    private func makeStore() -> SystemDialDiagnosticStore { SystemDialDiagnosticStore(fileURL: temporaryStoreURL()) }
+    private func temporaryStoreURL() -> URL { FileManager.default.temporaryDirectory.appendingPathComponent("system-dial-\(UUID().uuidString).json") }
+}
+
+private enum TestSystemDialError: Error { case timeout, transport }
+
 final class WiFiSecureCallTests: XCTestCase {
     func testLegalCallStateTransitions() {
         let id = UUID()

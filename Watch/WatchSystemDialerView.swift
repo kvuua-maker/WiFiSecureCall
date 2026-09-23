@@ -31,6 +31,7 @@ import WatchKit
 
 struct WatchSystemDialerView: View {
     @Environment(\.dismiss) private var dismiss
+    @StateObject private var coordinator = WatchSystemDialCoordinator.shared
     @State private var number = ""
     @State private var showsInvalidNumber = false
 
@@ -63,8 +64,23 @@ struct WatchSystemDialerView: View {
 
                 Button("Call") { callSystemPhone() }
                     .tint(.green)
+                    .disabled(coordinator.isPreparing)
                 Button("Close") { dismiss() }
                     .font(.caption2)
+
+                if let attempt = coordinator.latestAttempt {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(SystemDialClassification.displayText(for: attempt.classification))
+                            .font(.caption2.bold())
+                        Text("ID \(attempt.attemptID.uuidString.prefix(8))")
+                            .font(.system(size: 9, design: .monospaced))
+                            .foregroundStyle(.secondary)
+                        ForEach(Array(coordinator.recentLines.enumerated()), id: \.offset) { _, line in
+                            Text(line).font(.system(size: 9)).lineLimit(1)
+                        }
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                }
             }
             .padding(.horizontal, 4)
         }
@@ -82,7 +98,7 @@ struct WatchSystemDialerView: View {
             showsInvalidNumber = true
             return
         }
-        WKApplication.shared().openSystemURL(url)
+        Task { await coordinator.prepareAndDial(number: number, url: url) }
     }
 }
 #endif
