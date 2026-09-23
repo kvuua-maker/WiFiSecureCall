@@ -622,6 +622,162 @@ final class WiFiSecureCallTests: XCTestCase {
     }
 
     @MainActor
+    func testAppRequestedEndWhileOutgoingRingingCancelsNormally() async throws {
+        let capture = RequestCapture(); capture.mutationState = .cancelled
+        let (session, adapter, _, localID) = try await prepareOutgoingRinging(capture: capture)
+
+        let disposition = try await adapter.approveEnd(localID, origin: .appRequested)
+        await eventually { capture.paths.contains { $0.hasSuffix("/cancel") } }
+
+        XCTAssertEqual(disposition, .ended)
+        XCTAssertTrue(session.state.isTerminal)
+        XCTAssertTrue(capture.paths.contains { $0.hasSuffix("/cancel") })
+    }
+
+    @MainActor
+    func testSystemEndWhileServerRingingCancelsNormally() async throws {
+        let capture = RequestCapture(); capture.mutationState = .cancelled
+        let (session, adapter, _, localID) = try await prepareOutgoingRinging(capture: capture)
+
+        let disposition = try await adapter.approveEnd(localID, origin: .system)
+        await eventually { capture.paths.contains { $0.hasSuffix("/cancel") } }
+
+        XCTAssertEqual(disposition, .ended)
+        XCTAssertTrue(session.state.isTerminal)
+        XCTAssertTrue(capture.paths.contains { $0.hasSuffix("/cancel") })
+    }
+
+    @MainActor
+    func testSystemEndAfterRemoteAcceptPreservesOutgoingCall() async throws {
+        let capture = RequestCapture()
+        let (session, adapter, serverID, localID) = try await prepareOutgoingRinging(capture: capture)
+        capture.getState = .accepted
+
+        let disposition = try await adapter.approveEnd(localID, origin: .system)
+
+        XCTAssertEqual(disposition, .preserveCall)
+        XCTAssertEqual(session.state, .connecting(serverID))
+        XCTAssertFalse(capture.paths.contains { $0.hasSuffix("/cancel") || $0.hasSuffix("/end") })
+    }
+
+    @MainActor
+    func testAcceptedSystemEndWithActivatedCallKitStartsAudioAndMedia() async throws {
+        let capture = RequestCapture()
+        let audio = AudioEngineMock(), media = MediaTransportMock()
+        let (session, adapter, serverID, localID) = try await prepareOutgoingRinging(capture: capture, audio: audio, media: media)
+        adapter.onAudioActivated?(localID)
+        capture.getState = .accepted
+
+        let disposition = try await adapter.approveEnd(localID, origin: .system)
+        await eventually { audio.startCount == 1 && media.connectedCallIDs == [serverID] }
+
+        XCTAssertEqual(disposition, .preserveCall)
+        XCTAssertEqual(session.state, .connecting(serverID))
+        XCTAssertEqual(audio.startCount, 1)
+        XCTAssertEqual(media.connectedCallIDs, [serverID])
+    }
+
+    @MainActor
+    func testDuplicateSystemEndDuringPreservedConnectingIsSuppressed() async throws {
+        let capture = RequestCapture()
+        let (session, adapter, serverID, localID) = try await prepareOutgoingRinging(capture: capture)
+        capture.getState = .accepted
+        let first = try await adapter.approveEnd(localID, origin: .system)
+        XCTAssertEqual(first, .preserveCall)
+        let getCountAfterFirst = capture.paths.filter { $0.hasSuffix("/calls/\(serverID.uuidString.lowercased())") }.count
+
+        let second = try await adapter.approveEnd(localID, origin: .system)
+
+        XCTAssertEqual(second, .preserveCall)
+        XCTAssertEqual(session.state, .connecting(serverID))
+        XCTAssertEqual(capture.paths.filter { $0.hasSuffix("/calls/\(serverID.uuidString.lowercased())") }.count, getCountAfterFirst)
+        XCTAssertFalse(capture.paths.contains { $0.hasSuffix("/cancel") || $0.hasSuffix("/end") })
+    }
+
+    @MainActor
+    func testExplicitAppEndAfterPreservedAcceptanceEndsNormally() async throws {
+        let capture = RequestCapture(); capture.mutationState = .ended
+        let (session, adapter, _, localID) = try await prepareOutgoingRinging(capture: capture)
+        capture.getState = .accepted
+        let preserved = try await adapter.approveEnd(localID, origin: .system)
+        XCTAssertEqual(preserved, .preserveCall)
+
+        let disposition = try await adapter.approveEnd(localID, origin: .appRequested)
+        await eventually { capture.paths.contains { $0.hasSuffix("/end") } }
+
+        XCTAssertEqual(disposition, .ended)
+        XCTAssertTrue(session.state.isTerminal)
+        XCTAssertTrue(capture.paths.contains { $0.hasSuffix("/end") })
+    }
+
+    @MainActor
+    func testSystemEndAfterCallBecomesActiveEndsNormally() async throws {
+        let capture = RequestCapture(); capture.mutationState = .ended
+        let media = MediaTransportMock()
+        let (session, adapter, serverID, localID) = try await prepareOutgoingRinging(capture: capture, media: media)
+        adapter.onAudioActivated?(localID)
+        capture.getState = .accepted
+        let preserved = try await adapter.approveEnd(localID, origin: .system)
+        XCTAssertEqual(preserved, .preserveCall)
+        await eventually { !media.connectionIDs.isEmpty }
+        let epoch = try XCTUnwrap(media.connectionIDs.last)
+        media.onPeerReady?(serverID, epoch)
+        await eventually { session.state == .active(serverID) }
+
+        let disposition = try await adapter.approveEnd(localID, origin: .system)
+        await eventually { capture.paths.contains { $0.hasSuffix("/end") } }
+
+        XCTAssertEqual(disposition, .ended)
+        XCTAssertTrue(capture.paths.contains { $0.hasSuffix("/end") })
+    }
+
+    @MainActor
+    func testSystemEndReconcileUsesExistingRemoteTerminalHandling() async throws {
+        let capture = RequestCapture()
+        let (session, adapter, _, localID) = try await prepareOutgoingRinging(capture: capture)
+        capture.getState = .rejected
+
+        let disposition = try await adapter.approveEnd(localID, origin: .system)
+
+        XCTAssertEqual(disposition, .ended)
+        XCTAssertTrue(session.state.isTerminal)
+        XCTAssertFalse(capture.paths.contains { $0.hasSuffix("/cancel") || $0.hasSuffix("/end") })
+    }
+
+    @MainActor
+    func testSystemEndReconcileNetworkFailureFallsBackToNormalCancel() async throws {
+        let capture = RequestCapture(); capture.mutationState = .cancelled
+        let (session, adapter, _, localID) = try await prepareOutgoingRinging(capture: capture)
+        capture.getError = URLError(.timedOut)
+
+        let disposition = try await adapter.approveEnd(localID, origin: .system)
+        await eventually { capture.paths.contains { $0.hasSuffix("/cancel") } }
+
+        XCTAssertEqual(disposition, .ended)
+        XCTAssertTrue(session.state.isTerminal)
+        XCTAssertTrue(capture.paths.contains { $0.hasSuffix("/cancel") })
+    }
+
+    @MainActor
+    func testIncomingIPhoneAnswerPathRemainsUnchanged() async throws {
+        let capture = RequestCapture(); capture.mutationState = .accepted
+        let audio = AudioEngineMock(), media = MediaTransportMock()
+        let session = makeSession(capture: capture, role: .B, audio: audio, media: media)
+        let adapter = RetainedCallKitMock(); session.attach(callKit: adapter)
+        let serverID = UUID()
+        await session.handleIncomingVoIP(callID: serverID)
+        let localID = try XCTUnwrap(adapter.incomingIDs.first)
+
+        try await adapter.approveAnswer(localID)
+        adapter.onAudioActivated?(localID)
+        await eventually { audio.startCount == 1 && media.connectedCallIDs == [serverID] }
+
+        XCTAssertEqual(session.state, .connecting(serverID))
+        XCTAssertEqual(audio.startCount, 1)
+        XCTAssertEqual(media.connectedCallIDs, [serverID])
+    }
+
+    @MainActor
     func testCallKitErrorUploadsExactBoundedFields() async throws {
         let capture = RequestCapture()
         let session = makeSession(capture: capture)
@@ -911,6 +1067,27 @@ final class WiFiSecureCallTests: XCTestCase {
     }
 
     @MainActor
+    private func prepareOutgoingRinging(
+        capture: RequestCapture,
+        audio: AudioEngineHandling = AudioEngineMock(),
+        media: MediaTransport? = nil
+    ) async throws -> (CallSession, RetainedCallKitMock, UUID, UUID) {
+        capture.getState = .ringing
+        let session = makeSession(capture: capture, role: .B, audio: audio, media: media)
+        let adapter = RetainedCallKitMock(); session.attach(callKit: adapter)
+        await session.startCall()
+        let serverID = try XCTUnwrap(session.state.callID)
+        let localID = try XCTUnwrap(adapter.startedIDs.first)
+        try await adapter.approveStart(localID)
+        await eventually {
+            capture.createdCallID == serverID && capture.paths.contains {
+                $0.hasSuffix("/calls/\(serverID.uuidString.lowercased())")
+            }
+        }
+        return (session, adapter, serverID, localID)
+    }
+
+    @MainActor
     private func makeSession(capture: RequestCapture, role: DeviceRole = .B, audio: AudioEngineHandling = AudioEngineMock(), media: MediaTransport? = nil) -> CallSession {
         let config = AppConfig(
             apiBaseURL: URL(string: "https://unit.test/v1")!,
@@ -968,7 +1145,7 @@ private final class RetainedCallKitMock: CallKitHandling {
     var onActionFailed: ((UUID, String, Error) -> Void)?
     var onStartRequested: ((UUID, Date) async throws -> Void)?
     var onAnswerRequested: ((UUID, Date) async throws -> Void)?
-    var onEndRequested: ((UUID, Date) async throws -> Void)?
+    var onEndRequested: ((UUID, Date, CallEndRequestOrigin) async throws -> CallEndDisposition)?
     var onMutedRequested: ((UUID, Bool) throws -> Void)?
     var onActionTimedOut: ((UUID, String) -> Void)?
     var onAudioActivated: ((UUID) -> Void)?
@@ -994,7 +1171,10 @@ private final class RetainedCallKitMock: CallKitHandling {
     func reportEnded(id: UUID, reason: CallEndReason) { endedIDs.append(id) }
     func approveStart(_ id: UUID) async throws { try await onStartRequested?(id, Date().addingTimeInterval(10)) }
     func approveAnswer(_ id: UUID) async throws { try await onAnswerRequested?(id, Date().addingTimeInterval(10)) }
-    func approveEnd(_ id: UUID) async throws { try await onEndRequested?(id, Date().addingTimeInterval(10)) }
+    @discardableResult
+    func approveEnd(_ id: UUID, origin: CallEndRequestOrigin = .appRequested) async throws -> CallEndDisposition {
+        try await onEndRequested?(id, Date().addingTimeInterval(10), origin) ?? .ended
+    }
 }
 
 private final class AudioEngineMock: AudioEngineHandling, @unchecked Sendable {
@@ -1037,6 +1217,7 @@ private final class RequestCapture: @unchecked Sendable {
     private var _callKitDiagnostic: [String: Any]?
     var mutationState: ServerCallState = .ended
     var getState: ServerCallState = .ringing
+    var getError: Error?
     var acceptedMediaToken: String? = "media-token"
     var onRequest: ((URLRequest) -> Void)?
     var clientRole: DeviceRole = .B
@@ -1072,6 +1253,7 @@ private final class RequestCapture: @unchecked Sendable {
             return (response(request, 204), Data())
         }
         if request.httpMethod == "GET" {
+            if let getError { throw getError }
             let state = getState
             return (response(request, 200), callResponse(callID: callID, state: state, mediaToken: state == .accepted ? acceptedMediaToken : nil, outgoing: callID == createdCallID))
         }

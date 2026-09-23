@@ -1,6 +1,8 @@
 import Foundation
 
 enum CallEndReason: Sendable { case remoteEnded, failed, unanswered, declined, localEnded }
+enum CallEndRequestOrigin: Sendable { case appRequested, system }
+enum CallEndDisposition: Sendable { case ended, preserveCall }
 enum CallKitCoordinatorError: Error { case missingCoordinator, actionTimedOut, invalidAction }
 
 @MainActor
@@ -11,7 +13,7 @@ protocol CallKitHandling: AnyObject {
     var onActionFailed: ((UUID, String, Error) -> Void)? { get set }
     var onStartRequested: ((UUID, Date) async throws -> Void)? { get set }
     var onAnswerRequested: ((UUID, Date) async throws -> Void)? { get set }
-    var onEndRequested: ((UUID, Date) async throws -> Void)? { get set }
+    var onEndRequested: ((UUID, Date, CallEndRequestOrigin) async throws -> CallEndDisposition)? { get set }
     var onMutedRequested: ((UUID, Bool) throws -> Void)? { get set }
     var onActionTimedOut: ((UUID, String) -> Void)? { get set }
     var onAudioActivated: ((UUID) -> Void)? { get set }
@@ -77,6 +79,7 @@ final class CallSession: ObservableObject {
     private var audioStartedForCallKitUUID: UUID?
     private var serverCallCreated = false
     private var serverCallAccepted = false
+    private var suppressedSystemEndDuringAcceptance = false
     private var sequence: UInt64 = 0
     private let playout = AudioPlayoutController()
     private var tasks: [Task<Void, Never>] = []
@@ -176,9 +179,9 @@ final class CallSession: ObservableObject {
             guard let self else { throw CallKitCoordinatorError.missingCoordinator }
             try await self.performAnswer(localID: localID, deadline: deadline)
         }
-        callKit.onEndRequested = { [weak self] localID, deadline in
+        callKit.onEndRequested = { [weak self] localID, deadline, origin in
             guard let self else { throw CallKitCoordinatorError.missingCoordinator }
-            try await self.performEnd(localID: localID, deadline: deadline)
+            return try await self.performEnd(localID: localID, deadline: deadline, origin: origin)
         }
         callKit.onMutedRequested = { [weak self] localID, muted in
             guard let self, self.generation?.localCallKitUUID == localID else { throw CallKitCoordinatorError.invalidAction }
@@ -296,7 +299,7 @@ final class CallSession: ObservableObject {
     func endCall() async {
         guard let current = generation else { return }
         do { try await callKit?.requestEnd(id: current.localCallKitUUID) }
-        catch { guard isCurrent(current) else { return }; recordCallKitError(stage: "requestEnd", callID: current.serverCallID, error: error); try? await performEnd(localID: current.localCallKitUUID, deadline: Date().addingTimeInterval(1)) }
+        catch { guard isCurrent(current) else { return }; recordCallKitError(stage: "requestEnd", callID: current.serverCallID, error: error); _ = try? await performEnd(localID: current.localCallKitUUID, deadline: Date().addingTimeInterval(1), origin: .appRequested) }
     }
 
     func toggleMute() {
@@ -358,15 +361,61 @@ final class CallSession: ObservableObject {
         startTerminalObserver(current)
     }
 
-    private func performEnd(localID: UUID, deadline: Date) async throws {
+    private func performEnd(localID: UUID, deadline: Date, origin: CallEndRequestOrigin) async throws -> CallEndDisposition {
         guard let current = generation, current.localCallKitUUID == localID else { throw CallKitCoordinatorError.invalidAction }
+        let originStatus = origin == .appRequested ? "appRequested" : "system"
+        recordRuntimeDiagnostic("callkit_end_action_received", status: "origin=\(originStatus) state=\(String(describing: state))", callID: current.serverCallID)
+
+        if origin == .system, config.role == .B, isOutgoingCall {
+            if suppressedSystemEndDuringAcceptance, serverCallAccepted,
+               case .connecting = state, !transportActive {
+                recordRuntimeDiagnostic("system_end_duplicate_preserved_during_connecting", status: "preserved", callID: current.serverCallID)
+                return .preserveCall
+            }
+            if case .outgoingRinging = state {
+                recordRuntimeDiagnostic("system_end_reconcile_started", status: "started", callID: current.serverCallID)
+                do {
+                    let response = try await api.call(current.serverCallID)
+                    guard isCurrent(current), response.callID == current.serverCallID else { throw CancellationError() }
+                    switch response.state {
+                    case .accepted:
+                        guard let token = response.mediaToken, !token.isEmpty else {
+                            recordRuntimeDiagnostic("system_end_reconcile_result", status: "failed", callID: current.serverCallID)
+                            break
+                        }
+                        recordRuntimeDiagnostic("system_end_reconcile_result", status: "accepted", callID: current.serverCallID)
+                        mediaToken = token
+                        serverCallAccepted = true
+                        suppressedSystemEndDuringAcceptance = true
+                        transition(.connecting(current.serverCallID))
+                        beginActivationWatchdog(current)
+                        startTerminalObserver(current)
+                        startMediaIfReady(current)
+                        recordRuntimeDiagnostic("system_end_preserved_after_remote_accept", status: "accepted", callID: current.serverCallID)
+                        return .preserveCall
+                    case .ringing:
+                        recordRuntimeDiagnostic("system_end_reconcile_result", status: "ringing", callID: current.serverCallID)
+                    case .rejected, .cancelled, .expired, .ended:
+                        recordRuntimeDiagnostic("system_end_reconcile_result", status: "terminal", callID: current.serverCallID)
+                        await remoteTerminal(response, generation: current)
+                        return .ended
+                    }
+                } catch {
+                    guard isCurrent(current) else { throw error }
+                    recordRuntimeDiagnostic("system_end_reconcile_result", status: "failed", callID: current.serverCallID, domain: (error as NSError).domain, code: (error as NSError).code)
+                }
+            }
+        }
+
+        suppressedSystemEndDuringAcceptance = false
         let mutation = terminalMutationForCurrentState()
         terminalMutation = mutation
         terminalRequestID = terminalRequestID ?? UUID()
         registerTerminalCompensation(current, mutation: mutation)
         await teardownLocal(current, finalState: .ended(current.serverCallID), reportReason: nil)
-        guard Date() < deadline else { enqueueTerminalMutation(current, mutation: mutation); return }
+        guard Date() < deadline else { enqueueTerminalMutation(current, mutation: mutation); return .ended }
         enqueueTerminalMutation(current, mutation: mutation)
+        return .ended
     }
 
     private func actionTimedOut(localID: UUID, stage: String) {
@@ -490,6 +539,7 @@ final class CallSession: ObservableObject {
         guard let current = generation, current.serverCallID == callID, self.mediaEpoch == mediaEpoch else { return }
         peerWatchdog?.cancel()
         transportActive = true
+        suppressedSystemEndDuringAcceptance = false
         if state != .active(callID) { transition(.active(callID)); startDuration(current); if isOutgoingCall { callKit?.reportOutgoingConnected(id: current.localCallKitUUID) } }
         recordRuntimeDiagnostic("media_peer_ready", status: "ready", callID: callID)
         beginAudioFlowWatchdog(current)
@@ -769,7 +819,7 @@ final class CallSession: ObservableObject {
         audio.onFailure = { value in events?.yield(.audioFailure(next.id, value)) }
         audio.onMuteChanged = { value in events?.yield(.muteChanged(next.id, value)) }
         mediaToken = nil; mediaEpoch = nil; createRequestID = nil; acceptRequestID = nil; terminalRequestID = nil; terminalMutation = nil
-        activatedCallKitUUID = nil; audioStartedForCallKitUUID = nil; serverCallCreated = false; serverCallAccepted = false; sequence = 0; isMuted = false; elapsedSeconds = 0
+        activatedCallKitUUID = nil; audioStartedForCallKitUUID = nil; serverCallCreated = false; serverCallAccepted = false; suppressedSystemEndDuringAcceptance = false; sequence = 0; isMuted = false; elapsedSeconds = 0
         firstSentFrameReported = false; firstRemoteFrameReported = false; firstSendFailureReported = false
         transportActive = false; audioOperational = false; audioFlow = AudioFlowMilestones(); audioRecoveryBudget = AudioRecoveryBudget()
         firstRemoteNonzeroReported = false; firstSentNonzeroReported = false; sendBackpressureDropReported = false
@@ -779,7 +829,7 @@ final class CallSession: ObservableObject {
     private func invalidateGeneration(expected: CallGeneration? = nil) {
         if let expected, generation != expected { return }
         cancelCallTasks(); sendContinuation?.finish(); sendContinuation = nil; sendStream = nil; sendTask?.cancel(); sendTask = nil
-        generation = nil; activeCallKitUUID = nil; mediaEpoch = nil; mediaToken = nil; isOutgoingCall = false; callKitReported = false
+        generation = nil; activeCallKitUUID = nil; mediaEpoch = nil; mediaToken = nil; isOutgoingCall = false; callKitReported = false; suppressedSystemEndDuringAcceptance = false
     }
 
     private func cancelCallTasks() {
