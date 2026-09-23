@@ -34,11 +34,21 @@ struct WatchSystemDialerView: View {
     @StateObject private var coordinator = WatchSystemDialCoordinator.shared
     @State private var number = ""
     @State private var showsInvalidNumber = false
+    @State private var showingResult = false
 
     private let columns = Array(repeating: GridItem(.flexible(), spacing: 6), count: 3)
     private let digits: [Character] = ["1", "2", "3", "4", "5", "6", "7", "8", "9"]
 
     var body: some View {
+        Group {
+            if showingResult { resultScreen } else { numberEntryScreen }
+        }
+        .alert("Invalid number", isPresented: $showsInvalidNumber) {
+            Button("OK", role: .cancel) { }
+        }
+    }
+
+    private var numberEntryScreen: some View {
         ScrollView {
             VStack(spacing: 8) {
                 Text(number.isEmpty ? "Enter number" : number)
@@ -67,31 +77,43 @@ struct WatchSystemDialerView: View {
                     .disabled(coordinator.isPreparing)
                 Button("Close") { dismiss() }
                     .font(.caption2)
-
-                if let attempt = coordinator.latestAttempt {
-                    let summary = SystemDialUserSummary.make(from: attempt)
-                    VStack(spacing: 3) {
-                        Text(summary.title)
-                            .font(.headline)
-                            .multilineTextAlignment(.center)
-                        Text(summary.code)
-                            .font(.system(size: 10, weight: .semibold, design: .monospaced))
-                            .foregroundStyle(.secondary)
-                        if let detail = summary.detail {
-                            Text(detail)
-                                .font(.system(size: 9))
-                                .foregroundStyle(.secondary)
-                                .multilineTextAlignment(.center)
-                        }
-                    }
-                    .frame(maxWidth: .infinity)
-                }
             }
             .padding(.horizontal, 4)
         }
-        .alert("Invalid number", isPresented: $showsInvalidNumber) {
-            Button("OK", role: .cancel) { }
+    }
+
+    private var resultScreen: some View {
+        let summary = coordinator.latestAttempt.map { SystemDialUserSummary.make(from: $0) }
+            ?? SystemDialUserSummary.make(classification: SystemDialClassification.preparing)
+        return VStack(spacing: 5) {
+            Spacer(minLength: 0)
+            if coordinator.isPreparing { ProgressView().controlSize(.small) }
+            Text(summary.title)
+                .font(.headline)
+                .multilineTextAlignment(.center)
+                .lineLimit(2)
+                .minimumScaleFactor(0.75)
+            Text(summary.code)
+                .font(.system(size: 10, weight: .semibold, design: .monospaced))
+                .foregroundStyle(.secondary)
+            if let detail = summary.detail {
+                Text(detail)
+                    .font(.system(size: 9))
+                    .foregroundStyle(.secondary)
+                    .multilineTextAlignment(.center)
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.75)
+            }
+            Spacer(minLength: 0)
+            Button("Новий дзвінок") {
+                number = ""
+                showingResult = false
+            }
+            .font(.caption)
+            Button("Закрити") { dismiss() }
+                .font(.caption2)
         }
+        .padding(.horizontal, 5)
     }
 
     private func append(_ value: Character) {
@@ -103,6 +125,7 @@ struct WatchSystemDialerView: View {
             showsInvalidNumber = true
             return
         }
+        showingResult = true
         Task { await coordinator.prepareAndDial(number: number, url: url) }
     }
 }

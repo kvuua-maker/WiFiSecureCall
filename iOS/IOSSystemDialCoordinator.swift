@@ -84,14 +84,14 @@ final class IOSSystemDialCoordinator: NSObject {
                 classification: SystemDialClassification.iPhoneReady
             )
             attempt.iPhoneSnapshot = snapshot
+            attempt.events.append(.init(timestamp: receivedAt, source: "iPhone", event: "prepare_received", status: "replying", attemptID: attemptID))
             store.upsert(attempt)
         } else {
-            store.update(id: attemptID) {
+            store.updateAndRecord(id: attemptID, source: "iPhone", event: "prepare_received", status: "replying", at: receivedAt) {
                 $0.iPhoneSnapshot = snapshot
                 $0.classification = SystemDialClassification.iPhoneReady
             }
         }
-        store.record(id: attemptID, source: "iPhone", event: "prepare_received", status: "replying", at: receivedAt)
         startObservationIfNeeded(attemptID: attemptID, startedAt: receivedAt)
 
         let repliedAt = Date()
@@ -168,29 +168,26 @@ final class IOSSystemDialCoordinator: NSObject {
             current.relevantCallID = call.uuid
             observation = current
             let now = Date()
-            store.update(id: current.attemptID) {
+            store.updateAndRecord(id: current.attemptID, source: "iPhone", event: "system_call_observed_outgoing", status: "observed", at: now) {
                 if $0.iPhoneObservedOutgoingCallAt == nil { $0.iPhoneObservedOutgoingCallAt = now }
                 $0.classification = SystemDialClassification.systemCallObserved
             }
-            store.record(id: current.attemptID, source: "iPhone", event: "system_call_observed_outgoing", status: "observed", at: now)
         }
         guard current.relevantCallID == call.uuid else { return }
         if call.hasConnected, store.attempt(id: current.attemptID)?.iPhoneObservedConnectedCallAt == nil {
             let now = Date()
-            store.update(id: current.attemptID) {
+            store.updateAndRecord(id: current.attemptID, source: "iPhone", event: "system_call_observed_connected", status: "observed", at: now) {
                 $0.iPhoneObservedConnectedCallAt = now
                 $0.classification = SystemDialClassification.systemCallConnected
             }
-            store.record(id: current.attemptID, source: "iPhone", event: "system_call_observed_connected", status: "observed", at: now)
         }
         if call.hasEnded, store.attempt(id: current.attemptID)?.iPhoneObservedEndedCallAt == nil {
             let now = Date()
-            store.update(id: current.attemptID) {
+            store.updateAndRecord(id: current.attemptID, source: "iPhone", event: "system_call_observed_ended", status: "observed", at: now) {
                 $0.iPhoneObservedEndedCallAt = now
                 $0.finishedAt = now
                 $0.classification = SystemDialClassification.systemCallEnded
             }
-            store.record(id: current.attemptID, source: "iPhone", event: "system_call_observed_ended", status: "observed", at: now)
             finishObservation(classifyMissingEvidence: false)
         }
     }
@@ -201,7 +198,7 @@ final class IOSSystemDialCoordinator: NSObject {
         guard let current = observation else { return }
         observation = nil
         if classifyMissingEvidence {
-            store.update(id: current.attemptID) {
+            store.updateAndRecord(id: current.attemptID, source: "iPhone", event: "observation_window_finished", status: "bounded") {
                 $0.finishedAt = Date()
                 $0.classification = SystemDialClassification.afterHandoff(
                     outgoing: $0.iPhoneObservedOutgoingCallAt,
@@ -210,7 +207,6 @@ final class IOSSystemDialCoordinator: NSObject {
                     resultReceived: true
                 )
             }
-            store.record(id: current.attemptID, source: "iPhone", event: "observation_window_finished", status: "bounded")
         }
         if current.backgroundTask != .invalid {
             UIApplication.shared.endBackgroundTask(current.backgroundTask)

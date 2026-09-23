@@ -78,17 +78,16 @@ final class WatchSystemDialCoordinator: NSObject, ObservableObject {
         if let currentSession, currentSession.activationState == .activated, currentSession.isReachable {
             for index in 1...2 {
                 let result = await ping(session: currentSession, attemptID: attemptID, index: index, network: snapshot)
-                store.update(id: attemptID) { value in
-                    value.pingResults.append(result.result)
-                    if let iPhoneSnapshot = result.snapshot { value.iPhoneSnapshot = iPhoneSnapshot }
-                }
-                store.record(
+                store.updateAndRecord(
                     id: attemptID,
                     source: "watch",
                     event: "prepare_ping",
                     status: result.result.status,
                     detail: "index=\(index) rttMs=\(Int(result.result.rttMilliseconds))"
-                )
+                ) { value in
+                    value.pingResults.append(result.result)
+                    if let iPhoneSnapshot = result.snapshot { value.iPhoneSnapshot = iPhoneSnapshot }
+                }
                 publish(attemptID)
                 if result.snapshot != nil {
                     receivedReply = true
@@ -106,21 +105,20 @@ final class WatchSystemDialCoordinator: NSObject, ObservableObject {
             needsUnlock: needsUnlock,
             replied: receivedReply
         )
-        store.update(id: attemptID) {
+        store.updateAndRecord(id: attemptID, source: "watch", event: "preflight_finished", status: preflightClassification) {
             $0.wcActivationState = state
             $0.classification = preflightClassification
         }
-        store.record(id: attemptID, source: "watch", event: "preflight_finished", status: preflightClassification)
         publish(attemptID)
 
         guard SystemDialPreflightPolicy.shouldRequestTelHandoff(numberIsValid: true, preflightSucceeded: receivedReply) else { return }
         let handoffAt = Date()
-        store.update(id: attemptID) {
+        store.updateAndRecord(id: attemptID, source: "watch", event: "tel_handoff_requested", status: "requested", at: handoffAt) {
             $0.telHandoffRequestedAt = handoffAt
             $0.classification = SystemDialClassification.telHandoffRequested
         }
-        store.record(id: attemptID, source: "watch", event: "tel_handoff_requested", status: "requested", at: handoffAt)
         publish(attemptID)
+        await store.flush()
         WKApplication.shared().openSystemURL(url)
     }
 
@@ -145,11 +143,6 @@ final class WatchSystemDialCoordinator: NSObject, ObservableObject {
         resultRequestedForAttempt = attemptID
         publish(attemptID)
         Task { await fetchResult(attemptID: attemptID) }
-    }
-
-    var recentLines: [String] {
-        guard let latestAttempt else { return [] }
-        return latestAttempt.events.suffix(6).map { "\($0.event): \($0.status)" }
     }
 
     private func ping(session: WCSession, attemptID: UUID, index: Int, network: SystemDialNetworkSnapshot) async -> (result: SystemDialPingResult, snapshot: SystemDialIPhoneSnapshot?) {
@@ -204,12 +197,12 @@ final class WatchSystemDialCoordinator: NSObject, ObservableObject {
 
     private func fetchResult(attemptID: UUID) async {
         guard let session, session.activationState == .activated, session.isReachable else {
-            store.update(id: attemptID) {
+            store.updateAndRecord(id: attemptID, source: "watch", event: "result_fetch", status: "unreachable") {
                 $0.finishedAt = Date()
                 $0.classification = SystemDialClassification.unknownAfterTelHandoff
             }
-            store.record(id: attemptID, source: "watch", event: "result_fetch", status: "unreachable")
             publish(attemptID)
+            await store.flush()
             return
         }
         let nonce = UUID()
@@ -235,15 +228,15 @@ final class WatchSystemDialCoordinator: NSObject, ObservableObject {
         guard case let .success(reply) = response,
               let data = reply["attemptJSON"] as? Data,
               let remote = try? Self.decoder.decode(SystemDialAttempt.self, from: data) else {
-            store.update(id: attemptID) {
+            store.updateAndRecord(id: attemptID, source: "watch", event: "result_fetch", status: "failed") {
                 $0.finishedAt = Date()
                 $0.classification = SystemDialClassification.unknownAfterTelHandoff
             }
-            store.record(id: attemptID, source: "watch", event: "result_fetch", status: "failed")
             publish(attemptID)
+            await store.flush()
             return
         }
-        store.update(id: attemptID) {
+        store.updateAndRecord(id: attemptID, source: "watch", event: "result_fetch", status: "reply") {
             $0.iPhoneSnapshot = remote.iPhoneSnapshot ?? $0.iPhoneSnapshot
             $0.iPhoneObservedOutgoingCallAt = remote.iPhoneObservedOutgoingCallAt
             $0.iPhoneObservedConnectedCallAt = remote.iPhoneObservedConnectedCallAt
@@ -257,8 +250,8 @@ final class WatchSystemDialCoordinator: NSObject, ObservableObject {
             )
             for event in remote.events where event.source == "iPhone" { $0.events.append(event) }
         }
-        store.record(id: attemptID, source: "watch", event: "result_fetch", status: "reply")
         publish(attemptID)
+        await store.flush()
     }
 
     private func applyPushedResult(_ message: [String: Any]) -> Bool {
@@ -279,10 +272,19 @@ final class WatchSystemDialCoordinator: NSObject, ObservableObject {
             )
         }
         publish(attemptID)
+        Task { await store.flush() }
         return true
     }
 
-    private func publish(_ attemptID: UUID) { latestAttempt = store.attempt(id: attemptID) }
+    private func publish(_ attemptID: UUID) {
+        guard let next = store.attempt(id: attemptID) else { return }
+        if let current = latestAttempt,
+           current.attemptID == next.attemptID,
+           SystemDialUserSummary.make(from: current) == SystemDialUserSummary.make(from: next) {
+            return
+        }
+        latestAttempt = next
+    }
 
     private static var decoder: JSONDecoder {
         let decoder = JSONDecoder()

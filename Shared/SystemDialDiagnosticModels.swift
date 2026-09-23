@@ -87,37 +87,37 @@ struct SystemDialUserSummary: Equatable, Sendable {
     static func make(classification: String) -> SystemDialUserSummary {
         switch classification {
         case SystemDialClassification.preparing:
-            return .init(code: "D22-05", title: "Перевіряю iPhone…", detail: nil, severity: .neutral)
+            return .init(code: "D23-05", title: "Перевіряю iPhone…", detail: nil, severity: .neutral)
         case SystemDialClassification.ready, SystemDialClassification.iPhoneReady:
-            return .init(code: "D22-05", title: "iPhone відповідає", detail: nil, severity: .success)
+            return .init(code: "D23-05", title: "iPhone відповідає", detail: nil, severity: .success)
         case SystemDialClassification.watchNetworkUnavailable:
-            return .init(code: "D22-01", title: "На Watch немає мережі", detail: nil, severity: .failure)
+            return .init(code: "D23-01", title: "Немає мережі", detail: nil, severity: .failure)
         case SystemDialClassification.wcNotActivated:
-            return .init(code: "D22-02", title: "Зв’язок з iPhone не активний", detail: nil, severity: .warning)
+            return .init(code: "D23-02", title: "Немає зв’язку з iPhone", detail: nil, severity: .warning)
         case SystemDialClassification.iPhoneNeedsUnlock:
-            return .init(code: "D22-03", title: "Розблокуй iPhone після перезапуску", detail: nil, severity: .warning)
+            return .init(code: "D23-03", title: "Розблокуй iPhone", detail: nil, severity: .warning)
         case SystemDialClassification.iPhoneAppUnreachable:
-            return .init(code: "D22-04", title: "iPhone зараз недоступний", detail: nil, severity: .warning)
+            return .init(code: "D23-04", title: "iPhone недоступний", detail: nil, severity: .warning)
         case SystemDialClassification.telHandoffRequested:
-            return .init(code: "D22-06", title: "Дзвінок передано системі", detail: nil, severity: .neutral)
+            return .init(code: "D23-06", title: "Передано в Телефон", detail: nil, severity: .neutral)
         case SystemDialClassification.systemCallObserved:
-            return .init(code: "D22-07", title: "iPhone почав системний дзвінок", detail: nil, severity: .success)
+            return .init(code: "D23-07", title: "Дзвінок почався", detail: nil, severity: .success)
         case SystemDialClassification.systemCallConnected:
-            return .init(code: "D22-08", title: "Дзвінок з’єднано", detail: nil, severity: .success)
+            return .init(code: "D23-08", title: "З’єднано", detail: nil, severity: .success)
         case SystemDialClassification.systemCallEnded:
-            return .init(code: "D22-09", title: "Дзвінок завершено", detail: nil, severity: .success)
+            return .init(code: "D23-09", title: "Дзвінок завершено", detail: nil, severity: .success)
         case SystemDialClassification.noSystemCallEvidence:
             return .init(
-                code: "D22-10",
+                code: "D23-10",
                 title: "Система не підтвердила дзвінок",
-                detail: "Точна внутрішня причина системи недоступна",
+                detail: "Деталі є на iPhone",
                 severity: .warning
             )
         default:
             return .init(
-                code: "D22-10",
-                title: "Збій після передачі в Телефон",
-                detail: "Точна внутрішня причина системи недоступна",
+                code: "D23-10",
+                title: "Збій після передачі",
+                detail: "Деталі є на iPhone",
                 severity: .warning
             )
         }
@@ -292,6 +292,31 @@ final class SystemDialNetworkMonitor: @unchecked Sendable {
     }
 }
 
+actor SystemDialPersistenceWorker {
+    typealias Writer = @Sendable (Data, URL) throws -> Void
+
+    private let writer: Writer
+    private(set) var persistedRevision: UInt64 = 0
+
+    init(writer: @escaping Writer = { data, url in
+        try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try data.write(to: url, options: .atomic)
+    }) {
+        self.writer = writer
+    }
+
+    @discardableResult
+    func persist(snapshot: [SystemDialAttempt], revision: UInt64, fileURL: URL) throws -> UInt64 {
+        guard revision > persistedRevision else { return persistedRevision }
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        let data = try encoder.encode(snapshot)
+        try writer(data, fileURL)
+        persistedRevision = revision
+        return revision
+    }
+}
+
 @MainActor
 final class SystemDialDiagnosticStore: ObservableObject {
     static let shared = SystemDialDiagnosticStore()
@@ -300,12 +325,15 @@ final class SystemDialDiagnosticStore: ObservableObject {
     private static let logger = Logger(subsystem: "com.vkapps.wifisecurecall", category: "systemDial")
 
     @Published private(set) var attempts: [SystemDialAttempt]
+    private(set) var revision: UInt64 = 0
     private let fileURL: URL
+    private let persistenceWorker: SystemDialPersistenceWorker
 
-    init(fileURL: URL? = nil) {
+    init(fileURL: URL? = nil, persistenceWorker: SystemDialPersistenceWorker = SystemDialPersistenceWorker()) {
         self.fileURL = fileURL ?? Self.defaultFileURL()
+        self.persistenceWorker = persistenceWorker
         attempts = Self.load(from: self.fileURL)
-        normalizeAndPersistIfNeeded()
+        if normalizeIfNeeded() { commit() }
     }
 
     func attempt(id: UUID) -> SystemDialAttempt? { attempts.first { $0.attemptID == id } }
@@ -317,32 +345,64 @@ final class SystemDialDiagnosticStore: ObservableObject {
         }
         attempts.removeAll { $0.attemptID == value.attemptID }
         attempts.insert(value, at: 0)
-        trimAndPersist()
+        trim()
+        commit()
     }
 
-    func update(id: UUID, _ change: (inout SystemDialAttempt) -> Void) {
-        guard let index = attempts.firstIndex(where: { $0.attemptID == id }) else { return }
-        change(&attempts[index])
-        if attempts[index].events.count > Self.maximumEventsPerAttempt {
-            attempts[index].events.removeFirst(attempts[index].events.count - Self.maximumEventsPerAttempt)
+    @discardableResult
+    func update(id: UUID, _ change: (inout SystemDialAttempt) -> Void) -> Bool {
+        guard let index = attempts.firstIndex(where: { $0.attemptID == id }) else { return false }
+        var value = attempts[index]
+        change(&value)
+        if value.events.count > Self.maximumEventsPerAttempt {
+            value.events.removeFirst(value.events.count - Self.maximumEventsPerAttempt)
         }
-        let value = attempts.remove(at: index)
+        guard value != attempts[index] else { return false }
+        attempts.remove(at: index)
         attempts.insert(value, at: 0)
-        trimAndPersist()
+        trim()
+        commit()
+        return true
     }
 
     func record(id: UUID, source: String, event: String, status: String, detail: String? = nil, at timestamp: Date = Date()) {
+        updateAndRecord(id: id, source: source, event: event, status: status, detail: detail, at: timestamp) { _ in }
+    }
+
+    @discardableResult
+    func updateAndRecord(
+        id: UUID,
+        source: String,
+        event: String,
+        status: String,
+        detail: String? = nil,
+        at timestamp: Date = Date(),
+        _ change: (inout SystemDialAttempt) -> Void
+    ) -> Bool {
         let item = SystemDialEvent(timestamp: timestamp, source: source, event: event, status: status, detail: detail, attemptID: id)
-        update(id: id) { $0.events.append(item) }
+        let changed = update(id: id) {
+            change(&$0)
+            $0.events.append(item)
+        }
         Self.logger.info("attempt=\(id.uuidString, privacy: .public) event=\(event, privacy: .public) status=\(status, privacy: .public)")
+        return changed
     }
 
-    private func trimAndPersist() {
+    func flush() async {
+        let snapshot = attempts
+        let targetRevision = revision
+        do {
+            _ = try await persistenceWorker.persist(snapshot: snapshot, revision: targetRevision, fileURL: fileURL)
+        } catch {
+            Self.logger.error("diagnostic_store_write_failed")
+        }
+    }
+
+    private func trim() {
         if attempts.count > Self.maximumAttempts { attempts.removeLast(attempts.count - Self.maximumAttempts) }
-        persist()
     }
 
-    private func normalizeAndPersistIfNeeded() {
+    private func normalizeIfNeeded() -> Bool {
         var changed = false
         for index in attempts.indices where attempts[index].events.count > Self.maximumEventsPerAttempt {
             attempts[index].events.removeFirst(attempts[index].events.count - Self.maximumEventsPerAttempt)
@@ -352,18 +412,21 @@ final class SystemDialDiagnosticStore: ObservableObject {
             attempts.removeLast(attempts.count - Self.maximumAttempts)
             changed = true
         }
-        if changed { persist() }
+        return changed
     }
 
-    private func persist() {
-        do {
-            try FileManager.default.createDirectory(at: fileURL.deletingLastPathComponent(), withIntermediateDirectories: true)
-            let encoder = JSONEncoder()
-            encoder.dateEncodingStrategy = .iso8601
-            let data = try encoder.encode(attempts)
-            try data.write(to: fileURL, options: .atomic)
-        } catch {
-            Self.logger.error("diagnostic_store_write_failed")
+    private func commit() {
+        revision &+= 1
+        let snapshot = attempts
+        let committedRevision = revision
+        let worker = persistenceWorker
+        let destination = fileURL
+        Task {
+            do {
+                _ = try await worker.persist(snapshot: snapshot, revision: committedRevision, fileURL: destination)
+            } catch {
+                Self.logger.error("diagnostic_store_write_failed")
+            }
         }
     }
 

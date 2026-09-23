@@ -44,10 +44,11 @@ final class SystemDialDiagnosticTests: XCTestCase {
         XCTAssertEqual(store.attempt(id: id)?.events.first?.event, "event_5")
     }
 
-    func testDiagnosticPersistenceContainsNoRawPhoneNumber() throws {
+    func testDiagnosticPersistenceContainsNoRawPhoneNumber() async throws {
         let url = temporaryStoreURL()
         let store = SystemDialDiagnosticStore(fileURL: url)
         store.upsert(.make(numberDigitCount: 12))
+        await store.flush()
         let persisted = String(decoding: try Data(contentsOf: url), as: UTF8.self)
         XCTAssertFalse(persisted.contains("+380501234567"))
         XCTAssertFalse(persisted.contains("phoneNumber"))
@@ -137,21 +138,21 @@ final class SystemDialDiagnosticTests: XCTestCase {
         XCTAssertFalse(SystemDialPreflightPolicy.shouldRequestTelHandoff(numberIsValid: false, preflightSucceeded: false))
     }
 
-    func testEveryKnownClassificationMapsToD22CodeAndUkrainianTitle() {
+    func testEveryKnownClassificationMapsToD23CodeAndCompactUkrainianTitle() {
         let expected = [
-            SystemDialClassification.preparing: "D22-05",
-            SystemDialClassification.ready: "D22-05",
-            SystemDialClassification.watchNetworkUnavailable: "D22-01",
-            SystemDialClassification.wcNotActivated: "D22-02",
-            SystemDialClassification.iPhoneNeedsUnlock: "D22-03",
-            SystemDialClassification.iPhoneAppUnreachable: "D22-04",
-            SystemDialClassification.iPhoneReady: "D22-05",
-            SystemDialClassification.telHandoffRequested: "D22-06",
-            SystemDialClassification.systemCallObserved: "D22-07",
-            SystemDialClassification.systemCallConnected: "D22-08",
-            SystemDialClassification.systemCallEnded: "D22-09",
-            SystemDialClassification.noSystemCallEvidence: "D22-10",
-            SystemDialClassification.unknownAfterTelHandoff: "D22-10"
+            SystemDialClassification.preparing: "D23-05",
+            SystemDialClassification.ready: "D23-05",
+            SystemDialClassification.watchNetworkUnavailable: "D23-01",
+            SystemDialClassification.wcNotActivated: "D23-02",
+            SystemDialClassification.iPhoneNeedsUnlock: "D23-03",
+            SystemDialClassification.iPhoneAppUnreachable: "D23-04",
+            SystemDialClassification.iPhoneReady: "D23-05",
+            SystemDialClassification.telHandoffRequested: "D23-06",
+            SystemDialClassification.systemCallObserved: "D23-07",
+            SystemDialClassification.systemCallConnected: "D23-08",
+            SystemDialClassification.systemCallEnded: "D23-09",
+            SystemDialClassification.noSystemCallEvidence: "D23-10",
+            SystemDialClassification.unknownAfterTelHandoff: "D23-10"
         ]
         XCTAssertEqual(Set(expected.keys), Set(SystemDialClassification.knownValues))
         for classification in SystemDialClassification.knownValues {
@@ -159,11 +160,86 @@ final class SystemDialDiagnosticTests: XCTestCase {
             XCTAssertEqual(summary.code, expected[classification])
             XCTAssertFalse(summary.title.isEmpty)
             XCTAssertNotEqual(summary.title, classification)
+            XCTAssertLessThanOrEqual(summary.title.count, 34)
         }
     }
 
-    func testUnknownClassificationMapsToD22Ten() {
-        XCTAssertEqual(SystemDialUserSummary.make(classification: "FUTURE_UNKNOWN").code, "D22-10")
+    func testUnknownClassificationMapsToD23Ten() {
+        XCTAssertEqual(SystemDialUserSummary.make(classification: "FUTURE_UNKNOWN").code, "D23-10")
+    }
+
+    func testWatchResultSummaryDoesNotRequireRawDiagnosticLines() {
+        var attempt = SystemDialAttempt.make(numberDigitCount: 10, classification: SystemDialClassification.systemCallConnected)
+        attempt.events = [.init(source: "watch", event: "raw_private_event", status: "raw_status", attemptID: attempt.attemptID)]
+        let summary = SystemDialUserSummary.make(from: attempt)
+        XCTAssertEqual(summary.title, "З’єднано")
+        XCTAssertFalse(summary.title.contains("raw_private_event"))
+        XCTAssertFalse(summary.code.contains("raw_status"))
+    }
+
+    func testPersistenceRevisionsAreMonotonicAndNoOpDoesNotAdvance() {
+        let store = makeStore()
+        let id = UUID()
+        XCTAssertEqual(store.revision, 0)
+        store.upsert(.make(attemptID: id, numberDigitCount: 10))
+        XCTAssertEqual(store.revision, 1)
+        store.update(id: id) { $0.classification = SystemDialClassification.iPhoneReady }
+        XCTAssertEqual(store.revision, 2)
+        store.update(id: id) { $0.classification = SystemDialClassification.iPhoneReady }
+        XCTAssertEqual(store.revision, 2)
+    }
+
+    func testStalePersistenceRevisionCannotOverwriteNewer() async throws {
+        let url = temporaryStoreURL()
+        let worker = SystemDialPersistenceWorker()
+        let newer = SystemDialAttempt.make(numberDigitCount: 10, classification: SystemDialClassification.systemCallConnected)
+        let older = SystemDialAttempt.make(numberDigitCount: 10, classification: SystemDialClassification.preparing)
+        try await worker.persist(snapshot: [newer], revision: 2, fileURL: url)
+        try await worker.persist(snapshot: [older], revision: 1, fileURL: url)
+        let persisted = try decodeAttempts(at: url)
+        XCTAssertEqual(persisted.first?.classification, SystemDialClassification.systemCallConnected)
+        let persistedRevision = await worker.persistedRevision
+        XCTAssertEqual(persistedRevision, 2)
+    }
+
+    func testRapidUpdatesAndFlushPersistNewestState() async throws {
+        let url = temporaryStoreURL()
+        let store = SystemDialDiagnosticStore(fileURL: url)
+        let id = UUID()
+        store.upsert(.make(attemptID: id, numberDigitCount: 10))
+        for index in 0..<20 {
+            store.updateAndRecord(id: id, source: "watch", event: "rapid_\(index)", status: "ok") {
+                $0.finishedAt = Date(timeIntervalSince1970: Double(index))
+            }
+        }
+        await store.flush()
+        let persisted = try decodeAttempts(at: url).first
+        XCTAssertEqual(persisted?.finishedAt, Date(timeIntervalSince1970: 19))
+        XCTAssertEqual(persisted?.events.last?.event, "rapid_19")
+    }
+
+    func testFlushWaitsForRequestedRevision() async throws {
+        let url = temporaryStoreURL()
+        let store = SystemDialDiagnosticStore(fileURL: url)
+        let id = UUID()
+        store.upsert(.make(attemptID: id, numberDigitCount: 10, classification: SystemDialClassification.telHandoffRequested))
+        let requestedRevision = store.revision
+        await store.flush()
+        XCTAssertEqual(try decodeAttempts(at: url).first?.classification, SystemDialClassification.telHandoffRequested)
+        XCTAssertEqual(requestedRevision, store.revision)
+    }
+
+    func testRapidUpdateFlushThenNewerUpdatePersistsNewest() async throws {
+        let url = temporaryStoreURL()
+        let store = SystemDialDiagnosticStore(fileURL: url)
+        let id = UUID()
+        store.upsert(.make(attemptID: id, numberDigitCount: 10))
+        store.update(id: id) { $0.classification = SystemDialClassification.iPhoneReady }
+        let flushing = Task { await store.flush() }
+        store.update(id: id) { $0.classification = SystemDialClassification.systemCallConnected }
+        await flushing.value
+        await store.flush()
+        XCTAssertEqual(try decodeAttempts(at: url).first?.classification, SystemDialClassification.systemCallConnected)
     }
 
     func testDuplicateResignLifecycleRecordedOnce() {
@@ -227,6 +303,11 @@ final class SystemDialDiagnosticTests: XCTestCase {
 
     private func makeStore() -> SystemDialDiagnosticStore { SystemDialDiagnosticStore(fileURL: temporaryStoreURL()) }
     private func temporaryStoreURL() -> URL { FileManager.default.temporaryDirectory.appendingPathComponent("system-dial-\(UUID().uuidString).json") }
+    private func decodeAttempts(at url: URL) throws -> [SystemDialAttempt] {
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        return try decoder.decode([SystemDialAttempt].self, from: Data(contentsOf: url))
+    }
     private func handedOffAttempt() -> SystemDialAttempt {
         var attempt = SystemDialAttempt.make(numberDigitCount: 10)
         attempt.telHandoffRequestedAt = Date()
