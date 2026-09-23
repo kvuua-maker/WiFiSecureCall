@@ -1612,10 +1612,14 @@ final class AccountCallFoundationTests: XCTestCase {
                     AccountDeviceSummary(deviceID: UUID(), platform: "iOS", callReady: true, lastSeenAt: Date())
                 ])
             }
-            let body = try JSONDecoder.account.decode(AccountCallCreateRequest.self, from: try XCTUnwrap(request.httpBody))
-            XCTAssertEqual(body.targetDeviceID, targetID)
-            callIDBox.set(body.callID)
-            return (200, self.accountCallResponse(callID: body.callID, side: .caller, state: .ringing))
+            if request.url!.path.hasSuffix("/calls") {
+                let body = try JSONDecoder.account.decode(AccountCallCreateRequest.self, from: try XCTUnwrap(request.httpBody))
+                XCTAssertEqual(body.targetDeviceID, targetID)
+                callIDBox.set(body.callID)
+                return (200, self.accountCallResponse(callID: body.callID, side: .caller, state: .ringing))
+            }
+            let callID = try XCTUnwrap(callIDBox.value)
+            return (200, self.accountCallResponse(callID: callID, side: .caller, state: request.url!.path.hasSuffix("/cancel") ? .cancelled : .ringing))
         }
         let runtime = NotificationRuntime(config: accountCallConfig(), accountStore: store, accountAPI: AccountAPIClient(config: accountCallConfig(), tokenStore: secrets, session: session), audio: AudioEngineMock(), media: MediaTransportMock())
         let adapter = RetainedCallKitMock()
@@ -1625,13 +1629,20 @@ final class AccountCallFoundationTests: XCTestCase {
         try await adapter.approveStart(localID)
         for _ in 0..<100 where callIDBox.value == nil { try? await Task.sleep(nanoseconds: 10_000_000) }
         XCTAssertNotNil(callIDBox.value)
+        _ = try await adapter.approveEnd(localID)
+        for _ in 0..<100 where !runtime.callSession.state.isTerminal { try? await Task.sleep(nanoseconds: 10_000_000) }
+        XCTAssertTrue(runtime.callSession.state.isTerminal)
     }
 
     func testIncomingV2MissingAccountIgnoredAndSignedInAccountUsesSameProvider() async throws {
         let accountID = UUID(), callID = UUID(), secrets = InMemorySecureTokenStore()
         let defaults = try XCTUnwrap(UserDefaults(suiteName: "IncomingAccountCall.\(UUID())"))
         let store = AccountSessionStore(tokenStore: secrets, defaults: defaults)
-        let session = accountCallTestSession { _ in (200, self.accountCallResponse(callID: callID, side: .callee, state: .ringing)) }
+        let requestCount = LockedCounter()
+        let session = accountCallTestSession { request in
+            requestCount.increment()
+            return (200, self.accountCallResponse(callID: callID, side: .callee, state: request.url!.path.hasSuffix("/reject") ? .rejected : .ringing))
+        }
         let runtime = NotificationRuntime(config: accountCallConfig(), accountStore: store, accountAPI: AccountAPIClient(config: accountCallConfig(), tokenStore: secrets, session: session), audio: AudioEngineMock(), media: MediaTransportMock())
         let adapter = RetainedCallKitMock()
         runtime.configureCallKitFactory { adapter }
@@ -1642,6 +1653,39 @@ final class AccountCallFoundationTests: XCTestCase {
         XCTAssertEqual(adapter.incomingIDs.count, 1)
         XCTAssertEqual(runtime.callKitCreationCount, 1)
         XCTAssertEqual(runtime.callSession.state.callID, callID)
+        for _ in 0..<100 where requestCount.value == 0 { try? await Task.sleep(nanoseconds: 10_000_000) }
+        _ = try await adapter.approveEnd(try XCTUnwrap(adapter.incomingIDs.first))
+        for _ in 0..<100 where !runtime.callSession.state.isTerminal { try? await Task.sleep(nanoseconds: 10_000_000) }
+        XCTAssertTrue(runtime.callSession.state.isTerminal)
+    }
+
+    func testWatchBackgroundV2IncomingUsesSameCallSessionAndProvider() async throws {
+        let accountID = UUID(), callID = UUID(), secrets = InMemorySecureTokenStore()
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: "BackgroundAccountCall.\(UUID())"))
+        let store = AccountSessionStore(tokenStore: secrets, defaults: defaults)
+        try store.add(accountSession(accountID: accountID))
+        let requestCount = LockedCounter()
+        let session = accountCallTestSession { request in
+            requestCount.increment()
+            return (200, self.accountCallResponse(callID: callID, side: .callee, state: request.url!.path.hasSuffix("/reject") ? .rejected : .ringing))
+        }
+        let runtime = NotificationRuntime(config: accountCallConfig(), accountStore: store, accountAPI: AccountAPIClient(config: accountCallConfig(), tokenStore: secrets, session: session), audio: AudioEngineMock(), media: MediaTransportMock())
+        let adapter = RetainedCallKitMock()
+        runtime.configureCallKitFactory { adapter }
+
+        let firstHandled = await runtime.handleIncomingBackgroundNotification(callID: callID, accountID: accountID)
+        XCTAssertTrue(firstHandled)
+        XCTAssertEqual(adapter.incomingIDs.count, 1)
+        XCTAssertEqual(runtime.callKitCreationCount, 1)
+        XCTAssertEqual(runtime.callSession.state.callID, callID)
+        let duplicateHandled = await runtime.handleIncomingBackgroundNotification(callID: callID, accountID: accountID)
+        XCTAssertTrue(duplicateHandled)
+        XCTAssertEqual(adapter.incomingIDs.count, 1)
+        XCTAssertEqual(runtime.callKitCreationCount, 1)
+        for _ in 0..<100 where requestCount.value == 0 { try? await Task.sleep(nanoseconds: 10_000_000) }
+        _ = try await adapter.approveEnd(try XCTUnwrap(adapter.incomingIDs.first))
+        for _ in 0..<100 where !runtime.callSession.state.isTerminal { try? await Task.sleep(nanoseconds: 10_000_000) }
+        XCTAssertTrue(runtime.callSession.state.isTerminal)
     }
 
     private func accountCallConfig() -> AppConfig {
