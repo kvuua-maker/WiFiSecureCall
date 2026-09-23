@@ -13,6 +13,7 @@ enum CallFailure: String, Codable, Error, Equatable, Sendable {
     case networkLost
     case invalidServerState
     case notificationUnavailable
+    case accountSessionInvalid
     case targetUnavailable
     case targetAmbiguous
 }

@@ -17,8 +17,14 @@ struct WatchAccountLinkView: View {
         ScrollView {
             VStack(spacing: 8) {
                 if let active = store.activeAccount {
-                    Text(active.phoneNumber)
-                    Button("Sign out", role: .destructive) { Task { await signOut(active.accountID) } }
+                    if needsRelinking(active.accountID) {
+                        Text("Account needs relinking")
+                        Button("Relink account") { relink(active.accountID) }
+                        if !message.isEmpty { Text(message).font(.caption) }
+                    } else {
+                        Text(active.phoneNumber)
+                        Button("Sign out", role: .destructive) { Task { await signOut(active.accountID) } }
+                    }
                 } else {
                     Text(code.isEmpty ? "Link account" : code).font(code.isEmpty ? .headline : .title2.monospacedDigit())
                     if code.isEmpty { Button("Create code") { begin() } }
@@ -27,6 +33,22 @@ struct WatchAccountLinkView: View {
             }
         }
         .onDisappear { polling?.cancel(); polling = nil }
+    }
+
+    private func needsRelinking(_ accountID: UUID) -> Bool {
+        (try? store.tokenStore.tokens(for: accountID)) == nil
+    }
+
+    private func relink(_ accountID: UUID) {
+        do {
+            guard try store.removeOrphanedLocalAccount(accountID: accountID) else {
+                message = "Account session restored"
+                return
+            }
+            begin()
+        } catch {
+            message = "Unable to relink"
+        }
     }
 
     private func begin() {

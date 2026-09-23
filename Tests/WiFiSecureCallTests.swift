@@ -1216,6 +1216,7 @@ private final class RequestCapture: @unchecked Sendable {
     private var _events: [String] = []
     private var _createdCallID: UUID?
     private var _callKitDiagnostic: [String: Any]?
+    private var _diagnosticEvents: [String] = []
     var mutationState: ServerCallState = .ended
     var getState: ServerCallState = .ringing
     var getError: Error?
@@ -1230,6 +1231,7 @@ private final class RequestCapture: @unchecked Sendable {
     }
     var createdCallID: UUID? { lock.withLock { _createdCallID } }
     var callKitDiagnostic: [String: Any]? { lock.withLock { _callKitDiagnostic } }
+    var diagnosticEvents: [String] { lock.withLock { _diagnosticEvents } }
 
     func handle(_ request: URLRequest) throws -> (HTTPURLResponse, Data) {
         onRequest?(request)
@@ -1238,6 +1240,7 @@ private final class RequestCapture: @unchecked Sendable {
         let requestBody = bodyData(from: request)
         if path.hasSuffix("/devices/diagnostics"), let body = requestBody,
            let value = try JSONSerialization.jsonObject(with: body) as? [String: Any] {
+            if let event = value["event"] as? String { lock.withLock { _diagnosticEvents.append(event) } }
             if value["event"] as? String == "callkit_error" {
                 lock.withLock { _callKitDiagnostic = value }
             }
@@ -1403,6 +1406,155 @@ final class AccountFoundationTests: XCTestCase {
         let client = AccountAPIClient(config: accountConfig(), tokenStore: secrets, session: session)
         do { _ = try await client.me(accountID: accountID); XCTFail("500 refresh succeeded") } catch { }
         XCTAssertNotNil(try secrets.tokens(for: accountID))
+    }
+
+    func testCrossClientRefreshUsesOneProcessWideRequest() async throws {
+        let accountID = UUID(), deviceID = UUID(), secrets = InMemorySecureTokenStore()
+        try secrets.save(AccountTokens(accessToken: "expired", accessExpiresAt: .distantPast, refreshToken: "R0", refreshExpiresAt: .distantFuture), for: accountID)
+        let refreshCount = LockedCounter()
+        let session = accountTestSession { request in
+            if request.url!.path.hasSuffix("/auth/refresh") {
+                let body = try JSONDecoder.account.decode(AccountRefreshRequest.self, from: try XCTUnwrap(request.httpBody))
+                XCTAssertEqual(body.refreshToken, "R0")
+                XCTAssertEqual(body.deviceID, deviceID)
+                refreshCount.increment()
+                Thread.sleep(forTimeInterval: 0.05)
+                if refreshCount.value > 1 { return (401, AccountAPIErrorResponse(error: "stale refresh", retryAt: nil)) }
+                return (200, self.accountResponse(accountID: accountID, phone: "+380501234567", access: "A1", refresh: "R1"))
+            }
+            XCTAssertEqual(request.value(forHTTPHeaderField: "Authorization"), "Bearer A1")
+            return (200, AccountMeResponse(accountID: accountID, phoneNumber: "+380501234567", deviceID: deviceID, platform: "iOS"))
+        }
+        let first = AccountAPIClient(config: accountConfig(), tokenStore: secrets, session: session, deviceID: deviceID)
+        let second = AccountAPIClient(config: accountConfig(), tokenStore: secrets, session: session, deviceID: deviceID)
+
+        async let one = first.me(accountID: accountID)
+        async let two = second.me(accountID: accountID)
+        _ = try await (one, two)
+
+        XCTAssertEqual(refreshCount.value, 1)
+        XCTAssertEqual(try secrets.tokens(for: accountID)?.accessToken, "A1")
+        XCTAssertEqual(try secrets.tokens(for: accountID)?.refreshToken, "R1")
+    }
+
+    func testConditionalRefreshDeletionCannotDeleteNewerTokens() throws {
+        let accountID = UUID(), secrets = InMemorySecureTokenStore()
+        try secrets.save(AccountTokens(accessToken: "A0", accessExpiresAt: .distantPast, refreshToken: "R0", refreshExpiresAt: .distantFuture), for: accountID)
+        try secrets.save(AccountTokens(accessToken: "A1", accessExpiresAt: .distantFuture, refreshToken: "R1", refreshExpiresAt: .distantFuture), for: accountID)
+
+        XCTAssertFalse(try secrets.deleteIfRefreshTokenMatches(accountID: accountID, refreshToken: "R0"))
+        XCTAssertEqual(try secrets.tokens(for: accountID)?.refreshToken, "R1")
+        XCTAssertTrue(try secrets.deleteIfRefreshTokenMatches(accountID: accountID, refreshToken: "R1"))
+        XCTAssertNil(try secrets.tokens(for: accountID))
+    }
+
+    func testDifferentAccountsRefreshIndependently() async throws {
+        let firstID = UUID(), secondID = UUID(), deviceID = UUID()
+        let gate = RefreshConcurrencyGate()
+        let firstTokens = AccountTokens(accessToken: "A-first", accessExpiresAt: .distantFuture, refreshToken: "R1-first", refreshExpiresAt: .distantFuture)
+        let secondTokens = AccountTokens(accessToken: "A-second", accessExpiresAt: .distantFuture, refreshToken: "R1-second", refreshExpiresAt: .distantFuture)
+
+        async let one = AccountRefreshCoordinator.shared.refresh(
+            key: .init(accountID: firstID, deviceID: deviceID)
+        ) { await gate.arrive(firstID); return firstTokens }
+        async let two = AccountRefreshCoordinator.shared.refresh(
+            key: .init(accountID: secondID, deviceID: deviceID)
+        ) { await gate.arrive(secondID); return secondTokens }
+        let results = try await (one, two)
+        let arrivalCount = await gate.arrivalCount
+
+        XCTAssertEqual(results.0, firstTokens)
+        XCTAssertEqual(results.1, secondTokens)
+        XCTAssertEqual(arrivalCount, 2)
+    }
+
+    func testTransientRefreshFailurePreservesAttemptedToken() async throws {
+        let accountID = UUID(), secrets = InMemorySecureTokenStore()
+        try secrets.save(AccountTokens(accessToken: "expired", accessExpiresAt: .distantPast, refreshToken: "transient-refresh", refreshExpiresAt: .distantFuture), for: accountID)
+        let session = accountTestSession { _ in throw URLError(.notConnectedToInternet) }
+        let client = AccountAPIClient(config: accountConfig(), tokenStore: secrets, session: session)
+
+        do { _ = try await client.me(accountID: accountID); XCTFail("transient refresh succeeded") } catch { }
+
+        XCTAssertEqual(try secrets.tokens(for: accountID)?.refreshToken, "transient-refresh")
+    }
+
+    func testDefinitiveRefreshRejectionDeletesOnlyCurrentAttemptedToken() async throws {
+        let rejectedID = UUID(), otherID = UUID(), secrets = InMemorySecureTokenStore()
+        try secrets.save(AccountTokens(accessToken: "expired", accessExpiresAt: .distantPast, refreshToken: "rejected-current", refreshExpiresAt: .distantFuture), for: rejectedID)
+        try secrets.save(AccountTokens(accessToken: "other", accessExpiresAt: .distantFuture, refreshToken: "other-refresh", refreshExpiresAt: .distantFuture), for: otherID)
+        let session = accountTestSession { request in
+            XCTAssertTrue(request.url!.path.hasSuffix("/auth/refresh"))
+            return (401, AccountAPIErrorResponse(error: "unauthorized", retryAt: nil))
+        }
+        let client = AccountAPIClient(config: accountConfig(), tokenStore: secrets, session: session)
+
+        do { _ = try await client.me(accountID: rejectedID); XCTFail("invalid refresh succeeded") } catch { }
+
+        XCTAssertNil(try secrets.tokens(for: rejectedID))
+        XCTAssertEqual(try secrets.tokens(for: otherID)?.refreshToken, "other-refresh")
+    }
+
+    func testPreferredCallWithMissingTokensReportsAccountSessionInvalid() async throws {
+        let accountID = UUID(), secrets = InMemorySecureTokenStore()
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: "MissingPreferredSession.\(UUID())"))
+        let store = AccountSessionStore(tokenStore: secrets, defaults: defaults)
+        try store.add(accountResponse(accountID: accountID, phone: "+380501234567"))
+        try secrets.delete(accountID: accountID)
+        let requests = LockedCounter()
+        let accountSession = accountTestSession { _ in requests.increment(); return (500, AccountAPIErrorResponse(error: "unexpected", retryAt: nil)) }
+        let runtime = NotificationRuntime(config: accountConfig(), accountStore: store, accountAPI: AccountAPIClient(config: accountConfig(), tokenStore: secrets, session: accountSession), audio: AudioEngineMock(), media: MediaTransportMock())
+        let adapter = RetainedCallKitMock(); runtime.configureCallKitFactory { adapter }
+
+        await runtime.startPreferredCall(targetPlatform: "watchOS")
+
+        switch runtime.callSession.state {
+        case .failed(_, let failure): XCTAssertEqual(failure, .accountSessionInvalid)
+        default: XCTFail("unexpected state \(runtime.callSession.state)")
+        }
+        XCTAssertEqual(requests.value, 0)
+        XCTAssertTrue(adapter.startedIDs.isEmpty)
+    }
+
+    func testIncomingKnownAccountWithoutTokensFailsClosedAndRecordsDiagnostic() async throws {
+        let accountID = UUID(), callID = UUID(), secrets = InMemorySecureTokenStore()
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: "MissingIncomingSession.\(UUID())"))
+        let store = AccountSessionStore(tokenStore: secrets, defaults: defaults)
+        try store.add(accountResponse(accountID: accountID, phone: "+380501234567"))
+        try secrets.delete(accountID: accountID)
+        let capture = RequestCapture()
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [CallSessionURLProtocol.self]
+        CallSessionURLProtocol.capture = capture
+        let api = APIClient(config: accountConfig(), session: URLSession(configuration: configuration))
+        let accountRequests = LockedCounter()
+        let accountSession = accountTestSession { _ in accountRequests.increment(); return (500, AccountAPIErrorResponse(error: "unexpected", retryAt: nil)) }
+        let runtime = NotificationRuntime(config: accountConfig(), api: api, accountStore: store, accountAPI: AccountAPIClient(config: accountConfig(), tokenStore: secrets, session: accountSession), audio: AudioEngineMock(), media: MediaTransportMock())
+        let adapter = RetainedCallKitMock(); runtime.configureCallKitFactory { adapter }
+
+        await runtime.handleIncomingVoIP(callID: callID, accountID: accountID)
+        for _ in 0..<100 where !capture.diagnosticEvents.contains("account_session_invalid") { try? await Task.sleep(nanoseconds: 10_000_000) }
+
+        XCTAssertTrue(adapter.incomingIDs.isEmpty)
+        XCTAssertEqual(accountRequests.value, 0)
+        XCTAssertTrue(capture.diagnosticEvents.contains("account_session_invalid"))
+    }
+
+    func testOrphanedWatchAccountCanRelinkSameAccountWithoutSMS() throws {
+        let accountID = UUID(), secrets = InMemorySecureTokenStore()
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: "WatchRelinkRecovery.\(UUID())"))
+        let store = AccountSessionStore(tokenStore: secrets, defaults: defaults)
+        try store.add(accountResponse(accountID: accountID, phone: "+380••••4567", access: "old-access", refresh: "old-refresh"))
+        try secrets.delete(accountID: accountID)
+
+        XCTAssertTrue(try store.removeOrphanedLocalAccount(accountID: accountID))
+        XCTAssertFalse(store.accounts.contains(where: { $0.accountID == accountID }))
+        let replacement = AccountTokens(accessToken: "new-access", accessExpiresAt: .distantFuture, refreshToken: "new-refresh", refreshExpiresAt: .distantFuture)
+        try store.addLinkedAccount(accountID: accountID, phoneNumber: "+380••••4567", tokens: replacement)
+
+        XCTAssertEqual(store.activeAccountID, accountID)
+        XCTAssertEqual(store.activeAccount?.accountID, accountID)
+        XCTAssertEqual(try secrets.tokens(for: accountID), replacement)
     }
 
     func testAccountPushCoordinatorRegistersEveryAccountAndInvalidatesIndependently() async throws {
@@ -1987,6 +2139,35 @@ private final class InMemorySecureTokenStore: SecureTokenStore, @unchecked Senda
     func tokens(for accountID: UUID) throws -> AccountTokens? { lock.withLock { values[accountID] } }
     func save(_ tokens: AccountTokens, for accountID: UUID) throws { lock.withLock { values[accountID] = tokens } }
     func delete(accountID: UUID) throws { lock.withLock { values[accountID] = nil } }
+    @discardableResult
+    func deleteIfRefreshTokenMatches(accountID: UUID, refreshToken: String) throws -> Bool {
+        lock.withLock {
+            guard values[accountID]?.refreshToken == refreshToken else { return false }
+            values[accountID] = nil
+            return true
+        }
+    }
+}
+
+private actor RefreshConcurrencyGate {
+    private var arrivals: Set<UUID> = []
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+
+    var arrivalCount: Int { arrivals.count }
+
+    func arrive(_ id: UUID) async {
+        arrivals.insert(id)
+        if arrivals.count >= 2 {
+            let pending = waiters
+            waiters.removeAll()
+            pending.forEach { $0.resume() }
+            return
+        }
+        await withCheckedContinuation { continuation in
+            if arrivals.count >= 2 { continuation.resume() }
+            else { waiters.append(continuation) }
+        }
+    }
 }
 
 private final class LockedCounter: @unchecked Sendable {

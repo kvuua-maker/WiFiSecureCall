@@ -55,13 +55,22 @@ final class NotificationRuntime {
 
     func startPreferredCall(targetPlatform: String) async {
         guard let account = accountStore.activeAccount else { await startCall(); return }
+        do {
+            guard try accountStore.tokenStore.tokens(for: account.accountID) != nil else {
+                callSession.failToStart(.accountSessionInvalid)
+                return
+            }
+        } catch {
+            callSession.failToStart(.accountSessionInvalid)
+            return
+        }
         let matches: [AccountDeviceSummary]
         do {
             matches = try await accountAPI.devices(accountID: account.accountID).filter {
                 $0.deviceID != InstallationIdentity.shared.id && $0.callReady && $0.platform == targetPlatform
             }
         } catch {
-            callSession.failToStart(.targetUnavailable)
+            callSession.failToStart(Self.isInvalidAccountSession(error) ? .accountSessionInvalid : .serverUnavailable)
             return
         }
         guard matches.count == 1 else {
@@ -84,8 +93,10 @@ final class NotificationRuntime {
 
     func handleIncomingVoIP(callID: UUID, accountID: UUID) async {
         callSession.recordLifecycleDiagnostic("push_received", status: "account", callID: callID)
-        guard let signaling = accountIncomingSignaling(accountID: accountID) else {
-            callSession.recordLifecycleDiagnostic("new_call_blocked", status: "account_missing", callID: callID)
+        guard let signaling = accountIncomingSignaling(accountID: accountID, callID: callID) else {
+            if !accountStore.accounts.contains(where: { $0.accountID == accountID }) {
+                callSession.recordLifecycleDiagnostic("new_call_blocked", status: "account_missing", callID: callID)
+            }
             return
         }
         guard ensureCallKit() != nil else { return }
@@ -124,7 +135,7 @@ final class NotificationRuntime {
     func handleIncomingBackgroundNotification(callID: UUID, accountID: UUID) async -> Bool {
         callSession.recordLifecycleDiagnostic("watch_background_notification_received", status: "account", callID: callID)
         if let duplicate = duplicateIncomingResult(callID: callID) { return duplicate }
-        guard let signaling = accountIncomingSignaling(accountID: accountID) else { return false }
+        guard let signaling = accountIncomingSignaling(accountID: accountID, callID: callID) else { return false }
         guard ensureCallKit() != nil else { return false }
         callSession.recordLifecycleDiagnostic("watch_background_callkit_handoff", status: "started", callID: callID)
         await callSession.handleIncomingVoIP(callID: callID, signaling: signaling)
@@ -139,14 +150,26 @@ final class NotificationRuntime {
     }
 
     func handleIncomingAlert(callID: UUID, accountID: UUID, requestAnswer: Bool) async {
-        guard let signaling = accountIncomingSignaling(accountID: accountID), ensureCallKit() != nil else { return }
+        guard let signaling = accountIncomingSignaling(accountID: accountID, callID: callID), ensureCallKit() != nil else { return }
         await callSession.handleIncoming(callID: callID, requestAnswer: requestAnswer, signaling: signaling)
     }
 
-    private func accountIncomingSignaling(accountID: UUID) -> AccountCallSignaling? {
-        guard accountStore.accounts.contains(where: { $0.accountID == accountID }),
-              (try? accountStore.tokenStore.tokens(for: accountID)) != nil else { return nil }
+    private func accountIncomingSignaling(accountID: UUID, callID: UUID) -> AccountCallSignaling? {
+        guard accountStore.accounts.contains(where: { $0.accountID == accountID }) else { return nil }
+        guard (try? accountStore.tokenStore.tokens(for: accountID)) != nil else {
+            callSession.recordLifecycleDiagnostic("account_session_invalid", status: "missing_tokens", callID: callID)
+            return nil
+        }
         return AccountCallSignaling(client: accountAPI, accountID: accountID, localSide: .callee)
+    }
+
+    private static func isInvalidAccountSession(_ error: Error) -> Bool {
+        guard let error = error as? AccountAPIError else { return false }
+        switch error {
+        case .missingSession: return true
+        case let .status(status, _): return status == 401 || status == 403
+        default: return false
+        }
     }
 
     private func duplicateIncomingResult(callID: UUID) -> Bool? {

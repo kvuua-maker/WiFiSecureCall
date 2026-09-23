@@ -50,6 +50,14 @@ final class AccountSessionStore: ObservableObject {
     func logout(accountID: UUID) throws { try removeLocal(accountID: accountID) }
     func delete(accountID: UUID) throws { try removeLocal(accountID: accountID) }
 
+    @discardableResult
+    func removeOrphanedLocalAccount(accountID: UUID) throws -> Bool {
+        guard accounts.contains(where: { $0.accountID == accountID }),
+              try tokenStore.tokens(for: accountID) == nil else { return false }
+        try removeLocal(accountID: accountID)
+        return true
+    }
+
     private func removeLocal(accountID: UUID) throws {
         try tokenStore.delete(accountID: accountID)
         accounts.removeAll { $0.accountID == accountID }

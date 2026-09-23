@@ -5,15 +5,45 @@ protocol SecureTokenStore: AnyObject {
     func tokens(for accountID: UUID) throws -> AccountTokens?
     func save(_ tokens: AccountTokens, for accountID: UUID) throws
     func delete(accountID: UUID) throws
+    @discardableResult
+    func deleteIfRefreshTokenMatches(accountID: UUID, refreshToken: String) throws -> Bool
 }
 
 enum SecureTokenStoreError: Error { case encoding, keychain(OSStatus), decoding }
 
 final class KeychainSecureTokenStore: SecureTokenStore {
     private let service: String
+    private let lock = NSLock()
     init(service: String = "com.vkapps.wifisecurecall.account-session") { self.service = service }
 
     func tokens(for accountID: UUID) throws -> AccountTokens? {
+        lock.lock()
+        defer { lock.unlock() }
+        return try tokensUnlocked(for: accountID)
+    }
+
+    func save(_ tokens: AccountTokens, for accountID: UUID) throws {
+        lock.lock()
+        defer { lock.unlock() }
+        try saveUnlocked(tokens, for: accountID)
+    }
+
+    func delete(accountID: UUID) throws {
+        lock.lock()
+        defer { lock.unlock() }
+        try deleteUnlocked(accountID: accountID)
+    }
+
+    @discardableResult
+    func deleteIfRefreshTokenMatches(accountID: UUID, refreshToken: String) throws -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        guard try tokensUnlocked(for: accountID)?.refreshToken == refreshToken else { return false }
+        try deleteUnlocked(accountID: accountID)
+        return true
+    }
+
+    private func tokensUnlocked(for accountID: UUID) throws -> AccountTokens? {
         var query = base(accountID)
         query[kSecReturnData as String] = true
         query[kSecMatchLimit as String] = kSecMatchLimitOne
@@ -25,7 +55,7 @@ final class KeychainSecureTokenStore: SecureTokenStore {
         return value
     }
 
-    func save(_ tokens: AccountTokens, for accountID: UUID) throws {
+    private func saveUnlocked(_ tokens: AccountTokens, for accountID: UUID) throws {
         guard let data = try? JSONEncoder.account.encode(tokens) else { throw SecureTokenStoreError.encoding }
         var query = base(accountID)
         let attributes: [String: Any] = [kSecValueData as String: data, kSecAttrAccessible as String: kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly]
@@ -37,7 +67,7 @@ final class KeychainSecureTokenStore: SecureTokenStore {
         } else if update != errSecSuccess { throw SecureTokenStoreError.keychain(update) }
     }
 
-    func delete(accountID: UUID) throws {
+    private func deleteUnlocked(accountID: UUID) throws {
         let status = SecItemDelete(base(accountID) as CFDictionary)
         guard status == errSecSuccess || status == errSecItemNotFound else { throw SecureTokenStoreError.keychain(status) }
     }

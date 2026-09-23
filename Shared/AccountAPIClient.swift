@@ -1,11 +1,39 @@
 import Foundation
 
+actor AccountRefreshCoordinator {
+    static let shared = AccountRefreshCoordinator()
+
+    struct RefreshKey: Hashable, Sendable {
+        let accountID: UUID
+        let deviceID: UUID
+    }
+
+    private struct Entry {
+        let id: UUID
+        let task: Task<AccountTokens, Error>
+    }
+
+    private var entries: [RefreshKey: Entry] = [:]
+
+    func refresh(
+        key: RefreshKey,
+        operation: @escaping @Sendable () async throws -> AccountTokens
+    ) async throws -> AccountTokens {
+        if let entry = entries[key] { return try await entry.task.value }
+        let entry = Entry(id: UUID(), task: Task { try await operation() })
+        entries[key] = entry
+        defer {
+            if entries[key]?.id == entry.id { entries[key] = nil }
+        }
+        return try await entry.task.value
+    }
+}
+
 actor AccountAPIClient {
     private let baseURL: URL
     private let session: URLSession
     private let tokenStore: SecureTokenStore
     private let deviceID: UUID
-    private var refreshTasks: [UUID: Task<AccountTokens, Error>] = [:]
 
     init(config: AppConfig, tokenStore: SecureTokenStore, session: URLSession? = nil, deviceID: UUID = InstallationIdentity.shared.id) {
         let root = config.apiBaseURL.deletingLastPathComponent()
@@ -99,22 +127,22 @@ actor AccountAPIClient {
     }
 
     private func refresh(accountID: UUID) async throws -> AccountTokens {
-        if let task = refreshTasks[accountID] { return try await task.value }
-        let task = Task<AccountTokens, Error> {
-            guard let current = try tokenStore.tokens(for: accountID) else { throw AccountAPIError.missingSession }
-            let response: AccountSessionResponse = try await request("auth/refresh", body: AccountRefreshRequest(refreshToken: current.refreshToken, deviceID: deviceID))
+        let key = AccountRefreshCoordinator.RefreshKey(accountID: accountID, deviceID: deviceID)
+        return try await AccountRefreshCoordinator.shared.refresh(key: key) { [self] in
+            try await performRefresh(accountID: accountID)
+        }
+    }
+
+    private func performRefresh(accountID: UUID) async throws -> AccountTokens {
+        guard let current = try tokenStore.tokens(for: accountID) else { throw AccountAPIError.missingSession }
+        let attemptedRefreshToken = current.refreshToken
+        do {
+            let response: AccountSessionResponse = try await request("auth/refresh", body: AccountRefreshRequest(refreshToken: attemptedRefreshToken, deviceID: deviceID))
             try tokenStore.save(response.tokens, for: accountID)
             return response.tokens
-        }
-        refreshTasks[accountID] = task
-        do {
-            let value = try await task.value
-            refreshTasks[accountID] = nil
-            return value
         } catch {
-            refreshTasks[accountID] = nil
             if case let AccountAPIError.status(status, _) = error, status == 401 || status == 403 {
-                try? tokenStore.delete(accountID: accountID)
+                _ = try? tokenStore.deleteIfRefreshTokenMatches(accountID: accountID, refreshToken: attemptedRefreshToken)
             }
             throw error
         }
