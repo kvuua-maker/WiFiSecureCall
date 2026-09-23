@@ -1785,6 +1785,41 @@ final class AccountCallFoundationTests: XCTestCase {
         XCTAssertTrue(session.state.isTerminal)
     }
 
+    func testProviderResetTerminalDeliverySurvivesGenerationTeardownCancellation() async throws {
+        let cancelSignaling = ControlledCallSignaling(accountID: UUID(), localSide: .caller)
+        let unrelated = ControlledCallSignaling(accountID: UUID(), localSide: .caller)
+        let outgoing = CallSession(config: accountCallConfig(), audio: AudioEngineMock(), media: MediaTransportMock())
+        let outgoingAdapter = RetainedCallKitMock(); outgoing.attach(callKit: outgoingAdapter)
+        await outgoing.startCall(signaling: cancelSignaling)
+        let outgoingCallID = try XCTUnwrap(outgoing.state.callID)
+        let outgoingLocalID = try XCTUnwrap(outgoingAdapter.startedIDs.first)
+        try await outgoingAdapter.approveStart(outgoingLocalID)
+
+        outgoingAdapter.onProviderReset?(outgoingLocalID)
+        await eventually { outgoing.state.isTerminal && cancelSignaling.mutationCount(.cancel, callID: outgoingCallID) == 1 }
+        outgoing.reset()
+        await outgoing.startCall(signaling: unrelated)
+        try? await Task.sleep(nanoseconds: 50_000_000)
+
+        XCTAssertEqual(cancelSignaling.mutationCount(.cancel, callID: outgoingCallID), 1)
+        XCTAssertFalse(unrelated.containsAnyMutation(callID: outgoingCallID))
+
+        let endSignaling = ControlledCallSignaling(accountID: UUID(), localSide: .callee)
+        let accepted = CallSession(config: accountCallConfig(), audio: AudioEngineMock(), media: MediaTransportMock())
+        let acceptedAdapter = RetainedCallKitMock(); accepted.attach(callKit: acceptedAdapter)
+        let acceptedCallID = UUID()
+        await accepted.handleIncomingVoIP(callID: acceptedCallID, signaling: endSignaling)
+        let acceptedLocalID = try XCTUnwrap(acceptedAdapter.incomingIDs.first)
+        try await acceptedAdapter.approveAnswer(acceptedLocalID)
+
+        acceptedAdapter.onProviderReset?(acceptedLocalID)
+        await eventually { accepted.state.isTerminal && endSignaling.mutationCount(.end, callID: acceptedCallID) == 1 }
+        try? await Task.sleep(nanoseconds: 50_000_000)
+
+        XCTAssertEqual(endSignaling.mutationCount(.end, callID: acceptedCallID), 1)
+        XCTAssertTrue(accepted.state.isTerminal)
+    }
+
     func testLegacyProviderResetOutgoingRingingStillCancels() async throws {
         let capture = RequestCapture()
         let config = accountCallConfig()
@@ -1924,6 +1959,10 @@ private final class ControlledCallSignaling: CallSignaling, @unchecked Sendable 
 
     func containsAnyMutation(callID: UUID) -> Bool {
         lock.withLock { mutations.contains { $0.callID == callID } }
+    }
+
+    func mutationCount(_ action: CallMutation, callID: UUID) -> Int {
+        lock.withLock { mutations.filter { $0.action == action && $0.callID == callID }.count }
     }
 
     private func state(for action: CallMutation) -> ServerCallState {

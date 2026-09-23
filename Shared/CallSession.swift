@@ -500,7 +500,8 @@ final class CallSession: ObservableObject {
         let mutation = terminalMutationForCurrentState()
         let requestID = terminalRequestID ?? UUID(); terminalRequestID = requestID
         registerTerminalCompensation(current, mutation: mutation, signaling: callSignaling, requestID: requestID)
-        spawn { [weak self] in guard let self, self.isCurrent(current) else { return }; await self.teardownLocal(current, finalState: .failed(current.serverCallID, .callKitRejected), reportReason: nil); self.enqueueTerminalMutation(current, mutation: mutation) }
+        enqueueTerminalMutation(current, mutation: mutation)
+        spawn { [weak self] in guard let self, self.isCurrent(current) else { return }; await self.teardownLocal(current, finalState: .failed(current.serverCallID, .callKitRejected), reportReason: nil) }
     }
 
     private func startRingingPoll(_ current: CallGeneration, ringExpiresAt: Date) {
