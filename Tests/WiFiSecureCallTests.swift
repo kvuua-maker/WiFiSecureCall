@@ -1600,7 +1600,7 @@ final class AccountCallFoundationTests: XCTestCase {
     }
 
     func testPreferredCallSelectsOnlyReadyTargetAndCreatesV2Call() async throws {
-        let accountID = UUID(), targetID = UUID(), callIDBox = LockedUUID(), secrets = InMemorySecureTokenStore()
+        let accountID = UUID(), targetID = UUID(), callIDBox = LockedUUID(), mutationCount = LockedCounter(), secrets = InMemorySecureTokenStore()
         let defaults = try XCTUnwrap(UserDefaults(suiteName: "PreferredAccountCall.One.\(UUID())"))
         let store = AccountSessionStore(tokenStore: secrets, defaults: defaults)
         try store.add(accountSession(accountID: accountID))
@@ -1619,6 +1619,7 @@ final class AccountCallFoundationTests: XCTestCase {
                 return (200, self.accountCallResponse(callID: body.callID, side: .caller, state: .ringing))
             }
             let callID = try XCTUnwrap(callIDBox.value)
+            if request.url!.path.hasSuffix("/cancel") { mutationCount.increment() }
             return (200, self.accountCallResponse(callID: callID, side: .caller, state: request.url!.path.hasSuffix("/cancel") ? .cancelled : .ringing))
         }
         let runtime = NotificationRuntime(config: accountCallConfig(), accountStore: store, accountAPI: AccountAPIClient(config: accountCallConfig(), tokenStore: secrets, session: session), audio: AudioEngineMock(), media: MediaTransportMock())
@@ -1630,8 +1631,9 @@ final class AccountCallFoundationTests: XCTestCase {
         for _ in 0..<100 where callIDBox.value == nil { try? await Task.sleep(nanoseconds: 10_000_000) }
         XCTAssertNotNil(callIDBox.value)
         _ = try await adapter.approveEnd(localID)
-        for _ in 0..<100 where !runtime.callSession.state.isTerminal { try? await Task.sleep(nanoseconds: 10_000_000) }
+        for _ in 0..<100 where !runtime.callSession.state.isTerminal || mutationCount.value == 0 { try? await Task.sleep(nanoseconds: 10_000_000) }
         XCTAssertTrue(runtime.callSession.state.isTerminal)
+        XCTAssertEqual(mutationCount.value, 1)
     }
 
     func testIncomingV2MissingAccountIgnoredAndSignedInAccountUsesSameProvider() async throws {
@@ -1655,8 +1657,9 @@ final class AccountCallFoundationTests: XCTestCase {
         XCTAssertEqual(runtime.callSession.state.callID, callID)
         for _ in 0..<100 where requestCount.value == 0 { try? await Task.sleep(nanoseconds: 10_000_000) }
         _ = try await adapter.approveEnd(try XCTUnwrap(adapter.incomingIDs.first))
-        for _ in 0..<100 where !runtime.callSession.state.isTerminal { try? await Task.sleep(nanoseconds: 10_000_000) }
+        for _ in 0..<100 where !runtime.callSession.state.isTerminal || requestCount.value < 2 { try? await Task.sleep(nanoseconds: 10_000_000) }
         XCTAssertTrue(runtime.callSession.state.isTerminal)
+        XCTAssertGreaterThanOrEqual(requestCount.value, 2)
     }
 
     func testWatchBackgroundV2IncomingUsesSameCallSessionAndProvider() async throws {
@@ -1684,8 +1687,149 @@ final class AccountCallFoundationTests: XCTestCase {
         XCTAssertEqual(runtime.callKitCreationCount, 1)
         for _ in 0..<100 where requestCount.value == 0 { try? await Task.sleep(nanoseconds: 10_000_000) }
         _ = try await adapter.approveEnd(try XCTUnwrap(adapter.incomingIDs.first))
-        for _ in 0..<100 where !runtime.callSession.state.isTerminal { try? await Task.sleep(nanoseconds: 10_000_000) }
+        for _ in 0..<100 where !runtime.callSession.state.isTerminal || requestCount.value < 2 { try? await Task.sleep(nanoseconds: 10_000_000) }
         XCTAssertTrue(runtime.callSession.state.isTerminal)
+        XCTAssertGreaterThanOrEqual(requestCount.value, 2)
+    }
+
+    func testStaleV2CreateCompensatesThroughOriginalSignaling() async throws {
+        let original = ControlledCallSignaling(accountID: UUID(), localSide: .caller, holdCreate: true)
+        let replacement = ControlledCallSignaling(accountID: UUID(), localSide: .caller)
+        let session = CallSession(config: accountCallConfig(), audio: AudioEngineMock(), media: MediaTransportMock())
+        let adapter = RetainedCallKitMock(); session.attach(callKit: adapter)
+
+        await session.startCall(signaling: original)
+        let oldCallID = try XCTUnwrap(session.state.callID)
+        let oldLocalID = try XCTUnwrap(adapter.startedIDs.first)
+        let start = Task { try await adapter.approveStart(oldLocalID) }
+        await eventually { original.createPending }
+        adapter.onActionFailed?(oldLocalID, "start", NSError(domain: "generation-invalidated", code: 1))
+        await eventually { session.state.isTerminal }
+        session.reset()
+        await session.startCall(signaling: replacement)
+
+        original.resumeCreate()
+        _ = try? await start.value
+        await eventually { original.contains(.cancel, callID: oldCallID) }
+
+        XCTAssertTrue(original.contains(.cancel, callID: oldCallID))
+        XCTAssertFalse(replacement.containsAnyMutation(callID: oldCallID))
+    }
+
+    func testStaleV2AcceptCompensatesThroughOriginalSignaling() async throws {
+        let original = ControlledCallSignaling(accountID: UUID(), localSide: .callee, holdAccept: true)
+        let replacement = ControlledCallSignaling(accountID: UUID(), localSide: .caller)
+        let session = CallSession(config: accountCallConfig(), audio: AudioEngineMock(), media: MediaTransportMock())
+        let adapter = RetainedCallKitMock(); session.attach(callKit: adapter)
+        let oldCallID = UUID()
+
+        await session.handleIncomingVoIP(callID: oldCallID, signaling: original)
+        let oldLocalID = try XCTUnwrap(adapter.incomingIDs.first)
+        let answer = Task { try await adapter.approveAnswer(oldLocalID) }
+        await eventually { original.acceptPending }
+        adapter.onActionFailed?(oldLocalID, "answer", NSError(domain: "generation-invalidated", code: 2))
+        await eventually { session.state.isTerminal }
+        session.reset()
+        await session.startCall(signaling: replacement)
+
+        original.resumeAccept()
+        _ = try? await answer.value
+        await eventually { original.contains(.end, callID: oldCallID) }
+
+        XCTAssertTrue(original.contains(.end, callID: oldCallID))
+        XCTAssertFalse(replacement.containsAnyMutation(callID: oldCallID))
+    }
+
+    func testProviderResetRingingV2RetainsCancelAndRejectBackends() async throws {
+        let signaling = ControlledCallSignaling(accountID: UUID(), localSide: .caller)
+        let session = CallSession(config: accountCallConfig(), audio: AudioEngineMock(), media: MediaTransportMock())
+        let adapter = RetainedCallKitMock(); session.attach(callKit: adapter)
+        await session.startCall(signaling: signaling)
+        let callID = try XCTUnwrap(session.state.callID)
+        let localID = try XCTUnwrap(adapter.startedIDs.first)
+        try await adapter.approveStart(localID)
+
+        adapter.onProviderReset?(localID)
+        await eventually { signaling.contains(.cancel, callID: callID) }
+
+        XCTAssertTrue(signaling.contains(.cancel, callID: callID))
+        XCTAssertTrue(session.state.isTerminal)
+
+        let incomingSignaling = ControlledCallSignaling(accountID: UUID(), localSide: .callee)
+        let incomingSession = CallSession(config: accountCallConfig(), audio: AudioEngineMock(), media: MediaTransportMock())
+        let incomingAdapter = RetainedCallKitMock(); incomingSession.attach(callKit: incomingAdapter)
+        let incomingCallID = UUID()
+        await incomingSession.handleIncomingVoIP(callID: incomingCallID, signaling: incomingSignaling)
+        let incomingLocalID = try XCTUnwrap(incomingAdapter.incomingIDs.first)
+        incomingAdapter.onProviderReset?(incomingLocalID)
+        await eventually { incomingSignaling.contains(.reject, callID: incomingCallID) }
+
+        XCTAssertTrue(incomingSignaling.contains(.reject, callID: incomingCallID))
+        XCTAssertTrue(incomingSession.state.isTerminal)
+    }
+
+    func testProviderResetAcceptedV2RetainsEndBackend() async throws {
+        let signaling = ControlledCallSignaling(accountID: UUID(), localSide: .callee)
+        let session = CallSession(config: accountCallConfig(), audio: AudioEngineMock(), media: MediaTransportMock())
+        let adapter = RetainedCallKitMock(); session.attach(callKit: adapter)
+        let callID = UUID()
+        await session.handleIncomingVoIP(callID: callID, signaling: signaling)
+        let localID = try XCTUnwrap(adapter.incomingIDs.first)
+        try await adapter.approveAnswer(localID)
+        guard case .connecting = session.state else { return XCTFail("expected connecting") }
+
+        adapter.onProviderReset?(localID)
+        await eventually { signaling.contains(.end, callID: callID) }
+
+        XCTAssertTrue(signaling.contains(.end, callID: callID))
+        XCTAssertTrue(session.state.isTerminal)
+    }
+
+    func testLegacyProviderResetOutgoingRingingStillCancels() async throws {
+        let capture = RequestCapture()
+        let config = accountCallConfig()
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [CallSessionURLProtocol.self]
+        CallSessionURLProtocol.capture = capture
+        capture.clientRole = config.role
+        let api = APIClient(config: config, session: URLSession(configuration: configuration))
+        let session = CallSession(config: config, api: api, audio: AudioEngineMock(), media: MediaTransportMock())
+        let adapter = RetainedCallKitMock(); session.attach(callKit: adapter)
+        await session.startCall()
+        let callID = try XCTUnwrap(session.state.callID)
+        let localID = try XCTUnwrap(adapter.startedIDs.first)
+        try await adapter.approveStart(localID)
+
+        adapter.onProviderReset?(localID)
+        await eventually { capture.paths.contains { $0.hasSuffix("/calls/\(callID.uuidString.lowercased())/cancel") } }
+
+        XCTAssertTrue(capture.paths.contains { $0.hasSuffix("/calls/\(callID.uuidString.lowercased())/cancel") })
+        XCTAssertTrue(session.state.isTerminal)
+    }
+
+    func testStaleCompensationCannotCrossGenerationBackends() async throws {
+        let backendA = ControlledCallSignaling(accountID: UUID(), localSide: .caller, holdCreate: true)
+        let backendB = ControlledCallSignaling(accountID: UUID(), localSide: .caller)
+        let session = CallSession(config: accountCallConfig(), audio: AudioEngineMock(), media: MediaTransportMock())
+        let adapter = RetainedCallKitMock(); session.attach(callKit: adapter)
+        await session.startCall(signaling: backendA)
+        let callA = try XCTUnwrap(session.state.callID)
+        let localA = try XCTUnwrap(adapter.startedIDs.first)
+        let startA = Task { try await adapter.approveStart(localA) }
+        await eventually { backendA.createPending }
+        adapter.onActionFailed?(localA, "start", NSError(domain: "replace-generation", code: 3))
+        await eventually { session.state.isTerminal }
+        session.reset()
+        await session.startCall(signaling: backendB)
+        let callB = try XCTUnwrap(session.state.callID)
+
+        backendA.resumeCreate()
+        _ = try? await startA.value
+        await eventually { backendA.contains(.cancel, callID: callA) }
+
+        XCTAssertTrue(backendA.contains(.cancel, callID: callA))
+        XCTAssertFalse(backendB.containsAnyMutation(callID: callA))
+        XCTAssertFalse(backendA.containsAnyMutation(callID: callB))
     }
 
     private func accountCallConfig() -> AppConfig {
@@ -1705,6 +1849,89 @@ final class AccountCallFoundationTests: XCTestCase {
 
     private func accountCallResponse(callID: UUID, side: CallPartySide, state: ServerCallState) -> AccountCallResponse {
         AccountCallResponse(callID: callID, localSide: side, state: state, expiresAt: Date(timeIntervalSince1970: 2_000_000_000), mediaToken: state == .accepted ? "media" : nil, ringExpiresAt: Date(timeIntervalSince1970: 2_000_000_000), acceptedAt: state == .accepted ? Date() : nil, terminalAt: nil, terminalReason: nil, deliveryStatus: "submission_accepted", peerReady: state == .accepted, createdNew: true, mutationApplied: nil)
+    }
+
+    private func eventually(_ predicate: @escaping () -> Bool) async {
+        for _ in 0..<200 where !predicate() { try? await Task.sleep(nanoseconds: 10_000_000) }
+    }
+}
+
+private final class ControlledCallSignaling: CallSignaling, @unchecked Sendable {
+    private struct HeldOperation {
+        let callID: UUID
+        let continuation: CheckedContinuation<CallSignalView, Error>
+    }
+    private struct MutationRecord {
+        let action: CallMutation
+        let callID: UUID
+    }
+
+    let accountID: UUID
+    let localSide: CallPartySide
+    let mediaPeerIdentity: MediaPeerIdentity
+    private let holdCreate: Bool
+    private let holdAccept: Bool
+    private let lock = NSLock()
+    private var heldCreate: HeldOperation?
+    private var heldAccept: HeldOperation?
+    private var mutations: [MutationRecord] = []
+
+    init(accountID: UUID, localSide: CallPartySide, holdCreate: Bool = false, holdAccept: Bool = false) {
+        self.accountID = accountID
+        self.localSide = localSide
+        self.mediaPeerIdentity = .account(localSide)
+        self.holdCreate = holdCreate
+        self.holdAccept = holdAccept
+    }
+
+    var createPending: Bool { lock.withLock { heldCreate != nil } }
+    var acceptPending: Bool { lock.withLock { heldAccept != nil } }
+
+    func create(callID: UUID, requestID: UUID) async throws -> CallSignalView {
+        if holdCreate {
+            return try await withCheckedThrowingContinuation { continuation in
+                lock.withLock { heldCreate = HeldOperation(callID: callID, continuation: continuation) }
+            }
+        }
+        return view(callID: callID, state: .ringing, side: .caller)
+    }
+
+    func call(_ id: UUID) async throws -> CallSignalView { view(callID: id, state: .ringing, side: localSide) }
+
+    func mutate(_ action: CallMutation, callID: UUID, requestID: UUID) async throws -> CallSignalView {
+        lock.withLock { mutations.append(MutationRecord(action: action, callID: callID)) }
+        if action == .accept, holdAccept {
+            return try await withCheckedThrowingContinuation { continuation in
+                lock.withLock { heldAccept = HeldOperation(callID: callID, continuation: continuation) }
+            }
+        }
+        return view(callID: callID, state: state(for: action), side: localSide)
+    }
+
+    func resumeCreate() {
+        let held = lock.withLock { let value = heldCreate; heldCreate = nil; return value }
+        if let held { held.continuation.resume(returning: view(callID: held.callID, state: .ringing, side: .caller)) }
+    }
+
+    func resumeAccept() {
+        let held = lock.withLock { let value = heldAccept; heldAccept = nil; return value }
+        if let held { held.continuation.resume(returning: view(callID: held.callID, state: .accepted, side: localSide)) }
+    }
+
+    func contains(_ action: CallMutation, callID: UUID) -> Bool {
+        lock.withLock { mutations.contains { $0.action == action && $0.callID == callID } }
+    }
+
+    func containsAnyMutation(callID: UUID) -> Bool {
+        lock.withLock { mutations.contains { $0.callID == callID } }
+    }
+
+    private func state(for action: CallMutation) -> ServerCallState {
+        switch action { case .accept: return .accepted; case .reject: return .rejected; case .cancel: return .cancelled; case .end: return .ended }
+    }
+
+    private func view(callID: UUID, state: ServerCallState, side: CallPartySide) -> CallSignalView {
+        CallSignalView(callID: callID, localSide: side, state: state, expiresAt: Date(timeIntervalSince1970: 2_000_000_000), mediaToken: state == .accepted ? "media-token" : nil, ringExpiresAt: Date(timeIntervalSince1970: 2_000_000_000), acceptedAt: state == .accepted ? Date() : nil, terminalAt: state == .ended || state == .cancelled || state == .rejected ? Date() : nil, terminalReason: nil, deliveryStatus: "test", peerReady: false, createdNew: true, mutationApplied: true)
     }
 }
 

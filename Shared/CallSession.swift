@@ -53,6 +53,12 @@ private enum RuntimeEvent: Sendable {
     case muteChanged(UUID, Bool)
 }
 
+private struct TerminalCompensation {
+    let mutation: CallMutation
+    let requestID: UUID
+    let signaling: any CallSignaling
+}
+
 @MainActor
 final class CallSession: ObservableObject {
     @Published private(set) var state: CallState = .idle
@@ -72,7 +78,7 @@ final class CallSession: ObservableObject {
     private var acceptRequestID: UUID?
     private var terminalRequestID: UUID?
     private var terminalMutation: CallMutation?
-    private var terminalCompensations: [UUID: (CallMutation, UUID, any CallSignaling)] = [:]
+    private var terminalCompensations: [UUID: TerminalCompensation] = [:]
     private var activeSignaling: (any CallSignaling)?
     private var isOutgoingCall = false
     private var callKitReported = false
@@ -277,7 +283,7 @@ final class CallSession: ObservableObject {
             validation?.cancel()
             guard isCurrent(current) else { return }
             recordCallKitError(stage: "reportIncoming", callID: callID, error: error)
-            await terminalMutationForIncomingFailure(current)
+            await terminalMutationForIncomingFailure(current, signaling: signaling)
             await fail(current, .callKitRejected, reportCallKit: false)
         }
     }
@@ -333,24 +339,25 @@ final class CallSession: ObservableObject {
 
     private func performStart(localID: UUID, deadline: Date) async throws {
         guard let current = generation, current.localCallKitUUID == localID, case .outgoingRinging = state else { throw CallKitCoordinatorError.invalidAction }
+        let callSignaling = try signaling(for: current)
         recordRuntimeDiagnostic("callkit_start_approved", status: "success", callID: current.serverCallID)
         callKit?.reportOutgoingStartedConnecting(id: localID)
         let requestID = createRequestID ?? UUID(); createRequestID = requestID
         let response: CallSignalView
         recordRuntimeDiagnostic("server_call_create_started", status: "started", callID: current.serverCallID)
-        do { response = try await signaling(for: current).create(callID: current.serverCallID, requestID: requestID) }
+        do { response = try await callSignaling.create(callID: current.serverCallID, requestID: requestID) }
         catch { guard isCurrent(current) else { throw CancellationError() }; recordRuntimeDiagnostic("server_call_create_failed", status: "failed", callID: current.serverCallID, domain: (error as NSError).domain, code: (error as NSError).code); throw error }
         guard response.callID == current.serverCallID, response.localSide == .caller, response.state == .ringing else {
             throw CallKitCoordinatorError.invalidAction
         }
         guard isCurrent(current) else {
-            registerTerminalCompensation(current, mutation: .cancel, requestID: UUID())
+            registerTerminalCompensation(current, mutation: .cancel, signaling: callSignaling, requestID: UUID())
             await deliverTerminalCompensation(current)
             throw CancellationError()
         }
         serverCallCreated = true
         guard Date() < deadline else {
-            await compensateAfterStart(current)
+            await compensateAfterStart(current, signaling: callSignaling)
             throw CallKitCoordinatorError.actionTimedOut
         }
         callKitReported = true
@@ -362,14 +369,15 @@ final class CallSession: ObservableObject {
         guard let current = generation, current.localCallKitUUID == localID, case .incomingRinging = state else { throw CallKitCoordinatorError.invalidAction }
         guard await audio.ensureRecordPermission() else { throw CallFailure.permissionDenied }
         guard isCurrent(current), Date() < deadline else { throw CallKitCoordinatorError.actionTimedOut }
+        let callSignaling = try signaling(for: current)
         let requestID = acceptRequestID ?? UUID(); acceptRequestID = requestID
-        let response = try await signaling(for: current).mutate(.accept, callID: current.serverCallID, requestID: requestID)
+        let response = try await callSignaling.mutate(.accept, callID: current.serverCallID, requestID: requestID)
         guard isCurrent(current) else {
-            if response.state == .accepted { registerTerminalCompensation(current, mutation: .end); await deliverTerminalCompensation(current) }
+            if response.state == .accepted { registerTerminalCompensation(current, mutation: .end, signaling: callSignaling, requestID: UUID()); await deliverTerminalCompensation(current) }
             throw CancellationError()
         }
         guard Date() < deadline, response.callID == current.serverCallID, response.state == .accepted, let token = response.mediaToken, !token.isEmpty else {
-            if response.state == .accepted { await compensateAfterAccept(current) }
+            if response.state == .accepted { await compensateAfterAccept(current, signaling: callSignaling) }
             throw response.state == .expired ? CallFailure.callExpired : CallFailure.invalidServerState
         }
         mediaToken = token
@@ -381,6 +389,7 @@ final class CallSession: ObservableObject {
 
     private func performEnd(localID: UUID, deadline: Date, origin: CallEndRequestOrigin) async throws -> CallEndDisposition {
         guard let current = generation, current.localCallKitUUID == localID else { throw CallKitCoordinatorError.invalidAction }
+        let callSignaling = try signaling(for: current)
         let originStatus = origin == .appRequested ? "appRequested" : "system"
         recordRuntimeDiagnostic("callkit_end_action_received", status: "origin=\(originStatus) state=\(String(describing: state))", callID: current.serverCallID)
 
@@ -393,7 +402,7 @@ final class CallSession: ObservableObject {
             if case .outgoingRinging = state {
                 recordRuntimeDiagnostic("system_end_reconcile_started", status: "started", callID: current.serverCallID)
                 do {
-                    let response = try await signaling(for: current).call(current.serverCallID)
+                    let response = try await callSignaling.call(current.serverCallID)
                     guard isCurrent(current), response.callID == current.serverCallID else { throw CancellationError() }
                     switch response.state {
                     case .accepted:
@@ -429,7 +438,7 @@ final class CallSession: ObservableObject {
         let mutation = terminalMutationForCurrentState()
         terminalMutation = mutation
         terminalRequestID = terminalRequestID ?? UUID()
-        registerTerminalCompensation(current, mutation: mutation)
+        registerTerminalCompensation(current, mutation: mutation, signaling: callSignaling)
         await teardownLocal(current, finalState: .ended(current.serverCallID), reportReason: nil)
         guard Date() < deadline else { enqueueTerminalMutation(current, mutation: mutation); return .ended }
         enqueueTerminalMutation(current, mutation: mutation)
@@ -441,10 +450,11 @@ final class CallSession: ObservableObject {
         recordRuntimeDiagnostic("callkit_action_timeout", status: stage, callID: current.serverCallID)
         spawn { [weak self] in
             guard let self, self.isCurrent(current) else { return }
-            if stage.contains("Start") || stage.lowercased().contains("start") { await self.compensateAfterStart(current) }
+            guard let callSignaling = try? self.signaling(for: current) else { return }
+            if stage.contains("Start") || stage.lowercased().contains("start") { await self.compensateAfterStart(current, signaling: callSignaling) }
             else if stage.contains("Answer") || stage.lowercased().contains("answer") {
-                if self.serverCallAccepted { await self.compensateAfterAccept(current) }
-                else { await self.terminalMutationForIncomingFailure(current) }
+                if self.serverCallAccepted { await self.compensateAfterAccept(current, signaling: callSignaling) }
+                else { await self.terminalMutationForIncomingFailure(current, signaling: callSignaling) }
             }
             await self.fail(current, .callKitRejected, reportCallKit: false)
         }
@@ -456,10 +466,11 @@ final class CallSession: ObservableObject {
         if stage == "mute" { return }
         spawn { [weak self] in
             guard let self, self.isCurrent(current) else { return }
-            if stage == "start" && self.serverCallCreated { await self.compensateAfterStart(current) }
+            guard let callSignaling = try? self.signaling(for: current) else { return }
+            if stage == "start" && self.serverCallCreated { await self.compensateAfterStart(current, signaling: callSignaling) }
             if stage == "answer" {
-                if self.serverCallAccepted { await self.compensateAfterAccept(current) }
-                else { await self.terminalMutationForIncomingFailure(current) }
+                if self.serverCallAccepted { await self.compensateAfterAccept(current, signaling: callSignaling) }
+                else { await self.terminalMutationForIncomingFailure(current, signaling: callSignaling) }
             }
             await self.fail(current, .callKitRejected, reportCallKit: self.callKitReported)
         }
@@ -485,7 +496,10 @@ final class CallSession: ObservableObject {
 
     private func providerReset(localID: UUID?) {
         guard let current = generation, localID == nil || current.localCallKitUUID == localID else { return }
+        guard let callSignaling = try? signaling(for: current) else { return }
         let mutation = terminalMutationForCurrentState()
+        let requestID = terminalRequestID ?? UUID(); terminalRequestID = requestID
+        registerTerminalCompensation(current, mutation: mutation, signaling: callSignaling, requestID: requestID)
         spawn { [weak self] in guard let self, self.isCurrent(current) else { return }; await self.teardownLocal(current, finalState: .failed(current.serverCallID, .callKitRejected), reportReason: nil); self.enqueueTerminalMutation(current, mutation: mutation) }
     }
 
@@ -758,52 +772,54 @@ final class CallSession: ObservableObject {
         }
     }
 
-    private func compensateAfterStart(_ current: CallGeneration) async {
+    private func compensateAfterStart(_ current: CallGeneration, signaling: any CallSignaling) async {
         guard isCurrent(current), serverCallCreated else { return }
-        terminalRequestID = terminalRequestID ?? UUID(); registerTerminalCompensation(current, mutation: .cancel); await deliverTerminalCompensation(current)
+        terminalRequestID = terminalRequestID ?? UUID(); registerTerminalCompensation(current, mutation: .cancel, signaling: signaling); await deliverTerminalCompensation(current)
     }
-    private func compensateAfterAccept(_ current: CallGeneration) async {
+    private func compensateAfterAccept(_ current: CallGeneration, signaling: any CallSignaling) async {
         guard isCurrent(current) else { return }
-        terminalRequestID = terminalRequestID ?? UUID(); registerTerminalCompensation(current, mutation: .end); await deliverTerminalCompensation(current)
+        terminalRequestID = terminalRequestID ?? UUID(); registerTerminalCompensation(current, mutation: .end, signaling: signaling); await deliverTerminalCompensation(current)
     }
-    private func terminalMutationForIncomingFailure(_ current: CallGeneration) async { terminalRequestID = terminalRequestID ?? UUID(); registerTerminalCompensation(current, mutation: .reject); await deliverTerminalCompensation(current) }
+    private func terminalMutationForIncomingFailure(_ current: CallGeneration, signaling: any CallSignaling) async { terminalRequestID = terminalRequestID ?? UUID(); registerTerminalCompensation(current, mutation: .reject, signaling: signaling); await deliverTerminalCompensation(current) }
 
     private func terminalMutationForCurrentState() -> CallMutation {
         switch state { case .outgoingRinging: return .cancel; case .incomingRinging: return .reject; default: return .end }
     }
 
     private func enqueueTerminalMutation(_ current: CallGeneration, mutation: CallMutation) {
-        let requestID = terminalRequestID ?? UUID(); terminalRequestID = requestID
-        guard let signaling = terminalCompensations[current.id]?.2 ?? activeSignaling else { return }
-        terminalCompensations[current.id] = (mutation, requestID, signaling)
+        guard terminalCompensations[current.id]?.mutation == mutation else { return }
         Task { @MainActor [weak self] in await self?.deliverTerminalCompensation(current) }
     }
 
-    private func registerTerminalCompensation(_ current: CallGeneration, mutation: CallMutation, requestID: UUID? = nil) {
-        if terminalCompensations[current.id] == nil {
-            guard let signaling = activeSignaling else { return }
-            if terminalCompensations.count >= 8, let oldest = terminalCompensations.keys.first { terminalCompensations.removeValue(forKey: oldest) }
-            terminalCompensations[current.id] = (mutation, requestID ?? terminalRequestID ?? UUID(), signaling)
+    private func registerTerminalCompensation(_ current: CallGeneration, mutation: CallMutation, signaling: any CallSignaling, requestID: UUID? = nil) {
+        if let retained = terminalCompensations[current.id] {
+            terminalCompensations[current.id] = TerminalCompensation(mutation: mutation, requestID: requestID ?? retained.requestID, signaling: retained.signaling)
+            return
         }
+        if terminalCompensations.count >= 8, let oldest = terminalCompensations.keys.first { terminalCompensations.removeValue(forKey: oldest) }
+        terminalCompensations[current.id] = TerminalCompensation(mutation: mutation, requestID: requestID ?? terminalRequestID ?? UUID(), signaling: signaling)
     }
 
     private func deliverTerminalCompensation(_ current: CallGeneration) async {
         guard let retained = terminalCompensations[current.id] else { return }
         for delay: UInt64 in [0, 250_000_000, 500_000_000, 1_000_000_000, 2_000_000_000] {
             if delay > 0 { do { try await Task.sleep(nanoseconds: delay) } catch { return } }
-            guard terminalCompensations[current.id]?.0 == retained.0, terminalCompensations[current.id]?.1 == retained.1 else { return }
+            guard terminalCompensations[current.id]?.mutation == retained.mutation, terminalCompensations[current.id]?.requestID == retained.requestID else { return }
             do {
-                _ = try await retained.2.mutate(retained.0, callID: current.serverCallID, requestID: retained.1)
+                _ = try await retained.signaling.mutate(retained.mutation, callID: current.serverCallID, requestID: retained.requestID)
                 terminalCompensations.removeValue(forKey: current.id)
                 return
             } catch { continue }
         }
-        recordRuntimeDiagnostic("terminal_mutation_failed", status: retained.0.rawValue, callID: current.serverCallID)
+        recordRuntimeDiagnostic("terminal_mutation_failed", status: retained.mutation.rawValue, callID: current.serverCallID)
     }
 
     private func fail(_ current: CallGeneration, _ failure: CallFailure, reportCallKit: Bool = true, reportReason: CallEndReason = .failed) async {
         guard isCurrent(current) else { return }
-        if state.isAcceptedLifecycle { enqueueTerminalMutation(current, mutation: .end) }
+        if state.isAcceptedLifecycle, let callSignaling = try? signaling(for: current) {
+            registerTerminalCompensation(current, mutation: .end, signaling: callSignaling)
+            enqueueTerminalMutation(current, mutation: .end)
+        }
         await teardownLocal(current, finalState: .failed(current.serverCallID, failure), reportReason: reportCallKit ? reportReason : nil)
     }
 
