@@ -69,17 +69,22 @@ struct WatchSystemDialerView: View {
                     .font(.caption2)
 
                 if let attempt = coordinator.latestAttempt {
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text(SystemDialClassification.displayText(for: attempt.classification))
-                            .font(.caption2.bold())
-                        Text("ID \(attempt.attemptID.uuidString.prefix(8))")
-                            .font(.system(size: 9, design: .monospaced))
+                    let summary = SystemDialUserSummary.make(from: attempt)
+                    VStack(spacing: 3) {
+                        Text(summary.title)
+                            .font(.headline)
+                            .multilineTextAlignment(.center)
+                        Text(summary.code)
+                            .font(.system(size: 10, weight: .semibold, design: .monospaced))
                             .foregroundStyle(.secondary)
-                        ForEach(Array(coordinator.recentLines.enumerated()), id: \.offset) { _, line in
-                            Text(line).font(.system(size: 9)).lineLimit(1)
+                        if let detail = summary.detail {
+                            Text(detail)
+                                .font(.system(size: 9))
+                                .foregroundStyle(.secondary)
+                                .multilineTextAlignment(.center)
                         }
                     }
-                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .frame(maxWidth: .infinity)
                 }
             }
             .padding(.horizontal, 4)

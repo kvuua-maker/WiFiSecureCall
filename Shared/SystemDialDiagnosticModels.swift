@@ -18,6 +18,13 @@ enum SystemDialClassification {
     static let noSystemCallEvidence = "NO_SYSTEM_CALL_EVIDENCE"
     static let unknownAfterTelHandoff = "UNKNOWN_AFTER_TEL_HANDOFF"
 
+    static let knownValues = [
+        preparing, ready, watchNetworkUnavailable, wcNotActivated,
+        iPhoneNeedsUnlock, iPhoneAppUnreachable, iPhoneReady,
+        telHandoffRequested, systemCallObserved, systemCallConnected,
+        systemCallEnded, noSystemCallEvidence, unknownAfterTelHandoff
+    ]
+
     static func preflight(
         networkStatus: String,
         wcSupported: Bool,
@@ -56,6 +63,63 @@ enum SystemDialClassification {
         case systemCallEnded: return "Системний дзвінок завершився"
         case noSystemCallEvidence: return "Номер передано системі, але програма не отримала підтвердження стану дзвінка"
         default: return "Збій стався після передачі керування системі; точна внутрішня причина Apple недоступна програмі"
+        }
+    }
+}
+
+struct SystemDialUserSummary: Equatable, Sendable {
+    enum Severity: Equatable, Sendable {
+        case neutral
+        case success
+        case warning
+        case failure
+    }
+
+    let code: String
+    let title: String
+    let detail: String?
+    let severity: Severity
+
+    static func make(from attempt: SystemDialAttempt) -> SystemDialUserSummary {
+        make(classification: attempt.classification)
+    }
+
+    static func make(classification: String) -> SystemDialUserSummary {
+        switch classification {
+        case SystemDialClassification.preparing:
+            return .init(code: "D22-05", title: "Перевіряю iPhone…", detail: nil, severity: .neutral)
+        case SystemDialClassification.ready, SystemDialClassification.iPhoneReady:
+            return .init(code: "D22-05", title: "iPhone відповідає", detail: nil, severity: .success)
+        case SystemDialClassification.watchNetworkUnavailable:
+            return .init(code: "D22-01", title: "На Watch немає мережі", detail: nil, severity: .failure)
+        case SystemDialClassification.wcNotActivated:
+            return .init(code: "D22-02", title: "Зв’язок з iPhone не активний", detail: nil, severity: .warning)
+        case SystemDialClassification.iPhoneNeedsUnlock:
+            return .init(code: "D22-03", title: "Розблокуй iPhone після перезапуску", detail: nil, severity: .warning)
+        case SystemDialClassification.iPhoneAppUnreachable:
+            return .init(code: "D22-04", title: "iPhone зараз недоступний", detail: nil, severity: .warning)
+        case SystemDialClassification.telHandoffRequested:
+            return .init(code: "D22-06", title: "Дзвінок передано системі", detail: nil, severity: .neutral)
+        case SystemDialClassification.systemCallObserved:
+            return .init(code: "D22-07", title: "iPhone почав системний дзвінок", detail: nil, severity: .success)
+        case SystemDialClassification.systemCallConnected:
+            return .init(code: "D22-08", title: "Дзвінок з’єднано", detail: nil, severity: .success)
+        case SystemDialClassification.systemCallEnded:
+            return .init(code: "D22-09", title: "Дзвінок завершено", detail: nil, severity: .success)
+        case SystemDialClassification.noSystemCallEvidence:
+            return .init(
+                code: "D22-10",
+                title: "Система не підтвердила дзвінок",
+                detail: "Точна внутрішня причина системи недоступна",
+                severity: .warning
+            )
+        default:
+            return .init(
+                code: "D22-10",
+                title: "Збій після передачі в Телефон",
+                detail: "Точна внутрішня причина системи недоступна",
+                severity: .warning
+            )
         }
     }
 }
@@ -157,6 +221,28 @@ struct SystemDialAttempt: Codable, Equatable, Identifiable, Sendable {
             classification: classification,
             events: []
         )
+    }
+}
+
+enum SystemDialLifecycleRecorder {
+    @discardableResult
+    static func recordFirstResign(in attempt: inout SystemDialAttempt, at timestamp: Date = Date()) -> Bool {
+        guard attempt.telHandoffRequestedAt != nil,
+              attempt.watchResignedActiveAt == nil,
+              !attempt.events.contains(where: { $0.event == "watch_resigned_active" }) else { return false }
+        attempt.watchResignedActiveAt = timestamp
+        attempt.events.append(.init(timestamp: timestamp, source: "watch", event: "watch_resigned_active", status: "observed", attemptID: attempt.attemptID))
+        return true
+    }
+
+    @discardableResult
+    static func recordFirstReturn(in attempt: inout SystemDialAttempt, at timestamp: Date = Date()) -> Bool {
+        guard attempt.telHandoffRequestedAt != nil,
+              attempt.watchReturnedActiveAt == nil,
+              !attempt.events.contains(where: { $0.event == "watch_returned_active" }) else { return false }
+        attempt.watchReturnedActiveAt = timestamp
+        attempt.events.append(.init(timestamp: timestamp, source: "watch", event: "watch_returned_active", status: "observed", attemptID: attempt.attemptID))
+        return true
     }
 }
 

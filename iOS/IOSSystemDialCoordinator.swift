@@ -271,14 +271,19 @@ struct SystemDialDiagnosticsView: View {
     var body: some View {
         NavigationView {
             List(store.attempts) { attempt in
+                let summary = SystemDialUserSummary.make(from: attempt)
                 DisclosureGroup {
-                    detail(attempt)
+                    detail(attempt, summary: summary)
                 } label: {
-                    VStack(alignment: .leading, spacing: 3) {
-                        Text(attempt.classification).font(.caption.bold())
-                        Text("\(attempt.startedAt.formatted()) · \(attempt.attemptID.uuidString.prefix(8))")
-                            .font(.caption2)
-                            .foregroundStyle(.secondary)
+                    HStack(spacing: 10) {
+                        Image(systemName: icon(for: summary.severity))
+                            .foregroundStyle(color(for: summary.severity))
+                        VStack(alignment: .leading, spacing: 3) {
+                            Text(summary.title).font(.subheadline.bold())
+                            Text("\(attempt.startedAt.formatted()) · \(summary.code) · \(attempt.attemptID.uuidString.prefix(8))")
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                        }
                     }
                 }
             }
@@ -287,18 +292,90 @@ struct SystemDialDiagnosticsView: View {
         }
     }
 
-    @ViewBuilder private func detail(_ attempt: SystemDialAttempt) -> some View {
-        Text("Watch: \(attempt.watchNetworkStatus) [\(attempt.watchNetworkInterfaces.joined(separator: ", "))]")
-        Text("WC: \(attempt.wcActivationState), reachable: \(attempt.wcReachableBeforePing ? "yes" : "no")")
-        if let snapshot = attempt.iPhoneSnapshot {
-            Text("iPhone: \(snapshot.applicationState), \(snapshot.networkStatus) [\(snapshot.networkInterfaces.joined(separator: ", "))]")
+    @ViewBuilder private func detail(_ attempt: SystemDialAttempt, summary: SystemDialUserSummary) -> some View {
+        diagnosticSection("Результат") {
+            Text(summary.title)
+            if let detail = summary.detail { Text(detail).font(.caption).foregroundStyle(.secondary) }
+            Text(attempt.classification).font(.caption2.monospaced()).foregroundStyle(.secondary)
         }
-        Text("Outgoing: \(attempt.iPhoneObservedOutgoingCallAt == nil ? "not observed" : "observed")")
-        Text("Connected: \(attempt.iPhoneObservedConnectedCallAt == nil ? "not observed" : "observed")")
-        Text("Ended: \(attempt.iPhoneObservedEndedCallAt == nil ? "not observed" : "observed")")
-        ForEach(attempt.events) { event in
-            Text("\(event.timestamp.formatted(date: .omitted, time: .standard)) \(event.source) · \(event.event) · \(event.status)")
-                .font(.caption2)
+
+        diagnosticSection("Watch") {
+            diagnosticLine("Мережа", networkText(status: attempt.watchNetworkStatus, interfaces: attempt.watchNetworkInterfaces))
+            diagnosticLine("WC активовано", yesNo(attempt.wcActivationState == "activated"))
+            diagnosticLine("iPhone доступний", yesNo(attempt.wcReachableBeforePing))
+            diagnosticLine("Потрібне розблокування", optionalYesNo(attempt.iPhoneNeedsUnlockAfterReboot))
+        }
+
+        if let snapshot = attempt.iPhoneSnapshot {
+            diagnosticSection("iPhone") {
+                diagnosticLine("Стан програми", snapshot.applicationState)
+                diagnosticLine("Мережа", networkText(status: snapshot.networkStatus, interfaces: snapshot.networkInterfaces))
+                diagnosticLine("Спарено", yesNo(snapshot.isPaired))
+                diagnosticLine("Watch app встановлено", yesNo(snapshot.isWatchAppInstalled))
+                if let ping = attempt.pingResults.last {
+                    diagnosticLine("Ping RTT", "\(Int(ping.rttMilliseconds.rounded())) ms")
+                }
+            }
+        } else {
+            diagnosticSection("iPhone") {
+                Text("Немає snapshot").font(.caption).foregroundStyle(.secondary)
+            }
+        }
+
+        diagnosticSection("Системний дзвінок") {
+            diagnosticLine("Передано в Телефон", yesNo(attempt.telHandoffRequestedAt != nil))
+            diagnosticLine("Вихідний помічено", yesNo(attempt.iPhoneObservedOutgoingCallAt != nil))
+            diagnosticLine("З’єднано", yesNo(attempt.iPhoneObservedConnectedCallAt != nil))
+            diagnosticLine("Завершено", yesNo(attempt.iPhoneObservedEndedCallAt != nil))
+        }
+
+        DisclosureGroup("Технічний журнал") {
+            ForEach(attempt.events) { event in
+                Text("\(event.timestamp.formatted(date: .omitted, time: .standard)) · \(event.source) · \(event.event) · \(event.status)")
+                    .font(.caption2.monospaced())
+                    .foregroundStyle(.secondary)
+            }
+        }
+    }
+
+    @ViewBuilder private func diagnosticSection<Content: View>(_ title: String, @ViewBuilder content: () -> Content) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text(title).font(.caption.bold())
+            content()
+        }
+    }
+
+    private func diagnosticLine(_ label: String, _ value: String) -> some View {
+        HStack { Text(label); Spacer(); Text(value).foregroundStyle(.secondary) }.font(.caption)
+    }
+
+    private func networkText(status: String, interfaces: [String]) -> String {
+        if status == "unsatisfied" || status == "requiresConnection" { return "Недоступна" }
+        if interfaces.contains("wifi") { return "Wi-Fi" }
+        if interfaces.contains("cellular") { return "Cellular" }
+        if interfaces.contains("wiredEthernet") { return "Ethernet" }
+        if interfaces.contains("other") { return "Інша" }
+        return "Невідомо"
+    }
+
+    private func yesNo(_ value: Bool) -> String { value ? "Так" : "Ні" }
+    private func optionalYesNo(_ value: Bool?) -> String { value.map(yesNo) ?? "Невідомо" }
+
+    private func icon(for severity: SystemDialUserSummary.Severity) -> String {
+        switch severity {
+        case .neutral: return "info.circle.fill"
+        case .success: return "checkmark.circle.fill"
+        case .warning: return "exclamationmark.triangle.fill"
+        case .failure: return "xmark.octagon.fill"
+        }
+    }
+
+    private func color(for severity: SystemDialUserSummary.Severity) -> Color {
+        switch severity {
+        case .neutral: return .blue
+        case .success: return .green
+        case .warning: return .yellow
+        case .failure: return .red
         }
     }
 }

@@ -137,6 +137,78 @@ final class SystemDialDiagnosticTests: XCTestCase {
         XCTAssertFalse(SystemDialPreflightPolicy.shouldRequestTelHandoff(numberIsValid: false, preflightSucceeded: false))
     }
 
+    func testEveryKnownClassificationMapsToD22CodeAndUkrainianTitle() {
+        let expected = [
+            SystemDialClassification.preparing: "D22-05",
+            SystemDialClassification.ready: "D22-05",
+            SystemDialClassification.watchNetworkUnavailable: "D22-01",
+            SystemDialClassification.wcNotActivated: "D22-02",
+            SystemDialClassification.iPhoneNeedsUnlock: "D22-03",
+            SystemDialClassification.iPhoneAppUnreachable: "D22-04",
+            SystemDialClassification.iPhoneReady: "D22-05",
+            SystemDialClassification.telHandoffRequested: "D22-06",
+            SystemDialClassification.systemCallObserved: "D22-07",
+            SystemDialClassification.systemCallConnected: "D22-08",
+            SystemDialClassification.systemCallEnded: "D22-09",
+            SystemDialClassification.noSystemCallEvidence: "D22-10",
+            SystemDialClassification.unknownAfterTelHandoff: "D22-10"
+        ]
+        XCTAssertEqual(Set(expected.keys), Set(SystemDialClassification.knownValues))
+        for classification in SystemDialClassification.knownValues {
+            let summary = SystemDialUserSummary.make(classification: classification)
+            XCTAssertEqual(summary.code, expected[classification])
+            XCTAssertFalse(summary.title.isEmpty)
+            XCTAssertNotEqual(summary.title, classification)
+        }
+    }
+
+    func testUnknownClassificationMapsToD22Ten() {
+        XCTAssertEqual(SystemDialUserSummary.make(classification: "FUTURE_UNKNOWN").code, "D22-10")
+    }
+
+    func testDuplicateResignLifecycleRecordedOnce() {
+        var attempt = handedOffAttempt()
+        XCTAssertTrue(SystemDialLifecycleRecorder.recordFirstResign(in: &attempt))
+        XCTAssertFalse(SystemDialLifecycleRecorder.recordFirstResign(in: &attempt))
+        XCTAssertEqual(attempt.events.filter { $0.event == "watch_resigned_active" }.count, 1)
+    }
+
+    func testDuplicateReturnLifecycleRecordedOnce() {
+        var attempt = handedOffAttempt()
+        XCTAssertTrue(SystemDialLifecycleRecorder.recordFirstReturn(in: &attempt))
+        XCTAssertFalse(SystemDialLifecycleRecorder.recordFirstReturn(in: &attempt))
+        XCTAssertEqual(attempt.events.filter { $0.event == "watch_returned_active" }.count, 1)
+    }
+
+    func testConnectedAndEndedSummariesAreSuccessful() {
+        XCTAssertEqual(SystemDialUserSummary.make(classification: SystemDialClassification.systemCallConnected).severity, .success)
+        XCTAssertEqual(SystemDialUserSummary.make(classification: SystemDialClassification.systemCallEnded).severity, .success)
+    }
+
+    func testIPhoneUnavailableSummaryIsWarningOrFailure() {
+        let severity = SystemDialUserSummary.make(classification: SystemDialClassification.iPhoneAppUnreachable).severity
+        XCTAssertTrue(severity == .warning || severity == .failure)
+    }
+
+    func testNoEvidenceSummaryDoesNotClaimRelayFailure() {
+        let summary = SystemDialUserSummary.make(classification: SystemDialClassification.noSystemCallEvidence)
+        let text = "\(summary.title) \(summary.detail ?? "")".lowercased()
+        XCTAssertFalse(text.contains("relay failed"))
+        XCTAssertFalse(text.contains("phone relay failed"))
+    }
+
+    func testBuild21PersistedAttemptJSONStillDecodes() throws {
+        let json = """
+        [{"attemptID":"0DAD90C0-47D5-44B5-B7C8-982B9368A950","startedAt":"2026-09-23T20:00:00Z","numberDigitCount":12,"watchNetworkStatus":"satisfied","watchNetworkInterfaces":["wifi"],"wcSupported":true,"wcActivationState":"activated","wcReachableBeforePing":true,"pingResults":[],"classification":"TEL_HANDOFF_REQUESTED","events":[]}]
+        """
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        let attempts = try decoder.decode([SystemDialAttempt].self, from: Data(json.utf8))
+        XCTAssertEqual(attempts.count, 1)
+        XCTAssertEqual(attempts[0].classification, SystemDialClassification.telHandoffRequested)
+        XCTAssertNil(attempts[0].watchReturnedActiveAt)
+    }
+
     private func classification(
         activation: String = "activated",
         reachable: Bool = true,
@@ -155,6 +227,11 @@ final class SystemDialDiagnosticTests: XCTestCase {
 
     private func makeStore() -> SystemDialDiagnosticStore { SystemDialDiagnosticStore(fileURL: temporaryStoreURL()) }
     private func temporaryStoreURL() -> URL { FileManager.default.temporaryDirectory.appendingPathComponent("system-dial-\(UUID().uuidString).json") }
+    private func handedOffAttempt() -> SystemDialAttempt {
+        var attempt = SystemDialAttempt.make(numberDigitCount: 10)
+        attempt.telHandoffRequestedAt = Date()
+        return attempt
+    }
 }
 
 private enum TestSystemDialError: Error { case timeout, transport }

@@ -128,9 +128,9 @@ final class WatchSystemDialCoordinator: NSObject, ObservableObject {
         guard let attemptID = activeAttemptID,
               let attempt = store.attempt(id: attemptID),
               attempt.telHandoffRequestedAt != nil else { return }
-        let now = Date()
-        store.update(id: attemptID) { $0.watchResignedActiveAt = now }
-        store.record(id: attemptID, source: "watch", event: "watch_resigned_active", status: "observed", at: now)
+        var recorded = false
+        store.update(id: attemptID) { recorded = SystemDialLifecycleRecorder.recordFirstResign(in: &$0) }
+        guard recorded else { return }
         publish(attemptID)
     }
 
@@ -139,10 +139,10 @@ final class WatchSystemDialCoordinator: NSObject, ObservableObject {
               resultRequestedForAttempt != attemptID,
               let attempt = store.attempt(id: attemptID),
               attempt.telHandoffRequestedAt != nil else { return }
-        let now = Date()
+        var recorded = false
+        store.update(id: attemptID) { recorded = SystemDialLifecycleRecorder.recordFirstReturn(in: &$0) }
+        guard recorded else { return }
         resultRequestedForAttempt = attemptID
-        store.update(id: attemptID) { $0.watchReturnedActiveAt = now }
-        store.record(id: attemptID, source: "watch", event: "watch_returned_active", status: "observed", at: now)
         publish(attemptID)
         Task { await fetchResult(attemptID: attemptID) }
     }
