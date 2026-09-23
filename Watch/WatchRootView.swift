@@ -28,7 +28,7 @@ struct WatchRootView: View {
         switch session.state {
         case .idle:
             VStack {
-                Button("Call iPhone") { Task { await NotificationRuntime.shared.startCall() } }
+                Button("Call iPhone") { Task { await NotificationRuntime.shared.startPreferredCall(targetPlatform: "iOS") } }
                 Button(accountStore.activeAccount == nil ? "Link account" : "Account") { showAccount = true }.font(.caption2)
             }
         case .outgoingRinging: Button("Cancel", role: .destructive) { Task { await session.cancel() } }

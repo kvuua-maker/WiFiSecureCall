@@ -72,6 +72,22 @@ actor AccountAPIClient {
         ))
     }
 
+    func devices(accountID: UUID) async throws -> [AccountDeviceSummary] {
+        try await authorized("devices", method: "GET", accountID: accountID, body: Optional<EmptyAccountRequest>.none)
+    }
+
+    func createCall(accountID: UUID, callID: UUID, requestID: UUID, targetDeviceID: UUID) async throws -> AccountCallResponse {
+        try await authorized("calls", accountID: accountID, body: AccountCallCreateRequest(requestID: requestID, callID: callID, targetDeviceID: targetDeviceID))
+    }
+
+    func call(accountID: UUID, callID: UUID) async throws -> AccountCallResponse {
+        try await authorized("calls/\(callID.uuidString.lowercased())", method: "GET", accountID: accountID, body: Optional<EmptyAccountRequest>.none)
+    }
+
+    func mutateCall(accountID: UUID, action: CallMutation, callID: UUID, requestID: UUID) async throws -> AccountCallResponse {
+        try await authorized("calls/\(callID.uuidString.lowercased())/\(action.rawValue)", accountID: accountID, body: AccountCallMutationRequest(requestID: requestID))
+    }
+
     private func authorized<T: Decodable, B: Encodable>(_ path: String, method: String = "POST", accountID: UUID, body: B?) async throws -> T {
         var tokens = try tokenStore.tokens(for: accountID) ?? { throw AccountAPIError.missingSession }()
         if tokens.accessExpiresAt <= Date() { tokens = try await refresh(accountID: accountID) }

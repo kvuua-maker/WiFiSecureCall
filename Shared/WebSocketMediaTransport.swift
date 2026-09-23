@@ -28,12 +28,12 @@ final class WebSocketMediaTransport: NSObject, MediaTransport, URLSessionWebSock
 
     init(baseURL: URL) { self.baseURL = baseURL; super.init() }
 
-    func connect(callID: UUID, role: DeviceRole, token: String) async throws -> UUID {
+    func connect(callID: UUID, peer: MediaPeerIdentity, token: String) async throws -> UUID {
         emit("media_connect_started", "started", callID: callID)
         guard var components = URLComponents(url: baseURL, resolvingAgainstBaseURL: false) else { throw CallFailure.mediaConnectionFailed }
         components.queryItems = [
             URLQueryItem(name: "callID", value: callID.uuidString.lowercased()),
-            URLQueryItem(name: "role", value: role.rawValue),
+            URLQueryItem(name: peer.queryName, value: peer.queryValue),
             URLQueryItem(name: "protocolVersion", value: "2")
         ]
         guard let url = components.url, url.scheme == "wss" else { throw CallFailure.mediaConnectionFailed }

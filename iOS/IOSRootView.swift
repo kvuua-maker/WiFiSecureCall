@@ -33,7 +33,7 @@ struct IOSRootView: View {
         switch session.state {
         case .idle:
             VStack {
-                Button("Call Watch") { Task { await NotificationRuntime.shared.startCall() } }.buttonStyle(.borderedProminent)
+                Button("Call Watch") { Task { await NotificationRuntime.shared.startPreferredCall(targetPlatform: "watchOS") } }.buttonStyle(.borderedProminent)
                 Button(accountStore.activeAccount?.phoneNumber ?? "Account") { showAccount = true }.font(.footnote)
             }
         case .outgoingRinging:

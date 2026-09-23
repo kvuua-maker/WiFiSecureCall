@@ -51,6 +51,38 @@ struct AccountDeviceRegistrationRequest: Codable, Sendable {
     let capabilities: DeviceCapabilities
 }
 
+struct AccountDeviceSummary: Codable, Equatable, Sendable, Identifiable {
+    let deviceID: UUID
+    let platform: String
+    let callReady: Bool
+    let lastSeenAt: Date
+    var id: UUID { deviceID }
+}
+
+struct AccountCallCreateRequest: Codable, Sendable {
+    let requestID: UUID
+    let callID: UUID
+    let targetDeviceID: UUID
+}
+
+struct AccountCallMutationRequest: Codable, Sendable { let requestID: UUID }
+
+struct AccountCallResponse: Codable, Equatable, Sendable {
+    let callID: UUID
+    let localSide: CallPartySide
+    let state: ServerCallState
+    let expiresAt: Date
+    let mediaToken: String?
+    let ringExpiresAt: Date?
+    let acceptedAt: Date?
+    let terminalAt: Date?
+    let terminalReason: String?
+    let deliveryStatus: String?
+    let peerReady: Bool?
+    let createdNew: Bool?
+    let mutationApplied: Bool?
+}
+
 struct AccountMeResponse: Codable, Sendable {
     let accountID: UUID
     let phoneNumber: String

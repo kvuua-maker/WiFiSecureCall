@@ -62,20 +62,28 @@ final class IOSNotificationController: NSObject, UIApplicationDelegate, UNUserNo
     private static func authorizationStatus(_ status: UNAuthorizationStatus, error: Error?) -> String { if error != nil { return "error" }; switch status { case .notDetermined: return "notDetermined"; case .denied: return "denied"; case .authorized: return "authorized"; case .provisional: return "provisional"; case .ephemeral: return "ephemeral"; @unknown default: return "unknown" } }
 
     nonisolated func userNotificationCenter(_ center: UNUserNotificationCenter, willPresent notification: UNNotification, withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void) {
-        switch ForegroundIncomingNotification.outcome(from: notification.request.content.userInfo) {
-        case let .incoming(callID):
-            Task { @MainActor in await NotificationRuntime.shared.handleIncomingAlert(callID: callID, requestAnswer: false) }
-            completionHandler([])
-        case .invalidCallID, .unrelated: completionHandler([.banner, .sound])
-        }
+        guard let envelope = ForegroundIncomingNotification.envelope(from: notification.request.content.userInfo) else { completionHandler([.banner, .sound]); return }
+        Task { @MainActor in await self.handle(envelope, voip: false, requestAnswer: false) }
+        completionHandler([])
     }
 
     nonisolated func userNotificationCenter(_ center: UNUserNotificationCenter, didReceive response: UNNotificationResponse) async {
-        guard let callID = VoIPIncomingNotification.callID(from: response.notification.request.content.userInfo) ?? ForegroundIncomingNotification.callID(from: response.notification.request.content.userInfo) else { return }
-        await NotificationRuntime.shared.handleIncomingAlert(callID: callID, requestAnswer: false)
+        guard let envelope = IncomingNotificationEnvelope.parse(response.notification.request.content.userInfo) else { return }
+        await handle(envelope, voip: false, requestAnswer: false)
         let session = await MainActor.run { NotificationRuntime.shared.callSession }
         if response.actionIdentifier == "REJECT" { await session.reject() }
         else if response.actionIdentifier == "ACCEPT" { await session.accept() }
+    }
+
+    private func handle(_ envelope: IncomingNotificationEnvelope, voip: Bool, requestAnswer: Bool) async {
+        switch envelope {
+        case let .legacy(callID):
+            if voip { await NotificationRuntime.shared.handleIncomingVoIP(callID: callID) }
+            else { await NotificationRuntime.shared.handleIncomingAlert(callID: callID, requestAnswer: requestAnswer) }
+        case let .account(callID, accountID):
+            if voip { await NotificationRuntime.shared.handleIncomingVoIP(callID: callID, accountID: accountID) }
+            else { await NotificationRuntime.shared.handleIncomingAlert(callID: callID, accountID: accountID, requestAnswer: requestAnswer) }
+        }
     }
 }
 
@@ -83,12 +91,12 @@ extension IOSNotificationController: PKPushRegistryDelegate {
     nonisolated func pushRegistry(_ registry: PKPushRegistry, didUpdate credentials: PKPushCredentials, for type: PKPushType) { guard type == .voIP else { return }; let token = credentials.token; Task { @MainActor in self.upload(token, pushType: .voip) } }
     nonisolated func pushRegistry(_ registry: PKPushRegistry, didInvalidatePushTokenFor type: PKPushType) { guard type == .voIP else { return }; Task { @MainActor in let token = self.lastVoIPToken; self.lastVoIPToken = nil; self.voipRegistrationTask?.cancel(); await NotificationRuntime.shared.api.invalidateDevice(pushType: .voip, expectedToken: token); await AccountPushRegistrationCoordinator.shared.invalidate(pushType: .voip, expectedToken: token) } }
     nonisolated func pushRegistry(_ registry: PKPushRegistry, didReceiveIncomingPushWith payload: PKPushPayload, for type: PKPushType, completion: @escaping () -> Void) {
-        guard type == .voIP, let callID = VoIPIncomingNotification.callID(from: payload.dictionaryPayload) else { completion(); return }
-        Task { @MainActor in await NotificationRuntime.shared.handleIncomingVoIP(callID: callID); completion() }
+        guard type == .voIP, let envelope = VoIPIncomingNotification.envelope(from: payload.dictionaryPayload) else { completion(); return }
+        Task { @MainActor in await self.handle(envelope, voip: true, requestAnswer: false); completion() }
     }
     @available(iOS 26.4, *)
     nonisolated func pushRegistry(_ registry: PKPushRegistry, didReceiveIncomingVoIPPushWith payload: PKPushPayload, metadata: PKVoIPPushMetadata, withCompletionHandler completion: @escaping @Sendable () -> Void) {
-        guard let callID = VoIPIncomingNotification.callID(from: payload.dictionaryPayload) else { completion(); return }
-        Task { @MainActor in await NotificationRuntime.shared.handleIncomingVoIP(callID: callID); completion() }
+        guard let envelope = VoIPIncomingNotification.envelope(from: payload.dictionaryPayload) else { completion(); return }
+        Task { @MainActor in await self.handle(envelope, voip: true, requestAnswer: false); completion() }
     }
 }

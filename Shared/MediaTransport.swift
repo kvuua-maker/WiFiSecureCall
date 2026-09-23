@@ -10,6 +10,14 @@ struct MediaTransportDiagnostic: Sendable {
 
 enum MediaDisconnectReason: String, Sendable { case remoteClosed, authFailed, protocolViolation, serverRestart, transientNetwork, sendFailed, peerUnavailable, localClose }
 
+enum MediaPeerIdentity: Equatable, Sendable {
+    case legacy(DeviceRole)
+    case account(CallPartySide)
+
+    var queryName: String { switch self { case .legacy: return "role"; case .account: return "side" } }
+    var queryValue: String { switch self { case let .legacy(role): return role.rawValue; case let .account(side): return side.rawValue } }
+}
+
 struct MediaDisconnect: Sendable {
     let callID: UUID
     let connectionID: UUID
@@ -22,7 +30,7 @@ protocol MediaTransport: AnyObject, Sendable {
     var onDisconnect: (@Sendable (MediaDisconnect) -> Void)? { get set }
     var onPeerReady: (@Sendable (UUID, UUID) -> Void)? { get set }
     var onDiagnostic: (@Sendable (MediaTransportDiagnostic) -> Void)? { get set }
-    func connect(callID: UUID, role: DeviceRole, token: String) async throws -> UUID
+    func connect(callID: UUID, peer: MediaPeerIdentity, token: String) async throws -> UUID
     func send(_ packet: AudioPacket, connectionID: UUID) async throws
     func close(connectionID: UUID?) async
 }

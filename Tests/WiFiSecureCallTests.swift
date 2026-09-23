@@ -1202,9 +1202,10 @@ private final class MediaTransportMock: MediaTransport, @unchecked Sendable {
     var onPeerReady: (@Sendable (UUID, UUID) -> Void)?
     var onDiagnostic: (@Sendable (MediaTransportDiagnostic) -> Void)?
     private(set) var connectedCallIDs: [UUID] = []
+    private(set) var connectedPeers: [MediaPeerIdentity] = []
     private(set) var sentPackets: [AudioPacket] = []
     private(set) var connectionIDs: [UUID] = []
-    func connect(callID: UUID, role: DeviceRole, token: String) async throws -> UUID { let id = UUID(); connectedCallIDs.append(callID); connectionIDs.append(id); return id }
+    func connect(callID: UUID, peer: MediaPeerIdentity, token: String) async throws -> UUID { let id = UUID(); connectedCallIDs.append(callID); connectedPeers.append(peer); connectionIDs.append(id); return id }
     func send(_ packet: AudioPacket, connectionID: UUID) async throws { sentPackets.append(packet) }
     func close(connectionID: UUID?) async {}
 }
@@ -1488,6 +1489,186 @@ final class AccountFoundationTests: XCTestCase {
         configuration.protocolClasses = [AccountURLProtocol.self]
         return URLSession(configuration: configuration)
     }
+}
+
+@MainActor
+final class AccountCallFoundationTests: XCTestCase {
+    func testMediaPeerIdentityKeepsLegacyAndAccountQueriesSeparate() {
+        XCTAssertEqual(MediaPeerIdentity.legacy(.A).queryName, "role")
+        XCTAssertEqual(MediaPeerIdentity.legacy(.B).queryValue, "B")
+        XCTAssertEqual(MediaPeerIdentity.account(.caller).queryName, "side")
+        XCTAssertEqual(MediaPeerIdentity.account(.caller).queryValue, "caller")
+        XCTAssertEqual(MediaPeerIdentity.account(.callee).queryValue, "callee")
+    }
+
+    func testLegacyAndAccountIncomingEnvelopesAreStrict() {
+        let callID = UUID(), accountID = UUID()
+        XCTAssertEqual(IncomingNotificationEnvelope.parse(["event": "incoming_call", "serverCallID": callID.uuidString]), .legacy(callID: callID))
+        XCTAssertEqual(IncomingNotificationEnvelope.parse(["event": "incoming_call_v2", "serverCallID": callID.uuidString, "accountID": accountID.uuidString]), .account(callID: callID, accountID: accountID))
+        XCTAssertNil(IncomingNotificationEnvelope.parse(["event": "incoming_call_v2", "serverCallID": callID.uuidString]))
+        XCTAssertNil(IncomingNotificationEnvelope.parse(["event": "incoming_call_v2", "serverCallID": "invalid", "accountID": accountID.uuidString]))
+        XCTAssertNil(IncomingNotificationEnvelope.parse(["event": "incoming_call_unknown", "serverCallID": callID.uuidString]))
+    }
+
+    func testAccountAPIUsesAuthenticatedV2DeviceAndCallRoutes() async throws {
+        let accountID = UUID(), deviceID = UUID(), targetID = UUID(), callID = UUID()
+        let secrets = InMemorySecureTokenStore()
+        try secrets.save(AccountTokens(accessToken: "account-access", accessExpiresAt: .distantFuture, refreshToken: "refresh", refreshExpiresAt: .distantFuture), for: accountID)
+        let requests = LockedRequests()
+        let session = accountCallTestSession { request in
+            requests.append(request)
+            XCTAssertEqual(request.value(forHTTPHeaderField: "Authorization"), "Bearer account-access")
+            if request.url!.path.hasSuffix("/devices") {
+                return (200, [AccountDeviceSummary(deviceID: targetID, platform: "watchOS", callReady: true, lastSeenAt: Date(timeIntervalSince1970: 1_700_000_000))])
+            }
+            let state: ServerCallState = request.url!.path.hasSuffix("/accept") ? .accepted : .ringing
+            return (200, self.accountCallResponse(callID: callID, side: .caller, state: state))
+        }
+        let client = AccountAPIClient(config: accountCallConfig(), tokenStore: secrets, session: session, deviceID: deviceID)
+        let devices = try await client.devices(accountID: accountID)
+        XCTAssertEqual(devices.map(\.deviceID), [targetID])
+        _ = try await client.createCall(accountID: accountID, callID: callID, requestID: UUID(), targetDeviceID: targetID)
+        _ = try await client.call(accountID: accountID, callID: callID)
+        _ = try await client.mutateCall(accountID: accountID, action: .accept, callID: callID, requestID: UUID())
+        XCTAssertTrue(requests.values.contains { $0.url?.path.hasSuffix("/v2/calls") == true })
+        XCTAssertTrue(requests.values.contains { $0.url?.path.hasSuffix("/v2/calls/\(callID.uuidString.lowercased())") == true && $0.httpMethod == "GET" })
+        XCTAssertTrue(requests.values.contains { $0.url?.path.hasSuffix("/accept") == true })
+        let create = try XCTUnwrap(requests.values.first { $0.url?.path.hasSuffix("/v2/calls") == true })
+        let body = try JSONDecoder.account.decode(AccountCallCreateRequest.self, from: try XCTUnwrap(create.httpBody))
+        XCTAssertEqual(body.targetDeviceID, targetID)
+    }
+
+    func testLegacySignalingMapsRoleBAsCallerAndCallee() async throws {
+        let callID = UUID(), capture = RequestCapture()
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [CallSessionURLProtocol.self]
+        CallSessionURLProtocol.capture = capture
+        capture.clientRole = .B
+        let legacyConfig = AppConfig(apiBaseURL: URL(string: "https://example.invalid/v1")!, mediaURL: URL(string: "wss://example.invalid/media")!, role: .B, bearerToken: String(repeating: "b", count: 64))
+        let api = APIClient(config: legacyConfig, session: URLSession(configuration: configuration))
+        let signaling = LegacyCallSignaling(api: api, role: .B)
+        let caller = try await signaling.create(callID: callID, requestID: UUID())
+        XCTAssertEqual(caller.localSide, .caller)
+        XCTAssertEqual(signaling.mediaPeerIdentity, .legacy(.B))
+
+        let incomingID = UUID()
+        let callee = try await signaling.call(incomingID)
+        XCTAssertEqual(callee.localSide, .callee)
+    }
+
+    func testAccountSignalingEnforcesExpectedLocalSideAndMediaSide() async throws {
+        let accountID = UUID(), targetID = UUID(), callID = UUID(), secrets = InMemorySecureTokenStore()
+        try secrets.save(AccountTokens(accessToken: "access", accessExpiresAt: .distantFuture, refreshToken: "refresh", refreshExpiresAt: .distantFuture), for: accountID)
+        let session = accountCallTestSession { request in
+            let side: CallPartySide = request.httpMethod == "POST" && request.url!.path.hasSuffix("/calls") ? .caller : .callee
+            return (200, self.accountCallResponse(callID: callID, side: side, state: .ringing))
+        }
+        let client = AccountAPIClient(config: accountCallConfig(), tokenStore: secrets, session: session)
+        let caller = AccountCallSignaling(client: client, accountID: accountID, targetDeviceID: targetID, localSide: .caller)
+        let callerView = try await caller.create(callID: callID, requestID: UUID())
+        XCTAssertEqual(callerView.localSide, .caller)
+        XCTAssertEqual(caller.mediaPeerIdentity, .account(.caller))
+        let callee = AccountCallSignaling(client: client, accountID: accountID, localSide: .callee)
+        let calleeView = try await callee.call(callID)
+        XCTAssertEqual(calleeView.localSide, .callee)
+        XCTAssertEqual(callee.mediaPeerIdentity, .account(.callee))
+    }
+
+    func testPreferredCallWithActiveAccountDoesNotFallBackWhenTargetMissingOrAmbiguous() async throws {
+        for devices in [
+            [AccountDeviceSummary](),
+            [AccountDeviceSummary(deviceID: UUID(), platform: "watchOS", callReady: true, lastSeenAt: Date()), AccountDeviceSummary(deviceID: UUID(), platform: "watchOS", callReady: true, lastSeenAt: Date())]
+        ] {
+            let accountID = UUID(), secrets = InMemorySecureTokenStore()
+            let defaults = try XCTUnwrap(UserDefaults(suiteName: "PreferredAccountCall.\(UUID())"))
+            let store = AccountSessionStore(tokenStore: secrets, defaults: defaults)
+            try store.add(accountSession(accountID: accountID))
+            let session = accountCallTestSession { request in
+                XCTAssertTrue(request.url!.path.hasSuffix("/v2/devices"))
+                return (200, devices)
+            }
+            let runtime = NotificationRuntime(config: accountCallConfig(), accountStore: store, accountAPI: AccountAPIClient(config: accountCallConfig(), tokenStore: secrets, session: session), audio: AudioEngineMock(), media: MediaTransportMock())
+            let adapter = RetainedCallKitMock()
+            runtime.configureCallKitFactory { adapter }
+            await runtime.startPreferredCall(targetPlatform: "watchOS")
+            XCTAssertTrue(adapter.startedIDs.isEmpty)
+            switch runtime.callSession.state {
+            case .failed(_, let failure): XCTAssertEqual(failure, devices.isEmpty ? .targetUnavailable : .targetAmbiguous)
+            default: XCTFail("unexpected state \(runtime.callSession.state)")
+            }
+        }
+    }
+
+    func testPreferredCallSelectsOnlyReadyTargetAndCreatesV2Call() async throws {
+        let accountID = UUID(), targetID = UUID(), callIDBox = LockedUUID(), secrets = InMemorySecureTokenStore()
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: "PreferredAccountCall.One.\(UUID())"))
+        let store = AccountSessionStore(tokenStore: secrets, defaults: defaults)
+        try store.add(accountSession(accountID: accountID))
+        let session = accountCallTestSession { request in
+            if request.url!.path.hasSuffix("/devices") {
+                return (200, [
+                    AccountDeviceSummary(deviceID: targetID, platform: "watchOS", callReady: true, lastSeenAt: Date()),
+                    AccountDeviceSummary(deviceID: UUID(), platform: "watchOS", callReady: false, lastSeenAt: Date()),
+                    AccountDeviceSummary(deviceID: UUID(), platform: "iOS", callReady: true, lastSeenAt: Date())
+                ])
+            }
+            let body = try JSONDecoder.account.decode(AccountCallCreateRequest.self, from: try XCTUnwrap(request.httpBody))
+            XCTAssertEqual(body.targetDeviceID, targetID)
+            callIDBox.set(body.callID)
+            return (200, self.accountCallResponse(callID: body.callID, side: .caller, state: .ringing))
+        }
+        let runtime = NotificationRuntime(config: accountCallConfig(), accountStore: store, accountAPI: AccountAPIClient(config: accountCallConfig(), tokenStore: secrets, session: session), audio: AudioEngineMock(), media: MediaTransportMock())
+        let adapter = RetainedCallKitMock()
+        runtime.configureCallKitFactory { adapter }
+        await runtime.startPreferredCall(targetPlatform: "watchOS")
+        let localID = try XCTUnwrap(adapter.startedIDs.first)
+        try await adapter.approveStart(localID)
+        for _ in 0..<100 where callIDBox.value == nil { try? await Task.sleep(nanoseconds: 10_000_000) }
+        XCTAssertNotNil(callIDBox.value)
+    }
+
+    func testIncomingV2MissingAccountIgnoredAndSignedInAccountUsesSameProvider() async throws {
+        let accountID = UUID(), callID = UUID(), secrets = InMemorySecureTokenStore()
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: "IncomingAccountCall.\(UUID())"))
+        let store = AccountSessionStore(tokenStore: secrets, defaults: defaults)
+        let session = accountCallTestSession { _ in (200, self.accountCallResponse(callID: callID, side: .callee, state: .ringing)) }
+        let runtime = NotificationRuntime(config: accountCallConfig(), accountStore: store, accountAPI: AccountAPIClient(config: accountCallConfig(), tokenStore: secrets, session: session), audio: AudioEngineMock(), media: MediaTransportMock())
+        let adapter = RetainedCallKitMock()
+        runtime.configureCallKitFactory { adapter }
+        await runtime.handleIncomingVoIP(callID: callID, accountID: accountID)
+        XCTAssertTrue(adapter.incomingIDs.isEmpty)
+        try store.add(accountSession(accountID: accountID))
+        await runtime.handleIncomingVoIP(callID: callID, accountID: accountID)
+        XCTAssertEqual(adapter.incomingIDs.count, 1)
+        XCTAssertEqual(runtime.callKitCreationCount, 1)
+        XCTAssertEqual(runtime.callSession.state.callID, callID)
+    }
+
+    private func accountCallConfig() -> AppConfig {
+        AppConfig(apiBaseURL: URL(string: "https://example.invalid/wifi-secure-call/v1")!, mediaURL: URL(string: "wss://example.invalid/media")!, role: .B, bearerToken: String(repeating: "b", count: 64))
+    }
+
+    private func accountSession(accountID: UUID) -> AccountSessionResponse {
+        AccountSessionResponse(account: AccountSummary(accountID: accountID, phoneNumber: "+380501234567"), deviceID: InstallationIdentity.shared.id, accessToken: "access-\(accountID)", accessExpiresAt: .distantFuture, refreshToken: "refresh-\(accountID)", refreshExpiresAt: .distantFuture)
+    }
+
+    private func accountCallTestSession(handler: @escaping (URLRequest) throws -> (Int, Encodable)) -> URLSession {
+        AccountURLProtocol.handler = handler
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [AccountURLProtocol.self]
+        return URLSession(configuration: configuration)
+    }
+
+    private func accountCallResponse(callID: UUID, side: CallPartySide, state: ServerCallState) -> AccountCallResponse {
+        AccountCallResponse(callID: callID, localSide: side, state: state, expiresAt: Date(timeIntervalSince1970: 2_000_000_000), mediaToken: state == .accepted ? "media" : nil, ringExpiresAt: Date(timeIntervalSince1970: 2_000_000_000), acceptedAt: state == .accepted ? Date() : nil, terminalAt: nil, terminalReason: nil, deliveryStatus: "submission_accepted", peerReady: state == .accepted, createdNew: true, mutationApplied: nil)
+    }
+}
+
+private final class LockedUUID: @unchecked Sendable {
+    private let lock = NSLock()
+    private var storage: UUID?
+    var value: UUID? { lock.withLock { storage } }
+    func set(_ value: UUID) { lock.withLock { storage = value } }
 }
 
 private final class InMemorySecureTokenStore: SecureTokenStore, @unchecked Sendable {

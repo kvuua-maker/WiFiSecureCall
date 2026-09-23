@@ -5,6 +5,8 @@ final class NotificationRuntime {
     static let shared = NotificationRuntime()
     let callSession: CallSession
     let api: APIClient
+    let accountStore: AccountSessionStore
+    let accountAPI: AccountAPIClient
     private var callKitFactory: (() -> CallKitHandling)?
     private var callKit: CallKitHandling?
     private(set) var callKitCreationCount = 0
@@ -12,11 +14,16 @@ final class NotificationRuntime {
     init(
         config: AppConfig = AppConfig.load(),
         api: APIClient? = nil,
+        accountStore: AccountSessionStore? = nil,
+        accountAPI: AccountAPIClient? = nil,
         audio: AudioEngineHandling = AudioEngine(),
         media: MediaTransport? = nil
     ) {
         let effectiveAPI = api ?? APIClient(config: config)
         self.api = effectiveAPI
+        let effectiveAccountStore = accountStore ?? .shared
+        self.accountStore = effectiveAccountStore
+        self.accountAPI = accountAPI ?? AccountAPIClient(config: config, tokenStore: effectiveAccountStore.tokenStore)
         callSession = CallSession(config: config, api: effectiveAPI, audio: audio, media: media)
     }
 
@@ -46,6 +53,26 @@ final class NotificationRuntime {
         await callSession.startCall()
     }
 
+    func startPreferredCall(targetPlatform: String) async {
+        guard let account = accountStore.activeAccount else { await startCall(); return }
+        let matches: [AccountDeviceSummary]
+        do {
+            matches = try await accountAPI.devices(accountID: account.accountID).filter {
+                $0.deviceID != InstallationIdentity.shared.id && $0.callReady && $0.platform == targetPlatform
+            }
+        } catch {
+            callSession.failToStart(.targetUnavailable)
+            return
+        }
+        guard matches.count == 1 else {
+            callSession.failToStart(matches.isEmpty ? .targetUnavailable : .targetAmbiguous)
+            return
+        }
+        _ = ensureCallKit()
+        let signaling = AccountCallSignaling(client: accountAPI, accountID: account.accountID, targetDeviceID: matches[0].deviceID, localSide: .caller)
+        await callSession.startCall(signaling: signaling)
+    }
+
     func handleIncomingVoIP(callID: UUID) async {
         callSession.recordLifecycleDiagnostic("push_received", status: "voip", callID: callID)
         guard ensureCallKit() != nil else {
@@ -53,6 +80,16 @@ final class NotificationRuntime {
             return
         }
         await callSession.handleIncomingVoIP(callID: callID)
+    }
+
+    func handleIncomingVoIP(callID: UUID, accountID: UUID) async {
+        callSession.recordLifecycleDiagnostic("push_received", status: "account", callID: callID)
+        guard let signaling = accountIncomingSignaling(accountID: accountID) else {
+            callSession.recordLifecycleDiagnostic("new_call_blocked", status: "account_missing", callID: callID)
+            return
+        }
+        guard ensureCallKit() != nil else { return }
+        await callSession.handleIncomingVoIP(callID: callID, signaling: signaling)
     }
 
     func handleIncomingBackgroundNotification(callID: UUID) async -> Bool {
@@ -84,9 +121,45 @@ final class NotificationRuntime {
         return reported
     }
 
+    func handleIncomingBackgroundNotification(callID: UUID, accountID: UUID) async -> Bool {
+        callSession.recordLifecycleDiagnostic("watch_background_notification_received", status: "account", callID: callID)
+        if let duplicate = duplicateIncomingResult(callID: callID) { return duplicate }
+        guard let signaling = accountIncomingSignaling(accountID: accountID) else { return false }
+        guard ensureCallKit() != nil else { return false }
+        callSession.recordLifecycleDiagnostic("watch_background_callkit_handoff", status: "started", callID: callID)
+        await callSession.handleIncomingVoIP(callID: callID, signaling: signaling)
+        let reported = liveStateBelongs(to: callID)
+        callSession.recordLifecycleDiagnostic("watch_background_callkit_handoff", status: reported ? "success" : "not_reported", callID: callID)
+        return reported
+    }
+
     func handleIncomingAlert(callID: UUID, requestAnswer: Bool) async {
         guard ensureCallKit() != nil else { return }
         await callSession.handleIncoming(callID: callID, requestAnswer: requestAnswer)
+    }
+
+    func handleIncomingAlert(callID: UUID, accountID: UUID, requestAnswer: Bool) async {
+        guard let signaling = accountIncomingSignaling(accountID: accountID), ensureCallKit() != nil else { return }
+        await callSession.handleIncoming(callID: callID, requestAnswer: requestAnswer, signaling: signaling)
+    }
+
+    private func accountIncomingSignaling(accountID: UUID) -> AccountCallSignaling? {
+        guard accountStore.accounts.contains(where: { $0.accountID == accountID }),
+              (try? accountStore.tokenStore.tokens(for: accountID)) != nil else { return nil }
+        return AccountCallSignaling(client: accountAPI, accountID: accountID, localSide: .callee)
+    }
+
+    private func duplicateIncomingResult(callID: UUID) -> Bool? {
+        guard callSession.state.callID == callID else { return nil }
+        callSession.recordLifecycleDiagnostic("duplicate_incoming_suppressed", status: "same_server_call_id", callID: callID)
+        return liveStateBelongs(to: callID)
+    }
+
+    private func liveStateBelongs(to callID: UUID) -> Bool {
+        switch callSession.state {
+        case let .incomingRinging(value), let .connecting(value), let .active(value), let .reconnecting(value): return value == callID
+        default: return false
+        }
     }
 }
 
@@ -115,6 +188,10 @@ enum ForegroundIncomingNotification {
         return callID
     }
 
+    static func envelope(from userInfo: [AnyHashable: Any]) -> IncomingNotificationEnvelope? {
+        IncomingNotificationEnvelope.parse(userInfo)
+    }
+
     @discardableResult
     static func dispatch(
         userInfo: [AnyHashable: Any],
@@ -134,5 +211,28 @@ enum VoIPIncomingNotification {
               let value = payload["serverCallID"] as? String
         else { return nil }
         return UUID(uuidString: value)
+    }
+
+
+    static func envelope(from payload: [AnyHashable: Any]) -> IncomingNotificationEnvelope? {
+        IncomingNotificationEnvelope.parse(payload)
+    }
+}
+
+enum IncomingNotificationEnvelope: Equatable, Sendable {
+    case legacy(callID: UUID)
+    case account(callID: UUID, accountID: UUID)
+
+    static func parse(_ payload: [AnyHashable: Any]) -> IncomingNotificationEnvelope? {
+        guard let event = payload["event"] as? String else { return nil }
+        guard let rawCallID = (payload["serverCallID"] as? String) ?? (payload["callID"] as? String),
+              let callID = UUID(uuidString: rawCallID) else { return nil }
+        if event == "incoming_call" { return .legacy(callID: callID) }
+        if event == "incoming_call_v2",
+           let rawAccountID = payload["accountID"] as? String,
+           let accountID = UUID(uuidString: rawAccountID) {
+            return .account(callID: callID, accountID: accountID)
+        }
+        return nil
     }
 }
