@@ -4,12 +4,16 @@ struct WatchRootView: View {
     @ObservedObject var session: CallSession
     @StateObject private var accountStore = AccountSessionStore.shared
     @State private var showAccount = false
+    @State private var showSystemDialer = false
     var body: some View {
         VStack(spacing: 8) {
             Text("WiFi Secure Call").font(.headline)
             Text(status).font(.caption).multilineTextAlignment(.center)
             controls
-        }.padding(4).sheet(isPresented: $showAccount) { WatchAccountLinkView(store: accountStore) }
+        }
+        .padding(4)
+        .sheet(isPresented: $showAccount) { WatchAccountLinkView(store: accountStore) }
+        .sheet(isPresented: $showSystemDialer) { WatchSystemDialerView() }
     }
     private var status: String {
         switch session.state {
@@ -30,6 +34,7 @@ struct WatchRootView: View {
             VStack {
                 Button("Call iPhone") { Task { await NotificationRuntime.shared.startPreferredCall(targetPlatform: "iOS") } }
                 Button(accountStore.activeAccount == nil ? "Link account" : "Account") { showAccount = true }.font(.caption2)
+                Button("Dial number") { showSystemDialer = true }.font(.caption2)
             }
         case .outgoingRinging: Button("Cancel", role: .destructive) { Task { await session.cancel() } }
         case .incomingRinging:

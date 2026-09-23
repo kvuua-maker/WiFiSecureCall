@@ -1,6 +1,29 @@
 import AVFoundation
 import XCTest
 
+final class WatchSystemDialerNumberTests: XCTestCase {
+    func testValidSystemDialerNumbers() {
+        XCTAssertTrue(WatchSystemDialerNumber.isValid("+380501234567"))
+        XCTAssertTrue(WatchSystemDialerNumber.isValid("380501234567"))
+        XCTAssertTrue(WatchSystemDialerNumber.isValid("0501234567"))
+    }
+
+    func testInvalidSystemDialerNumbers() {
+        for number in ["+", "12", "+380 50", "abc", "++380501234567", "1234567890123456", "380+501234567"] {
+            XCTAssertFalse(WatchSystemDialerNumber.isValid(number), number)
+        }
+    }
+
+    func testSystemDialerInputRulesAndURL() {
+        XCTAssertEqual(WatchSystemDialerNumber.appending("+", to: ""), "+")
+        XCTAssertEqual(WatchSystemDialerNumber.appending("+", to: "+"), "+")
+        XCTAssertEqual(WatchSystemDialerNumber.appending("+", to: "380"), "380")
+        XCTAssertEqual(WatchSystemDialerNumber.appending("-", to: "380"), "380")
+        XCTAssertEqual(WatchSystemDialerNumber.url(for: "+380501234567")?.absoluteString, "tel:+380501234567")
+        XCTAssertNil(WatchSystemDialerNumber.url(for: "+380 50"))
+    }
+}
+
 final class WiFiSecureCallTests: XCTestCase {
     func testLegalCallStateTransitions() {
         let id = UUID()
