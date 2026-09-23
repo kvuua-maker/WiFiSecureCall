@@ -1437,6 +1437,133 @@ final class AccountFoundationTests: XCTestCase {
         XCTAssertEqual(try secrets.tokens(for: accountID)?.refreshToken, "R1")
     }
 
+    func testStaggeredStaleRefreshSnapshotUsesNewerStoredSession() async throws {
+        let accountID = UUID(), deviceID = UUID(), secrets = InMemorySecureTokenStore()
+        try secrets.save(AccountTokens(accessToken: "A0", accessExpiresAt: .distantPast, refreshToken: "R0", refreshExpiresAt: .distantFuture), for: accountID)
+        let refreshCount = LockedCounter()
+        let entered = AsyncLatch(), release = AsyncLatch()
+        let session = accountTestSession { request in
+            if request.url!.path.hasSuffix("/auth/refresh") {
+                let body = try JSONDecoder.account.decode(AccountRefreshRequest.self, from: try XCTUnwrap(request.httpBody))
+                refreshCount.increment()
+                if refreshCount.value == 1 {
+                    XCTAssertEqual(body.refreshToken, "R0")
+                    return (200, self.accountResponse(accountID: accountID, phone: "+380501234567", access: "A1", refresh: "R1"))
+                }
+                return (200, self.accountResponse(accountID: accountID, phone: "+380501234567", access: "A2", refresh: "R2"))
+            }
+            XCTAssertEqual(request.value(forHTTPHeaderField: "Authorization"), "Bearer A1")
+            return (200, AccountMeResponse(accountID: accountID, phoneNumber: "+380501234567", deviceID: deviceID, platform: "iOS"))
+        }
+        let first = AccountAPIClient(config: accountConfig(), tokenStore: secrets, session: session, deviceID: deviceID)
+        let second = AccountAPIClient(
+            config: accountConfig(), tokenStore: secrets, session: session, deviceID: deviceID,
+            beforeRefresh: { _, _ in await entered.open(); await release.wait() }
+        )
+
+        let delayed = Task { try await second.me(accountID: accountID) }
+        await entered.wait()
+        do {
+            _ = try await first.me(accountID: accountID)
+            await release.open()
+            _ = try await delayed.value
+        } catch {
+            await release.open()
+            delayed.cancel()
+            throw error
+        }
+
+        XCTAssertEqual(refreshCount.value, 1)
+        XCTAssertEqual(try secrets.tokens(for: accountID)?.accessToken, "A1")
+        XCTAssertEqual(try secrets.tokens(for: accountID)?.refreshToken, "R1")
+    }
+
+    func testUnauthorizedRequestUsesNewerStoredSessionWithoutRefresh() async throws {
+        let accountID = UUID(), deviceID = UUID(), secrets = InMemorySecureTokenStore()
+        try secrets.save(AccountTokens(accessToken: "A0", accessExpiresAt: .distantFuture, refreshToken: "R0", refreshExpiresAt: .distantFuture), for: accountID)
+        let refreshCount = LockedCounter(), requestCount = LockedCounter()
+        let session = accountTestSession { request in
+            if request.url!.path.hasSuffix("/auth/refresh") {
+                refreshCount.increment()
+                return (500, AccountAPIErrorResponse(error: "unexpected refresh", retryAt: nil))
+            }
+            requestCount.increment()
+            if request.value(forHTTPHeaderField: "Authorization") == "Bearer A0" {
+                try secrets.save(AccountTokens(accessToken: "A1", accessExpiresAt: .distantFuture, refreshToken: "R1", refreshExpiresAt: .distantFuture), for: accountID)
+                return (401, AccountAPIErrorResponse(error: "stale access", retryAt: nil))
+            }
+            XCTAssertEqual(request.value(forHTTPHeaderField: "Authorization"), "Bearer A1")
+            return (200, AccountMeResponse(accountID: accountID, phoneNumber: "+380501234567", deviceID: deviceID, platform: "iOS"))
+        }
+        let client = AccountAPIClient(config: accountConfig(), tokenStore: secrets, session: session, deviceID: deviceID)
+
+        _ = try await client.me(accountID: accountID)
+
+        XCTAssertEqual(requestCount.value, 2)
+        XCTAssertEqual(refreshCount.value, 0)
+        XCTAssertEqual(try secrets.tokens(for: accountID)?.refreshToken, "R1")
+    }
+
+    func testNewerExpiredSessionRefreshesCurrentRefreshToken() async throws {
+        let accountID = UUID(), deviceID = UUID(), secrets = InMemorySecureTokenStore()
+        try secrets.save(AccountTokens(accessToken: "A0", accessExpiresAt: .distantPast, refreshToken: "R0", refreshExpiresAt: .distantFuture), for: accountID)
+        let refreshCount = LockedCounter()
+        let entered = AsyncLatch(), release = AsyncLatch()
+        let session = accountTestSession { request in
+            if request.url!.path.hasSuffix("/auth/refresh") {
+                let body = try JSONDecoder.account.decode(AccountRefreshRequest.self, from: try XCTUnwrap(request.httpBody))
+                XCTAssertEqual(body.refreshToken, "R1")
+                refreshCount.increment()
+                return (200, self.accountResponse(accountID: accountID, phone: "+380501234567", access: "A2", refresh: "R2"))
+            }
+            XCTAssertEqual(request.value(forHTTPHeaderField: "Authorization"), "Bearer A2")
+            return (200, AccountMeResponse(accountID: accountID, phoneNumber: "+380501234567", deviceID: deviceID, platform: "iOS"))
+        }
+        let client = AccountAPIClient(
+            config: accountConfig(), tokenStore: secrets, session: session, deviceID: deviceID,
+            beforeRefresh: { _, _ in await entered.open(); await release.wait() }
+        )
+
+        let operation = Task { try await client.me(accountID: accountID) }
+        await entered.wait()
+        try secrets.save(AccountTokens(accessToken: "A1", accessExpiresAt: .distantPast, refreshToken: "R1", refreshExpiresAt: .distantFuture), for: accountID)
+        await release.open()
+        _ = try await operation.value
+
+        XCTAssertEqual(refreshCount.value, 1)
+        XCTAssertEqual(try secrets.tokens(for: accountID)?.accessToken, "A2")
+        XCTAssertEqual(try secrets.tokens(for: accountID)?.refreshToken, "R2")
+    }
+
+    func testRepeatedUnauthorizedRecoveryIsBounded() async throws {
+        let accountID = UUID(), deviceID = UUID(), secrets = InMemorySecureTokenStore()
+        try secrets.save(AccountTokens(accessToken: "A0", accessExpiresAt: .distantFuture, refreshToken: "R0", refreshExpiresAt: .distantFuture), for: accountID)
+        let refreshCount = LockedCounter(), requestCount = LockedCounter()
+        let session = accountTestSession { request in
+            if request.url!.path.hasSuffix("/auth/refresh") {
+                let body = try JSONDecoder.account.decode(AccountRefreshRequest.self, from: try XCTUnwrap(request.httpBody))
+                refreshCount.increment()
+                switch body.refreshToken {
+                case "R0": return (200, self.accountResponse(accountID: accountID, phone: "+380501234567", access: "A1", refresh: "R1"))
+                case "R1": return (200, self.accountResponse(accountID: accountID, phone: "+380501234567", access: "A2", refresh: "R2"))
+                default: return (500, AccountAPIErrorResponse(error: "refresh storm", retryAt: nil))
+                }
+            }
+            requestCount.increment()
+            return (401, AccountAPIErrorResponse(error: "unauthorized", retryAt: nil))
+        }
+        let client = AccountAPIClient(config: accountConfig(), tokenStore: secrets, session: session, deviceID: deviceID)
+
+        do {
+            _ = try await client.me(accountID: accountID)
+            XCTFail("repeated unauthorized requests succeeded")
+        } catch AccountAPIError.status(401, _) { }
+
+        XCTAssertEqual(requestCount.value, 3)
+        XCTAssertEqual(refreshCount.value, 2)
+        XCTAssertEqual(try secrets.tokens(for: accountID)?.refreshToken, "R2")
+    }
+
     func testConditionalRefreshDeletionCannotDeleteNewerTokens() throws {
         let accountID = UUID(), secrets = InMemorySecureTokenStore()
         try secrets.save(AccountTokens(accessToken: "A0", accessExpiresAt: .distantPast, refreshToken: "R0", refreshExpiresAt: .distantFuture), for: accountID)
@@ -2167,6 +2294,27 @@ private actor RefreshConcurrencyGate {
             if arrivals.count >= 2 { continuation.resume() }
             else { waiters.append(continuation) }
         }
+    }
+}
+
+private actor AsyncLatch {
+    private var isOpen = false
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+
+    func wait() async {
+        if isOpen { return }
+        await withCheckedContinuation { continuation in
+            if isOpen { continuation.resume() }
+            else { waiters.append(continuation) }
+        }
+    }
+
+    func open() {
+        guard !isOpen else { return }
+        isOpen = true
+        let pending = waiters
+        waiters.removeAll()
+        pending.forEach { $0.resume() }
     }
 }
 

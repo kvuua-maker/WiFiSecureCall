@@ -34,12 +34,20 @@ actor AccountAPIClient {
     private let session: URLSession
     private let tokenStore: SecureTokenStore
     private let deviceID: UUID
+    private let beforeRefresh: (@Sendable (UUID, String) async -> Void)?
 
-    init(config: AppConfig, tokenStore: SecureTokenStore, session: URLSession? = nil, deviceID: UUID = InstallationIdentity.shared.id) {
+    init(
+        config: AppConfig,
+        tokenStore: SecureTokenStore,
+        session: URLSession? = nil,
+        deviceID: UUID = InstallationIdentity.shared.id,
+        beforeRefresh: (@Sendable (UUID, String) async -> Void)? = nil
+    ) {
         let root = config.apiBaseURL.deletingLastPathComponent()
         self.baseURL = root.appendingPathComponent("v2", isDirectory: true)
         self.tokenStore = tokenStore
         self.deviceID = deviceID
+        self.beforeRefresh = beforeRefresh
         if let session { self.session = session }
         else {
             let configuration = URLSessionConfiguration.ephemeral
@@ -118,23 +126,49 @@ actor AccountAPIClient {
 
     private func authorized<T: Decodable, B: Encodable>(_ path: String, method: String = "POST", accountID: UUID, body: B?) async throws -> T {
         var tokens = try tokenStore.tokens(for: accountID) ?? { throw AccountAPIError.missingSession }()
-        if tokens.accessExpiresAt <= Date() { tokens = try await refresh(accountID: accountID) }
-        do { return try await request(path, method: method, body: body, bearer: tokens.accessToken) }
-        catch AccountAPIError.status(401, _) {
-            let refreshed = try await refresh(accountID: accountID)
-            return try await request(path, method: method, body: body, bearer: refreshed.accessToken)
+        if tokens.accessExpiresAt <= Date() {
+            await beforeRefresh?(accountID, tokens.refreshToken)
+            tokens = try await refresh(accountID: accountID, expectedRefreshToken: tokens.refreshToken)
         }
+
+        for attempt in 0...2 {
+            do {
+                return try await request(path, method: method, body: body, bearer: tokens.accessToken)
+            } catch let error as AccountAPIError {
+                guard case .status(401, _) = error else { throw error }
+                guard attempt < 2 else { throw error }
+                guard let latest = try tokenStore.tokens(for: accountID) else {
+                    throw AccountAPIError.missingSession
+                }
+
+                if latest.accessToken != tokens.accessToken || latest.refreshToken != tokens.refreshToken {
+                    if latest.accessExpiresAt > Date() {
+                        tokens = latest
+                    } else {
+                        await beforeRefresh?(accountID, latest.refreshToken)
+                        tokens = try await refresh(accountID: accountID, expectedRefreshToken: latest.refreshToken)
+                    }
+                } else {
+                    await beforeRefresh?(accountID, tokens.refreshToken)
+                    tokens = try await refresh(accountID: accountID, expectedRefreshToken: tokens.refreshToken)
+                }
+            }
+        }
+        throw AccountAPIError.invalidResponse
     }
 
-    private func refresh(accountID: UUID) async throws -> AccountTokens {
+    private func refresh(accountID: UUID, expectedRefreshToken: String) async throws -> AccountTokens {
         let key = AccountRefreshCoordinator.RefreshKey(accountID: accountID, deviceID: deviceID)
         return try await AccountRefreshCoordinator.shared.refresh(key: key) { [self] in
-            try await performRefresh(accountID: accountID)
+            try await performRefresh(accountID: accountID, expectedRefreshToken: expectedRefreshToken)
         }
     }
 
-    private func performRefresh(accountID: UUID) async throws -> AccountTokens {
+    private func performRefresh(accountID: UUID, expectedRefreshToken: String) async throws -> AccountTokens {
         guard let current = try tokenStore.tokens(for: accountID) else { throw AccountAPIError.missingSession }
+        if current.refreshToken != expectedRefreshToken, current.accessExpiresAt > Date() {
+            return current
+        }
         let attemptedRefreshToken = current.refreshToken
         do {
             let response: AccountSessionResponse = try await request("auth/refresh", body: AccountRefreshRequest(refreshToken: attemptedRefreshToken, deviceID: deviceID))
