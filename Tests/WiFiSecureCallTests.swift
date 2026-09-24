@@ -1,4 +1,5 @@
 import AVFoundation
+import Intents
 import XCTest
 
 final class WatchSystemDialerNumberTests: XCTestCase {
@@ -175,11 +176,157 @@ final class SystemDialDiagnosticTests: XCTestCase {
         let parsed = try XCTUnwrap(SystemDialHandoffMessage.parse([
             "type": "systemDialHandoff",
             "attemptID": attemptID.uuidString,
-            "handoffAt": timestamp.timeIntervalSince1970
+            "handoffAt": timestamp.timeIntervalSince1970,
+            "numberDigitCount": 10
         ]))
         XCTAssertEqual(parsed.attemptID, attemptID)
         XCTAssertEqual(parsed.handoffAt, timestamp)
+        XCTAssertEqual(parsed.numberDigitCount, 10)
         XCTAssertNil(SystemDialHandoffMessage.parse(["type": "systemDialHandoff", "attemptID": "invalid", "handoffAt": 1.0]))
+    }
+
+    func testINStartCallIntentHandleExtraction() {
+        let intent = INStartCallIntent(
+            callRecordFilter: nil,
+            callRecordToCallBack: nil,
+            audioRoute: .unknown,
+            destinationType: .normal,
+            contacts: [intentPerson("+380501234567")],
+            callCapability: .audioCall
+        )
+        XCTAssertEqual(WSCDefaultCallingHandleExtractor.wscStartCallHandle(from: intent), "+380501234567")
+    }
+
+    func testLegacyAudioCallIntentHandleExtraction() {
+        let intent = INStartAudioCallIntent(destinationType: .normal, contacts: [intentPerson("0501234567")])
+        XCTAssertEqual(WSCDefaultCallingHandleExtractor.wscStartCallHandle(from: intent), "0501234567")
+    }
+
+    func testLegacyVideoCallIntentHandleExtraction() {
+        let intent = INStartVideoCallIntent(contacts: [intentPerson("380501234567")])
+        XCTAssertEqual(WSCDefaultCallingHandleExtractor.wscStartCallHandle(from: intent), "380501234567")
+    }
+
+    func testActivityWithoutInteractionCreatesSanitizedStandaloneAttempt() {
+        let store = makeStore()
+        let coordinator = makeIOSCoordinator(store: store)
+        XCTAssertFalse(coordinator.handleDefaultCallingActivity(NSUserActivity(activityType: "com.apple.calling")))
+        let attempt = store.attempts.first
+        XCTAssertEqual(store.attempts.count, 1)
+        XCTAssertEqual(attempt?.numberDigitCount, 0)
+        XCTAssertEqual(attempt?.events.last?.event, "default_call_activity_received")
+        XCTAssertEqual(attempt?.events.last?.status, "handle_missing")
+    }
+
+    func testUnsupportedIntentEvidenceStillCreatesAttempt() {
+        let store = makeStore()
+        let coordinator = makeIOSCoordinator(store: store)
+        XCTAssertFalse(coordinator.handleDefaultCallingActivityEvidence(
+            activityType: "com.apple.calling",
+            interactionPresent: true,
+            intentType: "INUnsupportedIntent",
+            handle: nil
+        ))
+        XCTAssertEqual(store.attempts.count, 1)
+        XCTAssertTrue(store.attempts[0].events[0].detail?.contains("interactionPresent=yes") == true)
+        XCTAssertTrue(store.attempts[0].events[0].detail?.contains("intentType=INUnsupportedIntent") == true)
+    }
+
+    func testValidDefaultActivityWithoutWCStartsStandaloneObservation() {
+        let store = makeStore()
+        var openedURL: URL?
+        let coordinator = makeIOSCoordinator(store: store) { url, completion in
+            openedURL = url
+            completion(true)
+        }
+        XCTAssertTrue(coordinator.handleDefaultCallingActivityEvidence(
+            activityType: "com.apple.calling",
+            interactionPresent: true,
+            intentType: "INStartCallIntent",
+            handle: "+380501234567"
+        ))
+        XCTAssertEqual(store.attempts.count, 1)
+        XCTAssertEqual(store.attempts[0].numberDigitCount, 12)
+        XCTAssertNotNil(store.attempts[0].iPhoneDefaultCallingRequestAt)
+        XCTAssertTrue(coordinator.hasActiveSystemDialObservation)
+        XCTAssertEqual(openedURL?.scheme, "telephony")
+    }
+
+    func testDefaultActivityThenWatchHandoffConvergesAndResultUsesAlias() throws {
+        let store = makeStore()
+        let coordinator = makeIOSCoordinator(store: store) { _, completion in completion(true) }
+        XCTAssertTrue(coordinator.handleDefaultCallingActivityEvidence(
+            activityType: "com.apple.calling",
+            interactionPresent: true,
+            intentType: "INStartCallIntent",
+            handle: "+380501234567"
+        ))
+        let iPhoneAttemptID = try XCTUnwrap(store.attempts.first?.attemptID)
+        let watchAttemptID = UUID()
+        coordinator.handleHandoff(handoffMessage(id: watchAttemptID, digitCount: 12))
+        XCTAssertEqual(store.attempts.count, 1)
+        XCTAssertEqual(store.attempts.first?.attemptID, iPhoneAttemptID)
+        XCTAssertNotNil(store.attempts.first?.telHandoffRequestedAt)
+
+        let nonce = UUID()
+        let reply = coordinator.handleResult([
+            "type": "systemDialResult",
+            "attemptID": watchAttemptID.uuidString,
+            "nonce": nonce.uuidString,
+            "numberDigitCount": 12
+        ])
+        XCTAssertNotNil(reply["attemptJSON"] as? Data)
+        XCTAssertEqual(reply["attemptID"] as? String, watchAttemptID.uuidString)
+    }
+
+    func testWatchHandoffThenDefaultActivityConvergesOnWatchAttempt() {
+        let store = makeStore()
+        let coordinator = makeIOSCoordinator(store: store) { _, completion in completion(true) }
+        let watchAttemptID = UUID()
+        coordinator.handleHandoff(handoffMessage(id: watchAttemptID, digitCount: 12))
+        XCTAssertTrue(coordinator.handleDefaultCallingActivityEvidence(
+            activityType: "com.apple.calling",
+            interactionPresent: true,
+            intentType: "INStartCallIntent",
+            handle: "+380501234567"
+        ))
+        XCTAssertEqual(store.attempts.count, 1)
+        XCTAssertEqual(store.attempts.first?.attemptID, watchAttemptID)
+        XCTAssertNotNil(store.attempts.first?.iPhoneDefaultCallingRequestAt)
+    }
+
+    func testAttemptCorrelationRequiresBoundedWindowAndDigitCount() {
+        let resolver = SystemDialAttemptAliasResolver(correlationWindow: 5, aliasLifetime: 10)
+        let startedAt = Date(timeIntervalSince1970: 100)
+        let standaloneID = UUID()
+        resolver.registerStandalone(attemptID: standaloneID, startedAt: startedAt, numberDigitCount: 12)
+        XCTAssertNil(resolver.correlate(watchAttemptID: UUID(), at: startedAt.addingTimeInterval(1), numberDigitCount: 10))
+        XCTAssertNil(resolver.correlate(watchAttemptID: UUID(), at: startedAt.addingTimeInterval(6), numberDigitCount: 12))
+    }
+
+    func testExpiredAttemptAliasIsNotReused() {
+        let resolver = SystemDialAttemptAliasResolver(correlationWindow: 5, aliasLifetime: 2)
+        let now = Date(timeIntervalSince1970: 100)
+        let standaloneID = UUID(), watchID = UUID()
+        resolver.registerStandalone(attemptID: standaloneID, startedAt: now, numberDigitCount: 12)
+        XCTAssertEqual(resolver.correlate(watchAttemptID: watchID, at: now, numberDigitCount: 12), standaloneID)
+        XCTAssertNil(resolver.resolve(watchAttemptID: watchID, now: now.addingTimeInterval(3)))
+    }
+
+    func testDefaultCallDiagnosticsPersistNoRawHandle() async throws {
+        let url = temporaryStoreURL()
+        let store = SystemDialDiagnosticStore(fileURL: url)
+        let coordinator = makeIOSCoordinator(store: store) { _, completion in completion(true) }
+        XCTAssertTrue(coordinator.handleDefaultCallingActivityEvidence(
+            activityType: "com.apple.calling",
+            interactionPresent: true,
+            intentType: "INStartCallIntent",
+            handle: "+380501234567"
+        ))
+        await store.flush()
+        let persisted = String(decoding: try Data(contentsOf: url), as: UTF8.self)
+        XCTAssertFalse(persisted.contains("+380501234567"))
+        XCTAssertTrue(persisted.contains("numberDigitCount"))
     }
 
     func testSecondDialCannotOverlapFirstPreflight() {
@@ -374,6 +521,33 @@ final class SystemDialDiagnosticTests: XCTestCase {
         var attempt = SystemDialAttempt.make(numberDigitCount: 10)
         attempt.telHandoffRequestedAt = Date()
         return attempt
+    }
+
+    private func intentPerson(_ handle: String) -> INPerson {
+        INPerson(
+            personHandle: INPersonHandle(value: handle, type: .phoneNumber),
+            nameComponents: nil,
+            displayName: nil,
+            image: nil,
+            contactIdentifier: nil,
+            customIdentifier: nil
+        )
+    }
+
+    private func makeIOSCoordinator(
+        store: SystemDialDiagnosticStore,
+        opener: @escaping IOSSystemDialCoordinator.URLOpener = { _, completion in completion(true) }
+    ) -> IOSSystemDialCoordinator {
+        IOSSystemDialCoordinator(session: nil, store: store, network: SystemDialNetworkMonitor(), urlOpener: opener)
+    }
+
+    private func handoffMessage(id: UUID, digitCount: Int) -> [String: Any] {
+        [
+            "type": "systemDialHandoff",
+            "attemptID": id.uuidString,
+            "handoffAt": Date().timeIntervalSince1970,
+            "numberDigitCount": digitCount
+        ]
     }
 }
 

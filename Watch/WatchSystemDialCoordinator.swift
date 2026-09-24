@@ -122,7 +122,8 @@ final class WatchSystemDialCoordinator: NSObject, ObservableObject {
             currentSession.sendMessage([
                 "type": "systemDialHandoff",
                 "attemptID": attemptID.uuidString,
-                "handoffAt": handoffAt.timeIntervalSince1970
+                "handoffAt": handoffAt.timeIntervalSince1970,
+                "numberDigitCount": attempt.numberDigitCount
             ], replyHandler: nil, errorHandler: nil)
         }
         WKApplication.shared().openSystemURL(url)
@@ -215,7 +216,8 @@ final class WatchSystemDialCoordinator: NSObject, ObservableObject {
         let message: [String: Any] = [
             "type": "systemDialResult",
             "attemptID": attemptID.uuidString,
-            "nonce": nonce.uuidString
+            "nonce": nonce.uuidString,
+            "numberDigitCount": store.attempt(id: attemptID)?.numberDigitCount ?? 0
         ]
         let response: Result<[String: Any], Error> = await withCheckedContinuation { continuation in
             let gate = SystemDialOneShotCompletion<[String: Any]> { continuation.resume(returning: $0) }

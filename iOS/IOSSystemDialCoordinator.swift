@@ -7,13 +7,17 @@ import WatchConnectivity
 
 @MainActor
 final class IOSSystemDialCoordinator: NSObject {
+    typealias URLOpener = @MainActor (URL, @escaping @MainActor @Sendable (Bool) -> Void) -> Void
+
     static let shared = IOSSystemDialCoordinator()
 
     private let session: WCSession?
     private let store: SystemDialDiagnosticStore
     private let network: SystemDialNetworkMonitor
+    private let urlOpener: URLOpener
     private let callObserver = CXCallObserver()
     private let defaultCallAdmission = SystemDialDefaultCallAdmissionGate()
+    private let attemptAliases = SystemDialAttemptAliasResolver()
     private var observation: Observation?
     private var observationTimeout: Task<Void, Never>?
 
@@ -33,10 +37,18 @@ final class IOSSystemDialCoordinator: NSObject {
         )
     }
 
-    init(session: WCSession?, store: SystemDialDiagnosticStore, network: SystemDialNetworkMonitor) {
+    init(
+        session: WCSession?,
+        store: SystemDialDiagnosticStore,
+        network: SystemDialNetworkMonitor,
+        urlOpener: @escaping URLOpener = { url, completion in
+            UIApplication.shared.open(url, options: [:], completionHandler: completion)
+        }
+    ) {
         self.session = session
         self.store = store
         self.network = network
+        self.urlOpener = urlOpener
         super.init()
         callObserver.setDelegate(self, queue: .main)
     }
@@ -50,71 +62,154 @@ final class IOSSystemDialCoordinator: NSObject {
 
     @discardableResult
     func handleDefaultCallingActivity(_ userActivity: NSUserActivity) -> Bool {
-        guard let handle = Self.startCallHandle(from: userActivity) else { return false }
+        let interaction = userActivity.interaction
+        let handle = WSCDefaultCallingHandleExtractor.wscStartCallHandle(from: userActivity)
+        return handleDefaultCallingActivityEvidence(
+            activityType: userActivity.activityType,
+            interactionPresent: interaction != nil,
+            intentType: interaction.map { String(reflecting: type(of: $0.intent)) } ?? "none",
+            handle: handle
+        )
+    }
+
+    @discardableResult
+    func handleDefaultCallingActivityEvidence(
+        activityType: String,
+        interactionPresent: Bool,
+        intentType: String,
+        handle: String?,
+        requestAt: Date = Date()
+    ) -> Bool {
+        let digitCount = handle?.filter(\.isNumber).count ?? 0
+        let attemptID = ensureDefaultActivityAttempt(at: requestAt, numberDigitCount: digitCount)
+        let evidence = SystemDialDefaultActivityEvidence(
+            activityType: activityType,
+            interactionPresent: interactionPresent,
+            intentType: intentType,
+            handleExtracted: handle != nil
+        )
+        store.record(
+            id: attemptID,
+            source: "iPhone",
+            event: "default_call_activity_received",
+            status: handle == nil ? "handle_missing" : "received",
+            detail: evidence.sanitizedDetail,
+            at: requestAt
+        )
+
+        guard let handle else { return false }
+        store.updateAndRecord(
+            id: attemptID,
+            source: "iPhone",
+            event: "default_call_handle_extracted",
+            status: "extracted",
+            detail: "digitCount=\(digitCount)",
+            at: requestAt
+        ) {
+            $0.iPhoneDefaultCallingRequestAt = requestAt
+        }
+        startObservationIfNeeded(attemptID: attemptID, startedAt: requestAt)
+
         let fingerprint = handle.hashValue
         guard defaultCallAdmission.admit(fingerprint: fingerprint) else { return true }
 
-        let requestAt = Date()
-        let attemptID = activeDiagnosticAttemptID(at: requestAt)
-        if let attemptID {
-            store.updateAndRecord(
-                id: attemptID,
-                source: "iPhone",
-                event: "default_call_request_received",
-                status: "received",
-                detail: "digitCount=\(handle.filter(\.isNumber).count)",
-                at: requestAt
-            ) {
-                $0.iPhoneDefaultCallingRequestAt = requestAt
-            }
-        }
-
         guard let url = SystemDialTelephonyURL.make(handle: handle) else {
-            if let attemptID {
-                store.record(id: attemptID, source: "iPhone", event: "telephony_fallback", status: "invalid_handle")
-            }
+            store.record(id: attemptID, source: "iPhone", event: "telephony_fallback", status: "invalid_handle")
             return false
         }
 
         let fallbackAt = Date()
-        if let attemptID {
-            store.updateAndRecord(id: attemptID, source: "iPhone", event: "telephony_fallback_requested", status: "requested", at: fallbackAt) {
-                $0.iPhoneTelephonyFallbackRequestedAt = fallbackAt
-            }
+        store.updateAndRecord(id: attemptID, source: "iPhone", event: "telephony_fallback_requested", status: "requested", at: fallbackAt) {
+            $0.iPhoneTelephonyFallbackRequestedAt = fallbackAt
         }
-        UIApplication.shared.open(url, options: [:]) { [weak self] accepted in
-            Task { @MainActor in
-                guard let self, let attemptID else { return }
-                let completedAt = Date()
-                self.store.updateAndRecord(
-                    id: attemptID,
-                    source: "iPhone",
-                    event: "telephony_fallback_open_completed",
-                    status: accepted ? "accepted" : "rejected",
-                    at: completedAt
-                ) {
-                    $0.iPhoneTelephonyFallbackOpenCompletedAt = completedAt
-                    $0.iPhoneTelephonyFallbackOpenAccepted = accepted
-                }
+        urlOpener(url) { [weak self] accepted in
+            guard let self else { return }
+            let completedAt = Date()
+            self.store.updateAndRecord(
+                id: attemptID,
+                source: "iPhone",
+                event: "telephony_fallback_open_completed",
+                status: accepted ? "accepted" : "rejected",
+                at: completedAt
+            ) {
+                $0.iPhoneTelephonyFallbackOpenCompletedAt = completedAt
+                $0.iPhoneTelephonyFallbackOpenAccepted = accepted
             }
         }
         return true
     }
 
-    private func activeDiagnosticAttemptID(at now: Date) -> UUID? {
+    var hasActiveSystemDialObservation: Bool { observation != nil }
+
+    private func activeDiagnosticAttemptID(at now: Date, numberDigitCount: Int) -> UUID? {
         if let observation, now.timeIntervalSince(observation.startedAt) <= 30 {
             return observation.attemptID
         }
         return store.attempts.first {
-            $0.finishedAt == nil && now.timeIntervalSince($0.startedAt) <= 30
+            $0.finishedAt == nil
+                && abs(now.timeIntervalSince($0.startedAt)) <= 30
+                && (numberDigitCount == 0 || $0.numberDigitCount == 0 || $0.numberDigitCount == numberDigitCount)
         }?.attemptID
     }
 
-    private static func startCallHandle(from userActivity: NSUserActivity) -> String? {
-        guard let intent = userActivity.interaction?.intent as? INStartCallIntent else { return nil }
-        return intent.contacts?
-            .compactMap { $0.personHandle?.value }
-            .first { !$0.isEmpty }
+    private func ensureDefaultActivityAttempt(at timestamp: Date, numberDigitCount: Int) -> UUID {
+        if let existing = activeDiagnosticAttemptID(at: timestamp, numberDigitCount: numberDigitCount) {
+            return existing
+        }
+        let attemptID = UUID()
+        var attempt = SystemDialAttempt.make(
+            attemptID: attemptID,
+            startedAt: timestamp,
+            numberDigitCount: numberDigitCount,
+            network: .unknown,
+            wcSupported: session != nil,
+            wcActivationState: session.map(Self.activationState) ?? "unsupported",
+            wcReachableBeforePing: session?.isReachable ?? false,
+            classification: SystemDialClassification.unknownAfterTelHandoff
+        )
+        attempt.iPhoneSnapshot = currentIPhoneSnapshot(at: timestamp)
+        store.upsert(attempt)
+        attemptAliases.registerStandalone(
+            attemptID: attemptID,
+            startedAt: timestamp,
+            numberDigitCount: numberDigitCount
+        )
+        return attemptID
+    }
+
+    private func currentIPhoneSnapshot(at timestamp: Date) -> SystemDialIPhoneSnapshot {
+        let currentNetwork = network.current
+        return .init(
+            receivedAt: timestamp,
+            repliedAt: timestamp,
+            applicationState: Self.applicationState(UIApplication.shared.applicationState),
+            wcActivationState: session.map(Self.activationState) ?? "unsupported",
+            isPaired: session?.isPaired ?? false,
+            isWatchAppInstalled: session?.isWatchAppInstalled ?? false,
+            networkStatus: currentNetwork.status,
+            networkInterfaces: currentNetwork.interfaces
+        )
+    }
+
+    private func effectiveAttemptID(
+        for watchAttemptID: UUID,
+        receivedAt: Date,
+        numberDigitCount: Int
+    ) -> UUID? {
+        if store.attempt(id: watchAttemptID) != nil { return watchAttemptID }
+        if let aliased = attemptAliases.resolve(watchAttemptID: watchAttemptID, now: receivedAt),
+           store.attempt(id: aliased) != nil {
+            return aliased
+        }
+        if let correlated = attemptAliases.correlate(
+            watchAttemptID: watchAttemptID,
+            at: receivedAt,
+            numberDigitCount: numberDigitCount,
+            now: receivedAt
+        ), store.attempt(id: correlated) != nil {
+            return correlated
+        }
+        return nil
     }
 
     private func handlePrepare(_ message: [String: Any]) -> [String: Any] {
@@ -126,27 +221,22 @@ final class IOSSystemDialCoordinator: NSObject {
             return ["type": "prepareSystemDialReply", "status": "invalid"]
         }
 
-        let currentNetwork = network.current
-        let currentSession = session
-        let snapshot = SystemDialIPhoneSnapshot(
+        let snapshot = currentIPhoneSnapshot(at: receivedAt)
+        let numberDigitCount = message["numberDigitCount"] as? Int ?? 0
+        let effectiveID = effectiveAttemptID(
+            for: attemptID,
             receivedAt: receivedAt,
-            repliedAt: Date(),
-            applicationState: Self.applicationState(UIApplication.shared.applicationState),
-            wcActivationState: currentSession.map(Self.activationState) ?? "unsupported",
-            isPaired: currentSession?.isPaired ?? false,
-            isWatchAppInstalled: currentSession?.isWatchAppInstalled ?? false,
-            networkStatus: currentNetwork.status,
-            networkInterfaces: currentNetwork.interfaces
-        )
-        if store.attempt(id: attemptID) == nil {
+            numberDigitCount: numberDigitCount
+        ) ?? attemptID
+        if store.attempt(id: effectiveID) == nil {
             let watchNetwork = SystemDialNetworkSnapshot(
                 status: message["watchNetworkStatus"] as? String ?? "unknown",
                 interfaces: message["watchNetworkInterfaces"] as? [String] ?? []
             )
             var attempt = SystemDialAttempt.make(
-                attemptID: attemptID,
+                attemptID: effectiveID,
                 startedAt: receivedAt,
-                numberDigitCount: message["numberDigitCount"] as? Int ?? 0,
+                numberDigitCount: numberDigitCount,
                 network: watchNetwork,
                 wcSupported: true,
                 wcActivationState: message["wcActivationState"] as? String ?? "unknown",
@@ -155,18 +245,23 @@ final class IOSSystemDialCoordinator: NSObject {
                 classification: SystemDialClassification.iPhoneReady
             )
             attempt.iPhoneSnapshot = snapshot
-            attempt.events.append(.init(timestamp: receivedAt, source: "iPhone", event: "prepare_received", status: "replying", attemptID: attemptID))
+            attempt.events.append(.init(timestamp: receivedAt, source: "iPhone", event: "prepare_received", status: "replying", attemptID: effectiveID))
             store.upsert(attempt)
         } else {
-            store.updateAndRecord(id: attemptID, source: "iPhone", event: "prepare_received", status: "replying", at: receivedAt) {
+            store.updateAndRecord(id: effectiveID, source: "iPhone", event: "prepare_received", status: "replying", at: receivedAt) {
                 $0.iPhoneSnapshot = snapshot
-                $0.classification = SystemDialClassification.iPhoneReady
+                if $0.iPhoneDefaultCallingRequestAt == nil {
+                    $0.classification = SystemDialClassification.iPhoneReady
+                }
             }
         }
-        startObservationIfNeeded(attemptID: attemptID, startedAt: receivedAt)
+        if effectiveID != attemptID {
+            attemptAliases.bind(watchAttemptID: attemptID, to: effectiveID, now: receivedAt)
+        }
+        startObservationIfNeeded(attemptID: effectiveID, startedAt: receivedAt)
 
         let repliedAt = Date()
-        store.update(id: attemptID) {
+        store.update(id: effectiveID) {
             $0.iPhoneSnapshot = .init(
                 receivedAt: receivedAt,
                 repliedAt: repliedAt,
@@ -193,7 +288,7 @@ final class IOSSystemDialCoordinator: NSObject {
         ]
     }
 
-    private func handleResult(_ message: [String: Any]) -> [String: Any] {
+    func handleResult(_ message: [String: Any]) -> [String: Any] {
         guard let attemptString = message["attemptID"] as? String,
               let attemptID = UUID(uuidString: attemptString),
               let nonce = message["nonce"] as? String else {
@@ -204,17 +299,45 @@ final class IOSSystemDialCoordinator: NSObject {
             "attemptID": attemptID.uuidString,
             "nonce": nonce
         ]
-        if let attempt = store.attempt(id: attemptID), let data = try? Self.encoder.encode(attempt) {
+        let numberDigitCount = message["numberDigitCount"] as? Int ?? 0
+        let effectiveID = effectiveAttemptID(
+            for: attemptID,
+            receivedAt: Date(),
+            numberDigitCount: numberDigitCount
+        ) ?? attemptID
+        if let attempt = store.attempt(id: effectiveID), let data = try? Self.encoder.encode(attempt) {
             reply["attemptJSON"] = data
         }
         return reply
     }
 
-    private func handleHandoff(_ message: [String: Any]) {
-        guard let handoff = SystemDialHandoffMessage.parse(message),
-              store.attempt(id: handoff.attemptID) != nil else { return }
+    func handleHandoff(_ message: [String: Any]) {
+        guard let handoff = SystemDialHandoffMessage.parse(message) else { return }
+        let receivedAt = Date()
+        let effectiveID = effectiveAttemptID(
+            for: handoff.attemptID,
+            receivedAt: receivedAt,
+            numberDigitCount: handoff.numberDigitCount
+        ) ?? handoff.attemptID
+        if store.attempt(id: effectiveID) == nil {
+            var attempt = SystemDialAttempt.make(
+                attemptID: effectiveID,
+                startedAt: handoff.handoffAt,
+                numberDigitCount: handoff.numberDigitCount,
+                network: .unknown,
+                wcSupported: session != nil,
+                wcActivationState: session.map(Self.activationState) ?? "unsupported",
+                wcReachableBeforePing: session?.isReachable ?? false,
+                classification: SystemDialClassification.telHandoffRequested
+            )
+            attempt.iPhoneSnapshot = currentIPhoneSnapshot(at: receivedAt)
+            store.upsert(attempt)
+        }
+        if effectiveID != handoff.attemptID {
+            attemptAliases.bind(watchAttemptID: handoff.attemptID, to: effectiveID, now: receivedAt)
+        }
         store.updateAndRecord(
-            id: handoff.attemptID,
+            id: effectiveID,
             source: "iPhone",
             event: "tel_handoff_received",
             status: "observed",
@@ -222,6 +345,7 @@ final class IOSSystemDialCoordinator: NSObject {
         ) {
             if $0.telHandoffRequestedAt == nil { $0.telHandoffRequestedAt = handoff.handoffAt }
         }
+        startObservationIfNeeded(attemptID: effectiveID, startedAt: receivedAt)
     }
 
     private func startObservationIfNeeded(attemptID: UUID, startedAt: Date) {
@@ -325,6 +449,29 @@ final class IOSSystemDialCoordinator: NSObject {
         case .background: return "background"
         @unknown default: return "unknown"
         }
+    }
+}
+
+enum WSCDefaultCallingHandleExtractor {
+    static func wscStartCallHandle(from userActivity: NSUserActivity) -> String? {
+        wscStartCallHandle(from: userActivity.interaction?.intent)
+    }
+
+    static func wscStartCallHandle(from intent: INIntent?) -> String? {
+        let contacts: [INPerson]?
+        switch intent {
+        case let value as INStartCallIntent:
+            contacts = value.contacts
+        case let value as INStartAudioCallIntent:
+            contacts = value.contacts
+        case let value as INStartVideoCallIntent:
+            contacts = value.contacts
+        default:
+            return nil
+        }
+        return contacts?
+            .compactMap { $0.personHandle?.value }
+            .first { !$0.isEmpty }
     }
 }
 

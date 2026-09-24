@@ -468,6 +468,7 @@ enum SystemDialMessageValidator {
 struct SystemDialHandoffMessage: Equatable, Sendable {
     let attemptID: UUID
     let handoffAt: Date
+    let numberDigitCount: Int
 
     static func parse(_ message: [String: Any]) -> SystemDialHandoffMessage? {
         guard message["type"] as? String == "systemDialHandoff",
@@ -475,7 +476,116 @@ struct SystemDialHandoffMessage: Equatable, Sendable {
               let attemptID = UUID(uuidString: attemptString),
               let interval = message["handoffAt"] as? TimeInterval,
               interval.isFinite, interval > 0 else { return nil }
-        return .init(attemptID: attemptID, handoffAt: Date(timeIntervalSince1970: interval))
+        let digitCount = message["numberDigitCount"] as? Int ?? 0
+        guard (0...20).contains(digitCount) else { return nil }
+        return .init(attemptID: attemptID, handoffAt: Date(timeIntervalSince1970: interval), numberDigitCount: digitCount)
+    }
+}
+
+struct SystemDialDefaultActivityEvidence: Equatable, Sendable {
+    let activityType: String
+    let interactionPresent: Bool
+    let intentType: String
+    let handleExtracted: Bool
+
+    var sanitizedDetail: String {
+        "activityType=\(Self.sanitize(activityType)) interactionPresent=\(interactionPresent ? "yes" : "no") intentType=\(Self.sanitize(intentType)) handleExtracted=\(handleExtracted ? "yes" : "no")"
+    }
+
+    private static func sanitize(_ value: String) -> String {
+        let allowed = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "._-"))
+        let scalars = value.unicodeScalars.filter { allowed.contains($0) }
+        let sanitized = String(String.UnicodeScalarView(scalars))
+        return String((sanitized.isEmpty ? "none" : sanitized).prefix(120))
+    }
+}
+
+final class SystemDialAttemptAliasResolver: @unchecked Sendable {
+    private struct Alias {
+        let iPhoneAttemptID: UUID
+        let expiresAt: Date
+    }
+
+    private struct Standalone {
+        let attemptID: UUID
+        let startedAt: Date
+        let numberDigitCount: Int
+    }
+
+    private let lock = NSLock()
+    private let correlationWindow: TimeInterval
+    private let aliasLifetime: TimeInterval
+    private var aliases: [UUID: Alias] = [:]
+    private var standaloneAttempts: [UUID: Standalone] = [:]
+
+    init(correlationWindow: TimeInterval = 30, aliasLifetime: TimeInterval = 300) {
+        self.correlationWindow = correlationWindow
+        self.aliasLifetime = aliasLifetime
+    }
+
+    func registerStandalone(attemptID: UUID, startedAt: Date, numberDigitCount: Int, now: Date? = nil) {
+        lock.withLock {
+            purge(now: now ?? startedAt)
+            standaloneAttempts[attemptID] = .init(
+                attemptID: attemptID,
+                startedAt: startedAt,
+                numberDigitCount: numberDigitCount
+            )
+        }
+    }
+
+    func resolve(watchAttemptID: UUID, now: Date = Date()) -> UUID? {
+        lock.withLock {
+            purge(now: now)
+            return aliases[watchAttemptID]?.iPhoneAttemptID
+        }
+    }
+
+    func correlate(
+        watchAttemptID: UUID,
+        at timestamp: Date,
+        numberDigitCount: Int,
+        now: Date? = nil
+    ) -> UUID? {
+        lock.withLock {
+            let reference = now ?? timestamp
+            purge(now: reference)
+            if let existing = aliases[watchAttemptID] { return existing.iPhoneAttemptID }
+            let match = standaloneAttempts.values
+                .filter { candidate in
+                    abs(timestamp.timeIntervalSince(candidate.startedAt)) <= correlationWindow
+                        && (numberDigitCount == 0
+                            || candidate.numberDigitCount == 0
+                            || candidate.numberDigitCount == numberDigitCount)
+                }
+                .sorted { $0.startedAt > $1.startedAt }
+                .first
+            guard let match else { return nil }
+            aliases[watchAttemptID] = .init(
+                iPhoneAttemptID: match.attemptID,
+                expiresAt: reference.addingTimeInterval(aliasLifetime)
+            )
+            standaloneAttempts.removeValue(forKey: match.attemptID)
+            return match.attemptID
+        }
+    }
+
+    func bind(watchAttemptID: UUID, to iPhoneAttemptID: UUID, now: Date = Date()) {
+        lock.withLock {
+            purge(now: now)
+            aliases[watchAttemptID] = .init(
+                iPhoneAttemptID: iPhoneAttemptID,
+                expiresAt: now.addingTimeInterval(aliasLifetime)
+            )
+            standaloneAttempts.removeValue(forKey: iPhoneAttemptID)
+        }
+    }
+
+    private func purge(now: Date) {
+        aliases = aliases.filter { $0.value.expiresAt > now }
+        standaloneAttempts = standaloneAttempts.filter {
+            abs(now.timeIntervalSince($0.value.startedAt)) <= correlationWindow
+        }
     }
 }
 
