@@ -25,6 +25,59 @@ final class WatchSystemDialerNumberTests: XCTestCase {
     }
 }
 
+final class CellularAudioGatewayVerdictTests: XCTestCase {
+    func testDefaultsNeverClaimGatewayPass() {
+        let verdict = CellularAudioGatewayVerdict()
+        XCTAssertFalse(verdict.cellularCallConnected)
+        XCTAssertFalse(verdict.uplinkStrongEvidence)
+        XCTAssertFalse(verdict.downlinkDigitalStreamProven)
+        XCTAssertFalse(verdict.fullGatewayPass)
+    }
+
+    func testRemoteHeardToneWithoutMutedCellularMicrophoneIsNotStrongEvidence() {
+        let verdict = CellularAudioGatewayVerdict(
+            cellularCallConnected: true,
+            userConfirmedCellularMicMuted: false,
+            uplinkToneWasRun: true,
+            remoteHeardTone: true,
+            downlinkDigitalStreamProven: false
+        )
+        XCTAssertFalse(verdict.uplinkStrongEvidence)
+        XCTAssertFalse(verdict.fullGatewayPass)
+    }
+
+    func testMutedConnectedToneCanOnlyProduceStrongUplinkEvidence() {
+        let verdict = CellularAudioGatewayVerdict(
+            cellularCallConnected: true,
+            userConfirmedCellularMicMuted: true,
+            uplinkToneWasRun: true,
+            remoteHeardTone: true,
+            downlinkDigitalStreamProven: false
+        )
+        XCTAssertTrue(verdict.uplinkStrongEvidence)
+        XCTAssertFalse(verdict.fullGatewayPass)
+    }
+
+    func testMicrophoneObservationCannotProveDownlink() {
+        var verdict = CellularAudioGatewayVerdict()
+        verdict.cellularCallConnected = true
+        XCTAssertFalse(verdict.downlinkDigitalStreamProven)
+        XCTAssertFalse(verdict.fullGatewayPass)
+    }
+
+    func testFullPassRequiresAllThreeIndependentVerdicts() {
+        let verdict = CellularAudioGatewayVerdict(
+            cellularCallConnected: true,
+            userConfirmedCellularMicMuted: true,
+            uplinkToneWasRun: true,
+            remoteHeardTone: true,
+            downlinkDigitalStreamProven: true
+        )
+        XCTAssertTrue(verdict.uplinkStrongEvidence)
+        XCTAssertTrue(verdict.fullGatewayPass)
+    }
+}
+
 @MainActor
 final class SystemDialDiagnosticTests: XCTestCase {
     func testDiagnosticStoreKeepsTwentyAttempts() {
