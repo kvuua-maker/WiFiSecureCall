@@ -31,24 +31,13 @@ import WatchKit
 
 struct WatchSystemDialerView: View {
     @Environment(\.dismiss) private var dismiss
-    @StateObject private var coordinator = WatchSystemDialCoordinator.shared
     @State private var number = ""
     @State private var showsInvalidNumber = false
-    @State private var showingResult = false
 
     private let columns = Array(repeating: GridItem(.flexible(), spacing: 6), count: 3)
     private let digits: [Character] = ["1", "2", "3", "4", "5", "6", "7", "8", "9"]
 
     var body: some View {
-        Group {
-            if showingResult { resultScreen } else { numberEntryScreen }
-        }
-        .alert("Invalid number", isPresented: $showsInvalidNumber) {
-            Button("OK", role: .cancel) { }
-        }
-    }
-
-    private var numberEntryScreen: some View {
         ScrollView {
             VStack(spacing: 8) {
                 Text(number.isEmpty ? "Enter number" : number)
@@ -74,46 +63,14 @@ struct WatchSystemDialerView: View {
 
                 Button("Call") { callSystemPhone() }
                     .tint(.green)
-                    .disabled(coordinator.isPreparing)
                 Button("Close") { dismiss() }
                     .font(.caption2)
             }
             .padding(.horizontal, 4)
         }
-    }
-
-    private var resultScreen: some View {
-        let summary = coordinator.latestAttempt.map { SystemDialUserSummary.make(from: $0) }
-            ?? SystemDialUserSummary.make(classification: SystemDialClassification.preparing)
-        return VStack(spacing: 5) {
-            Spacer(minLength: 0)
-            if coordinator.isPreparing { ProgressView().controlSize(.small) }
-            Text(summary.title)
-                .font(.headline)
-                .multilineTextAlignment(.center)
-                .lineLimit(2)
-                .minimumScaleFactor(0.75)
-            Text(summary.code)
-                .font(.system(size: 10, weight: .semibold, design: .monospaced))
-                .foregroundStyle(.secondary)
-            if let detail = summary.detail {
-                Text(detail)
-                    .font(.system(size: 9))
-                    .foregroundStyle(.secondary)
-                    .multilineTextAlignment(.center)
-                    .lineLimit(1)
-                    .minimumScaleFactor(0.75)
-            }
-            Spacer(minLength: 0)
-            Button("Новий дзвінок") {
-                number = ""
-                showingResult = false
-            }
-            .font(.caption)
-            Button("Закрити") { dismiss() }
-                .font(.caption2)
+        .alert("Invalid number", isPresented: $showsInvalidNumber) {
+            Button("OK", role: .cancel) { }
         }
-        .padding(.horizontal, 5)
     }
 
     private func append(_ value: Character) {
@@ -125,8 +82,7 @@ struct WatchSystemDialerView: View {
             showsInvalidNumber = true
             return
         }
-        showingResult = true
-        Task { await coordinator.prepareAndDial(number: number, url: url) }
+        WKApplication.shared().openSystemURL(url)
     }
 }
 #endif

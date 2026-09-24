@@ -156,14 +156,13 @@ final class SystemDialDiagnosticTests: XCTestCase {
         XCTAssertNil(SystemDialTelephonyURL.make(handle: ""))
     }
 
-    func testIOSInfoPlistDeclaresSupportedCallIntentActivities() throws {
+    func testIOSInfoPlistDoesNotDeclareDefaultCallingActivities() throws {
         let repository = URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent()
             .deletingLastPathComponent()
         let data = try Data(contentsOf: repository.appendingPathComponent("iOS/Info.plist"))
         let plist = try XCTUnwrap(PropertyListSerialization.propertyList(from: data, format: nil) as? [String: Any])
-        let types = try XCTUnwrap(plist["NSUserActivityTypes"] as? [String])
-        XCTAssertEqual(Set(types), Set(["INStartCallIntent", "INStartAudioCallIntent", "INStartVideoCallIntent"]))
+        XCTAssertNil(plist["NSUserActivityTypes"])
     }
 
     func testDefaultCallingTelURLParsesInternationalHandle() throws {

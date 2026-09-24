@@ -13,7 +13,6 @@ final class WatchNotificationController: NSObject, WKApplicationDelegate, UNUser
 
     func applicationDidFinishLaunching() {
         NotificationRuntime.shared.configureCallKitFactory { WatchCallKitAdapter() }
-        WatchSystemDialCoordinator.shared.activate()
         let center = UNUserNotificationCenter.current(); center.delegate = self
         center.setNotificationCategories([UNNotificationCategory(identifier: "INCOMING_CALL", actions: [
             UNNotificationAction(identifier: "ACCEPT", title: "Accept", options: .foreground),
@@ -27,12 +26,7 @@ final class WatchNotificationController: NSObject, WKApplicationDelegate, UNUser
     }
 
     func applicationDidBecomeActive() {
-        WatchSystemDialCoordinator.shared.applicationDidBecomeActive()
         Task { await refreshNotificationAuthorization() }
-    }
-
-    func applicationWillResignActive() {
-        WatchSystemDialCoordinator.shared.applicationWillResignActive()
     }
 
     nonisolated func didReceiveRemoteNotification(_ userInfo: [AnyHashable: Any], fetchCompletionHandler completionHandler: @escaping (WKBackgroundFetchResult) -> Void) {

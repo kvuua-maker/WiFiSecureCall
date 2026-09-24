@@ -12,7 +12,6 @@ final class IOSNotificationController: NSObject, UIApplicationDelegate, UNUserNo
 
     func application(_ application: UIApplication, didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]? = nil) -> Bool {
         NotificationRuntime.shared.configureCallKitFactory { IOSCallKitAdapter() }
-        IOSSystemDialCoordinator.shared.activate()
         let center = UNUserNotificationCenter.current(); center.delegate = self
         center.setNotificationCategories([UNNotificationCategory(identifier: "INCOMING_CALL", actions: [
             UNNotificationAction(identifier: "ACCEPT", title: "Accept", options: .foreground),
@@ -29,26 +28,6 @@ final class IOSNotificationController: NSObject, UIApplicationDelegate, UNUserNo
             } }
         }
         return true
-    }
-
-    func application(
-        _ application: UIApplication,
-        configurationForConnecting connectingSceneSession: UISceneSession,
-        options: UIScene.ConnectionOptions
-    ) -> UISceneConfiguration {
-        let configuration = UISceneConfiguration(name: nil, sessionRole: connectingSceneSession.role)
-        if connectingSceneSession.role == .windowApplication {
-            configuration.delegateClass = IOSDefaultCallingSceneDelegate.self
-        }
-        return configuration
-    }
-
-    func application(
-        _ application: UIApplication,
-        continue userActivity: NSUserActivity,
-        restorationHandler: @escaping ([UIUserActivityRestoring]?) -> Void
-    ) -> Bool {
-        IOSSystemDialCoordinator.shared.handleDefaultCallingActivity(userActivity)
     }
 
     func application(_ application: UIApplication, didRegisterForRemoteNotificationsWithDeviceToken token: Data) { upload(token, pushType: .alert) }
