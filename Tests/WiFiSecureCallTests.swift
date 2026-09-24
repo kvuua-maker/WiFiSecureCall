@@ -125,6 +125,63 @@ final class SystemDialDiagnosticTests: XCTestCase {
         XCTAssertEqual(SystemDialClassification.afterHandoff(outgoing: Date(), connected: Date(), ended: Date(), resultReceived: true), SystemDialClassification.systemCallEnded)
     }
 
+    func testEndedBeforeConnectClassification() {
+        XCTAssertEqual(
+            SystemDialClassification.afterHandoff(outgoing: Date(), connected: nil, ended: Date(), resultReceived: true),
+            SystemDialClassification.systemCallEndedBeforeConnect
+        )
+        let summary = SystemDialUserSummary.make(classification: SystemDialClassification.systemCallEndedBeforeConnect)
+        XCTAssertEqual(summary.code, "D24-10")
+        XCTAssertNotEqual(summary.severity, .success)
+    }
+
+    func testWCReplyOverridesStaleUnsatisfiedNetworkSnapshot() {
+        let value = SystemDialClassification.preflight(
+            networkStatus: "unsatisfied",
+            wcSupported: true,
+            activationState: "activated",
+            reachable: true,
+            needsUnlock: false,
+            replied: true
+        )
+        XCTAssertEqual(value, SystemDialClassification.iPhoneReady)
+    }
+
+    func testTelephonyURLBuilderPreservesExactValidHandle() throws {
+        let handle = "+380501234567"
+        let url = try XCTUnwrap(SystemDialTelephonyURL.make(handle: handle))
+        XCTAssertEqual(url.scheme, "telephony")
+        XCTAssertEqual(url.path, handle)
+        XCTAssertNil(SystemDialTelephonyURL.make(handle: ""))
+    }
+
+    func testDuplicateDefaultCallDeliveryIsSuppressed() {
+        let gate = SystemDialDefaultCallAdmissionGate(duplicateWindow: 3)
+        let now = Date(timeIntervalSince1970: 100)
+        XCTAssertTrue(gate.admit(fingerprint: 42, now: now))
+        XCTAssertFalse(gate.admit(fingerprint: 42, now: now.addingTimeInterval(0.1)))
+    }
+
+    func testSeparateLaterDefaultCallIsNotPermanentlyBlocked() {
+        let gate = SystemDialDefaultCallAdmissionGate(duplicateWindow: 3)
+        let now = Date(timeIntervalSince1970: 100)
+        XCTAssertTrue(gate.admit(fingerprint: 42, now: now))
+        XCTAssertTrue(gate.admit(fingerprint: 42, now: now.addingTimeInterval(3.1)))
+    }
+
+    func testSystemDialHandoffMessageIsValidatedWithoutReply() throws {
+        let attemptID = UUID()
+        let timestamp = Date(timeIntervalSince1970: 1_800_000_000)
+        let parsed = try XCTUnwrap(SystemDialHandoffMessage.parse([
+            "type": "systemDialHandoff",
+            "attemptID": attemptID.uuidString,
+            "handoffAt": timestamp.timeIntervalSince1970
+        ]))
+        XCTAssertEqual(parsed.attemptID, attemptID)
+        XCTAssertEqual(parsed.handoffAt, timestamp)
+        XCTAssertNil(SystemDialHandoffMessage.parse(["type": "systemDialHandoff", "attemptID": "invalid", "handoffAt": 1.0]))
+    }
+
     func testSecondDialCannotOverlapFirstPreflight() {
         let admission = SystemDialAttemptAdmission()
         XCTAssertTrue(admission.begin())
@@ -138,21 +195,22 @@ final class SystemDialDiagnosticTests: XCTestCase {
         XCTAssertFalse(SystemDialPreflightPolicy.shouldRequestTelHandoff(numberIsValid: false, preflightSucceeded: false))
     }
 
-    func testEveryKnownClassificationMapsToD23CodeAndCompactUkrainianTitle() {
+    func testEveryKnownClassificationMapsToD24CodeAndCompactUkrainianTitle() {
         let expected = [
-            SystemDialClassification.preparing: "D23-05",
-            SystemDialClassification.ready: "D23-05",
-            SystemDialClassification.watchNetworkUnavailable: "D23-01",
-            SystemDialClassification.wcNotActivated: "D23-02",
-            SystemDialClassification.iPhoneNeedsUnlock: "D23-03",
-            SystemDialClassification.iPhoneAppUnreachable: "D23-04",
-            SystemDialClassification.iPhoneReady: "D23-05",
-            SystemDialClassification.telHandoffRequested: "D23-06",
-            SystemDialClassification.systemCallObserved: "D23-07",
-            SystemDialClassification.systemCallConnected: "D23-08",
-            SystemDialClassification.systemCallEnded: "D23-09",
-            SystemDialClassification.noSystemCallEvidence: "D23-10",
-            SystemDialClassification.unknownAfterTelHandoff: "D23-10"
+            SystemDialClassification.preparing: "D24-05",
+            SystemDialClassification.ready: "D24-05",
+            SystemDialClassification.watchNetworkUnavailable: "D24-01",
+            SystemDialClassification.wcNotActivated: "D24-02",
+            SystemDialClassification.iPhoneNeedsUnlock: "D24-03",
+            SystemDialClassification.iPhoneAppUnreachable: "D24-04",
+            SystemDialClassification.iPhoneReady: "D24-05",
+            SystemDialClassification.telHandoffRequested: "D24-06",
+            SystemDialClassification.systemCallObserved: "D24-07",
+            SystemDialClassification.systemCallConnected: "D24-08",
+            SystemDialClassification.systemCallEnded: "D24-09",
+            SystemDialClassification.systemCallEndedBeforeConnect: "D24-10",
+            SystemDialClassification.noSystemCallEvidence: "D24-11",
+            SystemDialClassification.unknownAfterTelHandoff: "D24-12"
         ]
         XCTAssertEqual(Set(expected.keys), Set(SystemDialClassification.knownValues))
         for classification in SystemDialClassification.knownValues {
@@ -164,8 +222,8 @@ final class SystemDialDiagnosticTests: XCTestCase {
         }
     }
 
-    func testUnknownClassificationMapsToD23Ten() {
-        XCTAssertEqual(SystemDialUserSummary.make(classification: "FUTURE_UNKNOWN").code, "D23-10")
+    func testUnknownClassificationMapsToD24Twelve() {
+        XCTAssertEqual(SystemDialUserSummary.make(classification: "FUTURE_UNKNOWN").code, "D24-12")
     }
 
     func testWatchResultSummaryDoesNotRequireRawDiagnosticLines() {
@@ -283,6 +341,10 @@ final class SystemDialDiagnosticTests: XCTestCase {
         XCTAssertEqual(attempts.count, 1)
         XCTAssertEqual(attempts[0].classification, SystemDialClassification.telHandoffRequested)
         XCTAssertNil(attempts[0].watchReturnedActiveAt)
+        XCTAssertNil(attempts[0].iPhoneDefaultCallingRequestAt)
+        XCTAssertNil(attempts[0].iPhoneTelephonyFallbackRequestedAt)
+        XCTAssertNil(attempts[0].iPhoneTelephonyFallbackOpenCompletedAt)
+        XCTAssertNil(attempts[0].iPhoneTelephonyFallbackOpenAccepted)
     }
 
     private func classification(

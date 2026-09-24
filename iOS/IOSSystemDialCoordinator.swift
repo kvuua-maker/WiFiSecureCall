@@ -1,5 +1,6 @@
 import CallKit
 import Foundation
+import Intents
 import SwiftUI
 import UIKit
 import WatchConnectivity
@@ -12,6 +13,7 @@ final class IOSSystemDialCoordinator: NSObject {
     private let store: SystemDialDiagnosticStore
     private let network: SystemDialNetworkMonitor
     private let callObserver = CXCallObserver()
+    private let defaultCallAdmission = SystemDialDefaultCallAdmissionGate()
     private var observation: Observation?
     private var observationTimeout: Task<Void, Never>?
 
@@ -44,6 +46,75 @@ final class IOSSystemDialCoordinator: NSObject {
         guard let session else { return }
         session.delegate = self
         session.activate()
+    }
+
+    @discardableResult
+    func handleDefaultCallingActivity(_ userActivity: NSUserActivity) -> Bool {
+        guard let handle = Self.startCallHandle(from: userActivity) else { return false }
+        let fingerprint = handle.hashValue
+        guard defaultCallAdmission.admit(fingerprint: fingerprint) else { return true }
+
+        let requestAt = Date()
+        let attemptID = activeDiagnosticAttemptID(at: requestAt)
+        if let attemptID {
+            store.updateAndRecord(
+                id: attemptID,
+                source: "iPhone",
+                event: "default_call_request_received",
+                status: "received",
+                detail: "digitCount=\(handle.filter(\.isNumber).count)",
+                at: requestAt
+            ) {
+                $0.iPhoneDefaultCallingRequestAt = requestAt
+            }
+        }
+
+        guard let url = SystemDialTelephonyURL.make(handle: handle) else {
+            if let attemptID {
+                store.record(id: attemptID, source: "iPhone", event: "telephony_fallback", status: "invalid_handle")
+            }
+            return false
+        }
+
+        let fallbackAt = Date()
+        if let attemptID {
+            store.updateAndRecord(id: attemptID, source: "iPhone", event: "telephony_fallback_requested", status: "requested", at: fallbackAt) {
+                $0.iPhoneTelephonyFallbackRequestedAt = fallbackAt
+            }
+        }
+        UIApplication.shared.open(url, options: [:]) { [weak self] accepted in
+            Task { @MainActor in
+                guard let self, let attemptID else { return }
+                let completedAt = Date()
+                self.store.updateAndRecord(
+                    id: attemptID,
+                    source: "iPhone",
+                    event: "telephony_fallback_open_completed",
+                    status: accepted ? "accepted" : "rejected",
+                    at: completedAt
+                ) {
+                    $0.iPhoneTelephonyFallbackOpenCompletedAt = completedAt
+                    $0.iPhoneTelephonyFallbackOpenAccepted = accepted
+                }
+            }
+        }
+        return true
+    }
+
+    private func activeDiagnosticAttemptID(at now: Date) -> UUID? {
+        if let observation, now.timeIntervalSince(observation.startedAt) <= 30 {
+            return observation.attemptID
+        }
+        return store.attempts.first {
+            $0.finishedAt == nil && now.timeIntervalSince($0.startedAt) <= 30
+        }?.attemptID
+    }
+
+    private static func startCallHandle(from userActivity: NSUserActivity) -> String? {
+        guard let intent = userActivity.interaction?.intent as? INStartCallIntent else { return nil }
+        return intent.contacts?
+            .compactMap { $0.personHandle?.value }
+            .first { !$0.isEmpty }
     }
 
     private func handlePrepare(_ message: [String: Any]) -> [String: Any] {
@@ -139,6 +210,20 @@ final class IOSSystemDialCoordinator: NSObject {
         return reply
     }
 
+    private func handleHandoff(_ message: [String: Any]) {
+        guard let handoff = SystemDialHandoffMessage.parse(message),
+              store.attempt(id: handoff.attemptID) != nil else { return }
+        store.updateAndRecord(
+            id: handoff.attemptID,
+            source: "iPhone",
+            event: "tel_handoff_received",
+            status: "observed",
+            at: handoff.handoffAt
+        ) {
+            if $0.telHandoffRequestedAt == nil { $0.telHandoffRequestedAt = handoff.handoffAt }
+        }
+    }
+
     private func startObservationIfNeeded(attemptID: UUID, startedAt: Date) {
         if observation?.attemptID == attemptID { return }
         finishObservation(classifyMissingEvidence: true)
@@ -186,7 +271,12 @@ final class IOSSystemDialCoordinator: NSObject {
             store.updateAndRecord(id: current.attemptID, source: "iPhone", event: "system_call_observed_ended", status: "observed", at: now) {
                 $0.iPhoneObservedEndedCallAt = now
                 $0.finishedAt = now
-                $0.classification = SystemDialClassification.systemCallEnded
+                $0.classification = SystemDialClassification.afterHandoff(
+                    outgoing: $0.iPhoneObservedOutgoingCallAt,
+                    connected: $0.iPhoneObservedConnectedCallAt,
+                    ended: now,
+                    resultReceived: true
+                )
             }
             finishObservation(classifyMissingEvidence: false)
         }
@@ -249,6 +339,14 @@ extension IOSSystemDialCoordinator: WCSessionDelegate {
             case "prepareSystemDial": replyHandler(self.handlePrepare(message))
             case "systemDialResult": replyHandler(self.handleResult(message))
             default: replyHandler(["type": "unsupported"])
+            }
+        }
+    }
+
+    nonisolated func session(_ session: WCSession, didReceiveMessage message: [String: Any]) {
+        Task { @MainActor in
+            if message["type"] as? String == "systemDialHandoff" {
+                self.handleHandoff(message)
             }
         }
     }
@@ -320,9 +418,16 @@ struct SystemDialDiagnosticsView: View {
 
         diagnosticSection("Системний дзвінок") {
             diagnosticLine("Передано в Телефон", yesNo(attempt.telHandoffRequestedAt != nil))
+            diagnosticLine("Default request", yesNo(attempt.iPhoneDefaultCallingRequestAt != nil))
+            diagnosticLine("Telephony fallback", yesNo(attempt.iPhoneTelephonyFallbackRequestedAt != nil))
+            diagnosticLine("Fallback прийнято", optionalYesNo(attempt.iPhoneTelephonyFallbackOpenAccepted))
             diagnosticLine("Вихідний помічено", yesNo(attempt.iPhoneObservedOutgoingCallAt != nil))
             diagnosticLine("З’єднано", yesNo(attempt.iPhoneObservedConnectedCallAt != nil))
             diagnosticLine("Завершено", yesNo(attempt.iPhoneObservedEndedCallAt != nil))
+            durationLine("Default → fallback", from: attempt.iPhoneDefaultCallingRequestAt, to: attempt.iPhoneTelephonyFallbackRequestedAt)
+            durationLine("Fallback → outgoing", from: attempt.iPhoneTelephonyFallbackRequestedAt, to: attempt.iPhoneObservedOutgoingCallAt)
+            durationLine("Outgoing → connected", from: attempt.iPhoneObservedOutgoingCallAt, to: attempt.iPhoneObservedConnectedCallAt)
+            durationLine("Outgoing → ended", from: attempt.iPhoneObservedOutgoingCallAt, to: attempt.iPhoneObservedEndedCallAt)
         }
 
         DisclosureGroup("Технічний журнал") {
@@ -343,6 +448,12 @@ struct SystemDialDiagnosticsView: View {
 
     private func diagnosticLine(_ label: String, _ value: String) -> some View {
         HStack { Text(label); Spacer(); Text(value).foregroundStyle(.secondary) }.font(.caption)
+    }
+
+    @ViewBuilder private func durationLine(_ label: String, from start: Date?, to end: Date?) -> some View {
+        if let start, let end {
+            diagnosticLine(label, "\(Int((end.timeIntervalSince(start) * 1_000).rounded())) ms")
+        }
     }
 
     private func networkText(status: String, interfaces: [String]) -> String {

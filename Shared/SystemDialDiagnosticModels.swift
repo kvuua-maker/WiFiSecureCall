@@ -15,6 +15,7 @@ enum SystemDialClassification {
     static let systemCallObserved = "SYSTEM_CALL_OBSERVED"
     static let systemCallConnected = "SYSTEM_CALL_CONNECTED"
     static let systemCallEnded = "SYSTEM_CALL_ENDED"
+    static let systemCallEndedBeforeConnect = "SYSTEM_CALL_ENDED_BEFORE_CONNECT"
     static let noSystemCallEvidence = "NO_SYSTEM_CALL_EVIDENCE"
     static let unknownAfterTelHandoff = "UNKNOWN_AFTER_TEL_HANDOFF"
 
@@ -22,7 +23,8 @@ enum SystemDialClassification {
         preparing, ready, watchNetworkUnavailable, wcNotActivated,
         iPhoneNeedsUnlock, iPhoneAppUnreachable, iPhoneReady,
         telHandoffRequested, systemCallObserved, systemCallConnected,
-        systemCallEnded, noSystemCallEvidence, unknownAfterTelHandoff
+        systemCallEnded, systemCallEndedBeforeConnect,
+        noSystemCallEvidence, unknownAfterTelHandoff
     ]
 
     static func preflight(
@@ -33,16 +35,18 @@ enum SystemDialClassification {
         needsUnlock: Bool?,
         replied: Bool
     ) -> String {
+        if replied { return iPhoneReady }
         if networkStatus != "satisfied" { return watchNetworkUnavailable }
         if !wcSupported || activationState != "activated" { return wcNotActivated }
         if needsUnlock == true { return iPhoneNeedsUnlock }
-        if replied { return iPhoneReady }
         if !reachable { return iPhoneAppUnreachable }
         return iPhoneAppUnreachable
     }
 
     static func afterHandoff(outgoing: Date?, connected: Date?, ended: Date?, resultReceived: Bool) -> String {
-        if ended != nil { return systemCallEnded }
+        if ended != nil {
+            return connected == nil && outgoing != nil ? systemCallEndedBeforeConnect : systemCallEnded
+        }
         if connected != nil { return systemCallConnected }
         if outgoing != nil { return systemCallObserved }
         return resultReceived ? noSystemCallEvidence : unknownAfterTelHandoff
@@ -61,6 +65,7 @@ enum SystemDialClassification {
         case systemCallObserved: return "iPhone бачить системний вихідний дзвінок"
         case systemCallConnected: return "Системний дзвінок з’єднався"
         case systemCallEnded: return "Системний дзвінок завершився"
+        case systemCallEndedBeforeConnect: return "Системний дзвінок завершився до з’єднання"
         case noSystemCallEvidence: return "Номер передано системі, але програма не отримала підтвердження стану дзвінка"
         default: return "Збій стався після передачі керування системі; точна внутрішня причина Apple недоступна програмі"
         }
@@ -87,35 +92,37 @@ struct SystemDialUserSummary: Equatable, Sendable {
     static func make(classification: String) -> SystemDialUserSummary {
         switch classification {
         case SystemDialClassification.preparing:
-            return .init(code: "D23-05", title: "Перевіряю iPhone…", detail: nil, severity: .neutral)
+            return .init(code: "D24-05", title: "Перевіряю iPhone…", detail: nil, severity: .neutral)
         case SystemDialClassification.ready, SystemDialClassification.iPhoneReady:
-            return .init(code: "D23-05", title: "iPhone відповідає", detail: nil, severity: .success)
+            return .init(code: "D24-05", title: "iPhone відповідає", detail: nil, severity: .success)
         case SystemDialClassification.watchNetworkUnavailable:
-            return .init(code: "D23-01", title: "Немає мережі", detail: nil, severity: .failure)
+            return .init(code: "D24-01", title: "Немає мережі", detail: nil, severity: .failure)
         case SystemDialClassification.wcNotActivated:
-            return .init(code: "D23-02", title: "Немає зв’язку з iPhone", detail: nil, severity: .warning)
+            return .init(code: "D24-02", title: "Немає зв’язку з iPhone", detail: nil, severity: .warning)
         case SystemDialClassification.iPhoneNeedsUnlock:
-            return .init(code: "D23-03", title: "Розблокуй iPhone", detail: nil, severity: .warning)
+            return .init(code: "D24-03", title: "Розблокуй iPhone", detail: nil, severity: .warning)
         case SystemDialClassification.iPhoneAppUnreachable:
-            return .init(code: "D23-04", title: "iPhone недоступний", detail: nil, severity: .warning)
+            return .init(code: "D24-04", title: "iPhone недоступний", detail: nil, severity: .warning)
         case SystemDialClassification.telHandoffRequested:
-            return .init(code: "D23-06", title: "Передано в Телефон", detail: nil, severity: .neutral)
+            return .init(code: "D24-06", title: "Передано в Телефон", detail: nil, severity: .neutral)
         case SystemDialClassification.systemCallObserved:
-            return .init(code: "D23-07", title: "Дзвінок почався", detail: nil, severity: .success)
+            return .init(code: "D24-07", title: "Дзвінок почався", detail: nil, severity: .success)
         case SystemDialClassification.systemCallConnected:
-            return .init(code: "D23-08", title: "З’єднано", detail: nil, severity: .success)
+            return .init(code: "D24-08", title: "З’єднано", detail: nil, severity: .success)
         case SystemDialClassification.systemCallEnded:
-            return .init(code: "D23-09", title: "Дзвінок завершено", detail: nil, severity: .success)
+            return .init(code: "D24-09", title: "Дзвінок завершено", detail: nil, severity: .success)
+        case SystemDialClassification.systemCallEndedBeforeConnect:
+            return .init(code: "D24-10", title: "Завершився до з’єднання", detail: "Деталі є на iPhone", severity: .warning)
         case SystemDialClassification.noSystemCallEvidence:
             return .init(
-                code: "D23-10",
+                code: "D24-11",
                 title: "Система не підтвердила дзвінок",
                 detail: "Деталі є на iPhone",
                 severity: .warning
             )
         default:
             return .init(
-                code: "D23-10",
+                code: "D24-12",
                 title: "Збій після передачі",
                 detail: "Деталі є на iPhone",
                 severity: .warning
@@ -185,6 +192,10 @@ struct SystemDialAttempt: Codable, Equatable, Identifiable, Sendable {
     var iPhoneObservedOutgoingCallAt: Date?
     var iPhoneObservedConnectedCallAt: Date?
     var iPhoneObservedEndedCallAt: Date?
+    var iPhoneDefaultCallingRequestAt: Date?
+    var iPhoneTelephonyFallbackRequestedAt: Date?
+    var iPhoneTelephonyFallbackOpenCompletedAt: Date?
+    var iPhoneTelephonyFallbackOpenAccepted: Bool?
     var classification: String
     var events: [SystemDialEvent]
 
@@ -218,6 +229,10 @@ struct SystemDialAttempt: Codable, Equatable, Identifiable, Sendable {
             iPhoneObservedOutgoingCallAt: nil,
             iPhoneObservedConnectedCallAt: nil,
             iPhoneObservedEndedCallAt: nil,
+            iPhoneDefaultCallingRequestAt: nil,
+            iPhoneTelephonyFallbackRequestedAt: nil,
+            iPhoneTelephonyFallbackOpenCompletedAt: nil,
+            iPhoneTelephonyFallbackOpenAccepted: nil,
             classification: classification,
             events: []
         )
@@ -447,6 +462,51 @@ final class SystemDialDiagnosticStore: ObservableObject {
 enum SystemDialMessageValidator {
     static func matches(_ message: [String: Any], attemptID: UUID, nonce: UUID) -> Bool {
         message["attemptID"] as? String == attemptID.uuidString && message["nonce"] as? String == nonce.uuidString
+    }
+}
+
+struct SystemDialHandoffMessage: Equatable, Sendable {
+    let attemptID: UUID
+    let handoffAt: Date
+
+    static func parse(_ message: [String: Any]) -> SystemDialHandoffMessage? {
+        guard message["type"] as? String == "systemDialHandoff",
+              let attemptString = message["attemptID"] as? String,
+              let attemptID = UUID(uuidString: attemptString),
+              let interval = message["handoffAt"] as? TimeInterval,
+              interval.isFinite, interval > 0 else { return nil }
+        return .init(attemptID: attemptID, handoffAt: Date(timeIntervalSince1970: interval))
+    }
+}
+
+enum SystemDialTelephonyURL {
+    static func make(handle: String) -> URL? {
+        guard !handle.isEmpty else { return nil }
+        var components = URLComponents()
+        components.scheme = "telephony"
+        components.path = handle
+        return components.url
+    }
+}
+
+final class SystemDialDefaultCallAdmissionGate: @unchecked Sendable {
+    private let lock = NSLock()
+    private let duplicateWindow: TimeInterval
+    private var admittedAt: [Int: Date] = [:]
+
+    init(duplicateWindow: TimeInterval = 3) {
+        self.duplicateWindow = duplicateWindow
+    }
+
+    func admit(fingerprint: Int, now: Date = Date()) -> Bool {
+        lock.withLock {
+            admittedAt = admittedAt.filter { now.timeIntervalSince($0.value) < duplicateWindow }
+            if let existing = admittedAt[fingerprint], now.timeIntervalSince(existing) < duplicateWindow {
+                return false
+            }
+            admittedAt[fingerprint] = now
+            return true
+        }
     }
 }
 

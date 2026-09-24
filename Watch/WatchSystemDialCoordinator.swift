@@ -118,7 +118,13 @@ final class WatchSystemDialCoordinator: NSObject, ObservableObject {
             $0.classification = SystemDialClassification.telHandoffRequested
         }
         publish(attemptID)
-        await store.flush()
+        if let currentSession, currentSession.activationState == .activated, currentSession.isReachable {
+            currentSession.sendMessage([
+                "type": "systemDialHandoff",
+                "attemptID": attemptID.uuidString,
+                "handoffAt": handoffAt.timeIntervalSince1970
+            ], replyHandler: nil, errorHandler: nil)
+        }
         WKApplication.shared().openSystemURL(url)
     }
 
@@ -241,6 +247,10 @@ final class WatchSystemDialCoordinator: NSObject, ObservableObject {
             $0.iPhoneObservedOutgoingCallAt = remote.iPhoneObservedOutgoingCallAt
             $0.iPhoneObservedConnectedCallAt = remote.iPhoneObservedConnectedCallAt
             $0.iPhoneObservedEndedCallAt = remote.iPhoneObservedEndedCallAt
+            $0.iPhoneDefaultCallingRequestAt = remote.iPhoneDefaultCallingRequestAt
+            $0.iPhoneTelephonyFallbackRequestedAt = remote.iPhoneTelephonyFallbackRequestedAt
+            $0.iPhoneTelephonyFallbackOpenCompletedAt = remote.iPhoneTelephonyFallbackOpenCompletedAt
+            $0.iPhoneTelephonyFallbackOpenAccepted = remote.iPhoneTelephonyFallbackOpenAccepted
             $0.finishedAt = Date()
             $0.classification = SystemDialClassification.afterHandoff(
                 outgoing: remote.iPhoneObservedOutgoingCallAt,
@@ -264,6 +274,10 @@ final class WatchSystemDialCoordinator: NSObject, ObservableObject {
             $0.iPhoneObservedOutgoingCallAt = remote.iPhoneObservedOutgoingCallAt
             $0.iPhoneObservedConnectedCallAt = remote.iPhoneObservedConnectedCallAt
             $0.iPhoneObservedEndedCallAt = remote.iPhoneObservedEndedCallAt
+            $0.iPhoneDefaultCallingRequestAt = remote.iPhoneDefaultCallingRequestAt
+            $0.iPhoneTelephonyFallbackRequestedAt = remote.iPhoneTelephonyFallbackRequestedAt
+            $0.iPhoneTelephonyFallbackOpenCompletedAt = remote.iPhoneTelephonyFallbackOpenCompletedAt
+            $0.iPhoneTelephonyFallbackOpenAccepted = remote.iPhoneTelephonyFallbackOpenAccepted
             $0.classification = SystemDialClassification.afterHandoff(
                 outgoing: remote.iPhoneObservedOutgoingCallAt,
                 connected: remote.iPhoneObservedConnectedCallAt,
