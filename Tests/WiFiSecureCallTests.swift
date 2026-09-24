@@ -78,6 +78,59 @@ final class CellularAudioGatewayVerdictTests: XCTestCase {
     }
 }
 
+final class CellularAudioProbeStateTests: XCTestCase {
+    func testPrearmSuccess() {
+        var state = CellularAudioProbeState()
+        state.markAudioRunning(mode: .prearm)
+        XCTAssertEqual(state.prearmStatus, .running)
+        XCTAssertEqual(state.audioSessionStatus, .activeAttemptSuccess)
+        XCTAssertEqual(state.audioEngineStatus, .running)
+    }
+
+    func testPrearmInterruptedOnCellularConnect() {
+        var state = CellularAudioProbeState()
+        state.markAudioRunning(mode: .prearm)
+        state.markCallConnected(engineIsRunning: true)
+        state.markInterruptionBegan(engineWasRunning: true)
+        XCTAssertEqual(state.prearmStatus, .interrupted)
+        XCTAssertEqual(state.audioSessionStatus, .interrupted)
+        XCTAssertEqual(state.prearmSurvivedCellularConnect, false)
+    }
+
+    func testPostConnectActivationFailure() {
+        var state = CellularAudioProbeState()
+        let error = ProbeAudioError(stage: "audio_session_set_active", domain: "AVFAudio", code: 561017449, description: "failed")
+        state.markAudioFailure(mode: .postConnect, error: error)
+        XCTAssertEqual(state.postConnectStatus, .failed)
+        XCTAssertEqual(state.audioEngineStatus, .failed)
+        XCTAssertEqual(state.lastAudioError, error)
+    }
+
+    func testPostConnectActivationSuccess() {
+        var state = CellularAudioProbeState()
+        state.markAudioRunning(mode: .postConnect)
+        XCTAssertEqual(state.postConnectStatus, .running)
+        XCTAssertEqual(state.audioEngineStatus, .running)
+    }
+
+    func testUplinkBlockedWithExplicitReasons() {
+        let state = CellularAudioProbeState()
+        let reasons = state.uplinkToneBlockReasons(verdict: CellularAudioGatewayVerdict())
+        XCTAssertEqual(reasons, [.callNotConnected, .cellularMicNotConfirmedMuted, .appAudioNotRunning])
+    }
+
+    func testUplinkEnabledOnlyWhenEveryPrerequisiteIsTrue() {
+        var state = CellularAudioProbeState()
+        state.markAudioRunning(mode: .postConnect)
+        var verdict = CellularAudioGatewayVerdict()
+        verdict.cellularCallConnected = true
+        verdict.userConfirmedCellularMicMuted = true
+        XCTAssertTrue(state.uplinkToneBlockReasons(verdict: verdict).isEmpty)
+        verdict.uplinkToneWasRun = true
+        XCTAssertEqual(state.uplinkToneBlockReasons(verdict: verdict), [.toneAlreadyRun])
+    }
+}
+
 @MainActor
 final class SystemDialDiagnosticTests: XCTestCase {
     func testDiagnosticStoreKeepsTwentyAttempts() {

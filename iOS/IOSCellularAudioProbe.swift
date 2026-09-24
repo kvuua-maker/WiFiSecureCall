@@ -9,9 +9,9 @@ final class IOSCellularAudioProbe: NSObject, ObservableObject {
     static let shared = IOSCellularAudioProbe()
 
     @Published private(set) var logLines: [String] = []
-    @Published private(set) var isAudioProbeRunning = false
     @Published private(set) var cellularServicesSummary = "Not queried"
     @Published private(set) var verdict = CellularAudioGatewayVerdict()
+    @Published private(set) var probeState = CellularAudioProbeState()
 
     private let audioSession = AVAudioSession.sharedInstance()
     private let callObserver = CXCallObserver()
@@ -27,6 +27,14 @@ final class IOSCellularAudioProbe: NSObject, ObservableObject {
     private var audioInterruptionActive = false
     private var processHeartbeatTask: Task<Void, Never>?
 
+    var isAudioProbeRunning: Bool {
+        probeState.audioEngineStatus == .running && engine?.isRunning == true
+    }
+
+    var uplinkToneBlockReasons: [UplinkToneBlockReason] {
+        probeState.uplinkToneBlockReasons(verdict: verdict)
+    }
+
     override private init() {
         super.init()
         callObserver.setDelegate(self, queue: .main)
@@ -40,6 +48,7 @@ final class IOSCellularAudioProbe: NSObject, ObservableObject {
             return
         }
         verdict = CellularAudioGatewayVerdict()
+        probeState.markCallDialing()
         record("cellular_action_requested request_timestamp=\(ISO8601DateFormatter().string(from: Date())) digit_count=\(handleValue.filter(\.isNumber).count)")
         recordApplicationState(prefix: "before_cellular_action")
         startProcessHeartbeat()
@@ -70,54 +79,129 @@ final class IOSCellularAudioProbe: NSObject, ObservableObject {
         }
     }
 
-    func startAudioProbe() async {
-        guard !isAudioProbeRunning else {
-            record("audio_probe_already_running")
+    func armAudioBeforeCall() async {
+        guard probeState.callStatus != .connected else {
+            setVisiblePrerequisiteFailure(mode: .prearm, stage: "prearm_requires_call_not_connected")
+            return
+        }
+        await attemptStartAudio(mode: .prearm, isResume: false)
+    }
+
+    func tryAudioAfterConnect() async {
+        guard verdict.cellularCallConnected else {
+            setVisiblePrerequisiteFailure(mode: .postConnect, stage: "post_connect_requires_connected_call")
+            return
+        }
+        await attemptStartAudio(mode: .postConnect, isResume: false)
+    }
+
+    func tryResumeAppAudio() async {
+        guard probeState.resumeAvailable, !probeState.resumeAttempted else {
+            record("audio_resume_rejected reason=resume_not_available")
+            return
+        }
+        probeState.resumeAttempted = true
+        probeState.resumeAvailable = false
+        record("audio_resume_requested controlled_attempt=1")
+        await attemptStartAudio(mode: .postConnect, isResume: true)
+    }
+
+    private func attemptStartAudio(mode: ProbeAudioMode, isResume: Bool) async {
+        if isAudioProbeRunning {
+            setVisiblePrerequisiteFailure(mode: mode, stage: "audio_engine_already_running")
             return
         }
 
+        cleanupAudioGraph(deactivateSession: false)
+        record("audio_start_attempt mode=\(mode.rawValue) resume=\(isResume)")
         recordAudioSnapshot(prefix: "audio_before_activation")
         let permission = await requestRecordPermission()
         record("microphone_permission granted=\(permission)")
+        guard permission else {
+            setVisibleAudioFailure(mode: mode, stage: "microphone_permission", error: nil)
+            return
+        }
 
         do {
-            try audioSession.setCategory(.playAndRecord, mode: .measurement, options: [.defaultToSpeaker, .allowBluetoothHFP])
-            try audioSession.setActive(true)
-            record("audio_session_set_active result=success")
+            try audioSession.setCategory(.playAndRecord, mode: .voiceChat, options: [.defaultToSpeaker, .allowBluetoothHFP])
+            record("audio_session_configured category=playAndRecord mode=voiceChat allowBluetoothHFP=true defaultToSpeaker=true")
         } catch {
-            recordError("audio_session_set_active", error)
+            setVisibleAudioFailure(mode: mode, stage: "audio_session_set_category", error: error)
+            recordAudioSnapshot(prefix: "audio_after_category_failure")
+            return
+        }
+
+        do {
+            try audioSession.setActive(true)
+            probeState.audioSessionStatus = .activeAttemptSuccess
+            record("audio_session_set_active result=success mode=\(mode.rawValue)")
+        } catch {
+            setVisibleAudioFailure(mode: mode, stage: "audio_session_set_active", error: error)
             recordAudioSnapshot(prefix: "audio_after_activation_failure")
             return
         }
 
-        let engine = AVAudioEngine()
-        let player = AVAudioPlayerNode()
-        engine.attach(player)
+        let candidateEngine = AVAudioEngine()
+        let candidatePlayer = AVAudioPlayerNode()
+        candidateEngine.attach(candidatePlayer)
 
-        let outputFormat = engine.mainMixerNode.outputFormat(forBus: 0)
-        let sampleRate = outputFormat.sampleRate > 0 ? outputFormat.sampleRate : 48_000
-        guard let toneFormat = AVAudioFormat(standardFormatWithSampleRate: sampleRate, channels: 1) else {
-            record("audio_probe_failed stage=tone_format")
+        do {
+            try candidateEngine.inputNode.setVoiceProcessingEnabled(true)
+            guard candidateEngine.inputNode.isVoiceProcessingEnabled,
+                  candidateEngine.outputNode.isVoiceProcessingEnabled else {
+                throw NSError(domain: "WiFiSecureCall.CellularAudioProbe", code: 20, userInfo: [NSLocalizedDescriptionKey: "Voice processing did not become active on both I/O nodes"])
+            }
+            record("voice_processing_enabled input=true output=true")
+        } catch {
+            setVisibleAudioFailure(mode: mode, stage: "voice_processing_enable", error: error)
             try? audioSession.setActive(false, options: .notifyOthersOnDeactivation)
             return
         }
-        engine.connect(player, to: engine.mainMixerNode, format: toneFormat)
 
+        let outputFormat = candidateEngine.mainMixerNode.outputFormat(forBus: 0)
+        let sampleRate = outputFormat.sampleRate > 0 ? outputFormat.sampleRate : 48_000
+        guard let toneFormat = AVAudioFormat(standardFormatWithSampleRate: sampleRate, channels: 1) else {
+            setVisibleAudioFailure(mode: mode, stage: "tone_format", error: nil)
+            try? audioSession.setActive(false, options: .notifyOthersOnDeactivation)
+            return
+        }
+        candidateEngine.connect(candidatePlayer, to: candidateEngine.mainMixerNode, format: toneFormat)
+
+        installDiagnosticTaps(on: candidateEngine, permission: permission)
+
+        do {
+            candidateEngine.prepare()
+            try candidateEngine.start()
+            engine = candidateEngine
+            player = candidatePlayer
+            inputFrameCount = 0
+            inputCallbackCount = 0
+            mixerFrameCount = 0
+            mixerCallbackCount = 0
+            probeState.markAudioRunning(mode: mode)
+            record("audio_engine_started result=success mode=\(mode.rawValue) engine_running=\(candidateEngine.isRunning)")
+            record("NO_PUBLIC_CELLULAR_AUDIO_STREAM_API_FOUND_IN_INSTALLED_SDK")
+            record("NO_PUBLIC_CELLULAR_DOWNLINK_AUDIO_ENDPOINT app_input_is_microphone_or_selected_input app_mixer_contains_app_graph_only")
+            recordVerdict(reason: "audio_probe_started_\(mode.rawValue)")
+            recordAudioSnapshot(prefix: "audio_probe_active")
+        } catch {
+            removeDiagnosticTaps(from: candidateEngine)
+            setVisibleAudioFailure(mode: mode, stage: "audio_engine_start", error: error)
+            try? audioSession.setActive(false, options: .notifyOthersOnDeactivation)
+        }
+    }
+
+    private func installDiagnosticTaps(on engine: AVAudioEngine, permission: Bool) {
         let input = engine.inputNode
         let inputFormat = input.outputFormat(forBus: 0)
         if permission, inputFormat.channelCount > 0, inputFormat.sampleRate > 0 {
             input.installTap(onBus: 0, bufferSize: 1024, format: inputFormat) { [weak self] buffer, _ in
                 guard let channel = buffer.floatChannelData?.pointee else { return }
-                var sumSquares: Float = 0
                 let count = Int(buffer.frameLength)
-                for index in 0..<count {
-                    let sample = channel[index]
-                    sumSquares += sample * sample
-                }
+                var sumSquares: Float = 0
+                for index in 0..<count { sumSquares += channel[index] * channel[index] }
                 let rms = count > 0 ? sqrt(sumSquares / Float(count)) : 0
-                Task { @MainActor [weak self] in
-                    self?.recordInputFrames(UInt64(buffer.frameLength), rms: rms)
-                }
+                Task { @MainActor [weak self] in self?.recordInputFrames(UInt64(buffer.frameLength), rms: rms) }
             }
             inputTapInstalled = true
             record("input_tap_installed source=app_audio_input_not_remote_audio format=\(Int(inputFormat.sampleRate))Hz/\(inputFormat.channelCount)ch")
@@ -130,48 +214,16 @@ final class IOSCellularAudioProbe: NSObject, ObservableObject {
         if mixerFormat.channelCount > 0, mixerFormat.sampleRate > 0 {
             mixer.installTap(onBus: 0, bufferSize: 1024, format: mixerFormat) { [weak self] buffer, _ in
                 guard let channel = buffer.floatChannelData?.pointee else { return }
-                var sumSquares: Float = 0
                 let count = Int(buffer.frameLength)
-                for index in 0..<count {
-                    let sample = channel[index]
-                    sumSquares += sample * sample
-                }
+                var sumSquares: Float = 0
+                for index in 0..<count { sumSquares += channel[index] * channel[index] }
                 let rms = count > 0 ? sqrt(sumSquares / Float(count)) : 0
-                Task { @MainActor [weak self] in
-                    self?.recordMixerFrames(UInt64(buffer.frameLength), rms: rms)
-                }
+                Task { @MainActor [weak self] in self?.recordMixerFrames(UInt64(buffer.frameLength), rms: rms) }
             }
             mixerTapInstalled = true
             record("app_mixer_tap_installed source=app_owned_main_mixer format=\(Int(mixerFormat.sampleRate))Hz/\(mixerFormat.channelCount)ch cellular_downlink_not_implied=true")
         } else {
             record("app_mixer_tap_not_installed sample_rate=\(mixerFormat.sampleRate) channels=\(mixerFormat.channelCount)")
-        }
-
-        do {
-            engine.prepare()
-            try engine.start()
-            self.engine = engine
-            self.player = player
-            isAudioProbeRunning = true
-            inputFrameCount = 0
-            inputCallbackCount = 0
-            mixerFrameCount = 0
-            mixerCallbackCount = 0
-            record("audio_engine_started result=success")
-            record("NO_PUBLIC_CELLULAR_DOWNLINK_AUDIO_ENDPOINT app_input_is_microphone_or_selected_input app_mixer_contains_app_graph_only")
-            recordVerdict(reason: "audio_probe_started")
-            recordAudioSnapshot(prefix: "audio_probe_active")
-        } catch {
-            if inputTapInstalled {
-                input.removeTap(onBus: 0)
-                inputTapInstalled = false
-            }
-            if mixerTapInstalled {
-                mixer.removeTap(onBus: 0)
-                mixerTapInstalled = false
-            }
-            recordError("audio_engine_start", error)
-            try? audioSession.setActive(false, options: .notifyOthersOnDeactivation)
         }
     }
 
@@ -188,16 +240,14 @@ final class IOSCellularAudioProbe: NSObject, ObservableObject {
     }
 
     func runUplinkTone() {
-        guard verdict.cellularCallConnected else {
-            record("uplink_tone_rejected reason=call_not_connected")
-            return
-        }
-        guard verdict.userConfirmedCellularMicMuted else {
-            record("uplink_tone_rejected reason=cellular_mic_mute_not_confirmed")
+        let blocked = uplinkToneBlockReasons
+        guard blocked.isEmpty else {
+            record("uplink_tone_rejected reasons=\(blocked.map(\.rawValue).joined(separator: ","))")
             return
         }
         guard let engine, let player, engine.isRunning else {
-            record("uplink_tone_rejected reason=audio_probe_not_running")
+            probeState.audioEngineStatus = .stopped
+            record("uplink_tone_rejected reason=APP_AUDIO_NOT_RUNNING actual_engine_running=false")
             return
         }
         if inputTapInstalled {
@@ -244,21 +294,8 @@ final class IOSCellularAudioProbe: NSObject, ObservableObject {
     func stop() {
         processHeartbeatTask?.cancel()
         processHeartbeatTask = nil
-        if let engine {
-            if inputTapInstalled {
-                engine.inputNode.removeTap(onBus: 0)
-                inputTapInstalled = false
-            }
-            if mixerTapInstalled {
-                engine.mainMixerNode.removeTap(onBus: 0)
-                mixerTapInstalled = false
-            }
-            player?.stop()
-            engine.stop()
-        }
-        engine = nil
-        player = nil
-        isAudioProbeRunning = false
+        cleanupAudioGraph(deactivateSession: false)
+        probeState.markStopped()
         do {
             try audioSession.setActive(false, options: .notifyOthersOnDeactivation)
             record("audio_probe_stopped set_active_false=success input_frames=\(inputFrameCount) input_callbacks=\(inputCallbackCount) mixer_frames=\(mixerFrameCount) mixer_callbacks=\(mixerCallbackCount)")
@@ -266,6 +303,53 @@ final class IOSCellularAudioProbe: NSObject, ObservableObject {
             recordError("audio_probe_stop", error)
         }
         recordAudioSnapshot(prefix: "audio_after_stop")
+    }
+
+    private func cleanupAudioGraph(deactivateSession: Bool) {
+        if let engine {
+            removeDiagnosticTaps(from: engine)
+            player?.stop()
+            engine.stop()
+        }
+        engine = nil
+        player = nil
+        if deactivateSession { try? audioSession.setActive(false, options: .notifyOthersOnDeactivation) }
+    }
+
+    private func removeDiagnosticTaps(from engine: AVAudioEngine) {
+        if inputTapInstalled {
+            engine.inputNode.removeTap(onBus: 0)
+            inputTapInstalled = false
+        }
+        if mixerTapInstalled {
+            engine.mainMixerNode.removeTap(onBus: 0)
+            mixerTapInstalled = false
+        }
+    }
+
+    private func setVisibleAudioFailure(mode: ProbeAudioMode, stage: String, error: Error?) {
+        let value = error.map { $0 as NSError }
+        let visible = ProbeAudioError(
+            stage: stage,
+            domain: value?.domain ?? "WiFiSecureCall.CellularAudioProbe",
+            code: value?.code ?? 0,
+            description: Self.sanitized(value?.localizedDescription ?? "Prerequisite or public audio operation failed")
+        )
+        probeState.markAudioFailure(mode: mode, error: visible)
+        record("audio_failure mode=\(mode.rawValue) stage=\(visible.stage) domain=\(visible.domain) code=\(visible.code) description=\(visible.description)")
+    }
+
+    private func setVisiblePrerequisiteFailure(mode: ProbeAudioMode, stage: String) {
+        let visible = ProbeAudioError(
+            stage: stage,
+            domain: "WiFiSecureCall.CellularAudioProbe",
+            code: 0,
+            description: "Probe prerequisite was not satisfied"
+        )
+        probeState.lastAudioError = visible
+        if mode == .prearm { probeState.prearmStatus = .failed }
+        else { probeState.postConnectStatus = .failed }
+        record("audio_prerequisite_failure mode=\(mode.rawValue) stage=\(stage)")
     }
 
     private func scheduleControlledTone(player: AVAudioPlayerNode, format: AVAudioFormat) {
@@ -320,14 +404,26 @@ final class IOSCellularAudioProbe: NSObject, ObservableObject {
         notificationTokens.append(center.addObserver(forName: AVAudioSession.routeChangeNotification, object: audioSession, queue: .main) { [weak self] note in
             Task { @MainActor [weak self] in
                 self?.recordAudioNotification("audio_route_changed", note)
-                self?.recordAudioSnapshot(prefix: "audio_after_route_change")
             }
         })
         notificationTokens.append(center.addObserver(forName: AVAudioSession.mediaServicesWereLostNotification, object: audioSession, queue: .main) { [weak self] note in
-            Task { @MainActor [weak self] in self?.recordAudioNotification("media_services_lost", note) }
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                self.recordAudioNotification("media_services_lost", note)
+                if self.probeState.activeAudioMode == .prearm, self.probeState.callStatus == .connected {
+                    self.probeState.prearmSurvivedCellularConnect = false
+                    self.record("PREARM_SURVIVED_CELLULAR_CONNECT=NO reason=media_services_lost")
+                }
+                self.setVisibleAudioFailure(mode: self.probeState.activeAudioMode ?? .postConnect, stage: "media_services_lost", error: nil)
+            }
         })
         notificationTokens.append(center.addObserver(forName: AVAudioSession.mediaServicesWereResetNotification, object: audioSession, queue: .main) { [weak self] note in
-            Task { @MainActor [weak self] in self?.recordAudioNotification("media_services_reset", note) }
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                self.recordAudioNotification("media_services_reset", note)
+                self.probeState.audioEngineStatus = .stopped
+                self.probeState.resumeAvailable = !self.probeState.resumeAttempted
+            }
         })
         notificationTokens.append(center.addObserver(forName: UIApplication.willResignActiveNotification, object: nil, queue: .main) { [weak self] _ in
             Task { @MainActor [weak self] in self?.record("process_lifecycle will_resign_active") }
@@ -350,7 +446,16 @@ final class IOSCellularAudioProbe: NSObject, ObservableObject {
                 do { try await Task.sleep(nanoseconds: 2_000_000_000) }
                 catch { return }
                 guard !Task.isCancelled else { return }
-                self?.record("process_heartbeat index=\(index) state=\(Self.applicationState(UIApplication.shared.applicationState))")
+                guard let self else { return }
+                let engineRunning = self.engine?.isRunning ?? false
+                self.record("process_heartbeat index=\(index) state=\(Self.applicationState(UIApplication.shared.applicationState)) engine_running=\(engineRunning) interruption_active=\(self.audioInterruptionActive)")
+                if self.probeState.audioEngineStatus == .running, !engineRunning {
+                    if self.probeState.activeAudioMode == .prearm, self.probeState.callStatus == .connected {
+                        self.probeState.prearmSurvivedCellularConnect = false
+                        self.record("PREARM_SURVIVED_CELLULAR_CONNECT=NO reason=engine_stopped_without_interruption")
+                    }
+                    self.setVisibleAudioFailure(mode: self.probeState.activeAudioMode ?? .postConnect, stage: "audio_engine_stopped_without_interruption", error: nil)
+                }
             }
         }
     }
@@ -360,12 +465,30 @@ final class IOSCellularAudioProbe: NSObject, ObservableObject {
         let interruptionType = info[AVAudioSessionInterruptionTypeKey].map { String(describing: $0) } ?? "none"
         let interruptionOptions = info[AVAudioSessionInterruptionOptionKey].map { String(describing: $0) } ?? "none"
         let routeReason = info[AVAudioSessionRouteChangeReasonKey].map { String(describing: $0) } ?? "none"
+        let rawInterruptionOptions = (info[AVAudioSessionInterruptionOptionKey] as? NSNumber)?.uintValue ?? 0
+        let shouldResume = AVAudioSession.InterruptionOptions(rawValue: rawInterruptionOptions).contains(.shouldResume)
+        let engineBefore = engine?.isRunning ?? false
+        let appState = Self.applicationState(UIApplication.shared.applicationState)
         if event == "audio_interruption",
            let rawValue = (info[AVAudioSessionInterruptionTypeKey] as? NSNumber)?.uintValue,
            let type = AVAudioSession.InterruptionType(rawValue: rawValue) {
-            audioInterruptionActive = type == .began
+            switch type {
+            case .began:
+                audioInterruptionActive = true
+                probeState.markInterruptionBegan(engineWasRunning: engineBefore)
+                if probeState.activeAudioMode == .prearm, probeState.callStatus == .connected {
+                    record("PREARM_SURVIVED_CELLULAR_CONNECT=NO reason=audio_interruption_began")
+                }
+            case .ended:
+                audioInterruptionActive = false
+                probeState.markInterruptionEnded(shouldResume: shouldResume)
+            @unknown default:
+                break
+            }
         }
-        record("\(event) interruption_type=\(interruptionType) interruption_options=\(interruptionOptions) route_reason=\(routeReason)")
+        let engineAfter = engine?.isRunning ?? false
+        record("\(event) interruption_type=\(interruptionType) interruption_options=\(interruptionOptions) should_resume=\(shouldResume) route_reason=\(routeReason) engine_running_before=\(engineBefore) engine_running_after=\(engineAfter) app_state=\(appState)")
+        recordAudioSnapshot(prefix: "audio_after_\(event)")
     }
 
     private func recordApplicationState(prefix: String) {
@@ -377,7 +500,10 @@ final class IOSCellularAudioProbe: NSObject, ObservableObject {
         let inputs = route.inputs.map { "\($0.portType.rawValue):\($0.portName)" }.joined(separator: ",")
         let outputs = route.outputs.map { "\($0.portType.rawValue):\($0.portName)" }.joined(separator: ",")
         let available = audioSession.availableInputs?.map { "\($0.portType.rawValue):\($0.portName)" }.joined(separator: ",") ?? "none"
-        record("\(prefix) category=\(audioSession.category.rawValue) mode=\(audioSession.mode.rawValue) sample_rate=\(audioSession.sampleRate) io_buffer=\(audioSession.ioBufferDuration) inputs=[\(inputs)] outputs=[\(outputs)] available_inputs=[\(available)] interruption_active=\(audioInterruptionActive)")
+        let engineRunning = engine?.isRunning ?? false
+        let inputVoiceProcessing = engine?.inputNode.isVoiceProcessingEnabled ?? false
+        let outputVoiceProcessing = engine?.outputNode.isVoiceProcessingEnabled ?? false
+        record("\(prefix) category=\(audioSession.category.rawValue) mode=\(audioSession.mode.rawValue) sample_rate=\(audioSession.sampleRate) io_buffer=\(audioSession.ioBufferDuration) inputs=[\(inputs)] outputs=[\(outputs)] available_inputs=[\(available)] interruption_active=\(audioInterruptionActive) engine_running=\(engineRunning) voice_processing_input=\(inputVoiceProcessing) voice_processing_output=\(outputVoiceProcessing) app_state=\(Self.applicationState(UIApplication.shared.applicationState))")
     }
 
     private func recordVerdict(reason: String) {
@@ -423,11 +549,21 @@ extension IOSCellularAudioProbe: CXCallObserverDelegate {
         Task { @MainActor [weak self] in
             guard let self else { return }
             self.record("cx_call_changed outgoing=\(call.isOutgoing) connected=\(call.hasConnected) ended=\(call.hasEnded) on_hold=\(call.isOnHold) process_state=\(Self.applicationState(UIApplication.shared.applicationState))")
-            if call.isOutgoing, call.hasConnected {
+            if call.isOutgoing, call.hasEnded {
+                self.probeState.markCallEnded()
+                self.record("cellular_call_ended evidence=CXCallObserver.hasEnded")
+            } else if call.isOutgoing, call.hasConnected {
                 var next = self.verdict
                 next.cellularCallConnected = true
                 self.verdict = next
+                let engineRunning = self.engine?.isRunning ?? false
+                self.probeState.markCallConnected(engineIsRunning: engineRunning)
                 self.record("cellular_call_connected evidence=CXCallObserver.hasConnected")
+                if self.probeState.activeAudioMode == .prearm {
+                    self.record("PREARM_SURVIVED_CELLULAR_CONNECT=\(self.probeState.prearmSurvivedCellularConnect == true ? "YES" : "NO") engine_running=\(engineRunning)")
+                }
+            } else if call.isOutgoing {
+                self.probeState.markCallDialing()
             }
             self.recordVerdict(reason: "cx_call_state_changed")
             self.recordAudioSnapshot(prefix: "audio_at_call_change")
@@ -445,9 +581,45 @@ struct IOSCellularAudioProbeView: View {
             ScrollViewReader { proxy in
                 ScrollView {
                     VStack(spacing: 12) {
+                        VStack(alignment: .leading, spacing: 5) {
+                            Text("CELLULAR CALL: \(probe.probeState.callStatus.rawValue)")
+                            Text("PRE-ARM AUDIO: \(probe.probeState.prearmStatus.rawValue)")
+                            if let survived = probe.probeState.prearmSurvivedCellularConnect {
+                                Text("PREARM_SURVIVED_CELLULAR_CONNECT: \(survived ? "YES" : "NO")")
+                            }
+                            Text("POST-CONNECT AUDIO: \(probe.probeState.postConnectStatus.rawValue)")
+                            Text("AVAudioSession: \(probe.probeState.audioSessionStatus.rawValue)")
+                            Text("AVAudioEngine: \(probe.probeState.audioEngineStatus.rawValue)")
+                            Text("RESUME AVAILABLE: \(probe.probeState.resumeAvailable ? "YES" : "NO")")
+                        }
+                        .font(.headline.monospaced())
+                        .frame(maxWidth: .infinity, alignment: .leading)
+
+                        if let error = probe.probeState.lastAudioError {
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text("LAST AUDIO ERROR").bold()
+                                Text("stage=\(error.stage)")
+                                Text("domain=\(error.domain)")
+                                Text("code=\(error.code)")
+                                Text(error.description)
+                            }
+                            .font(.caption.monospaced())
+                            .foregroundStyle(.red)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                        }
+
+                        Text("CELLULAR DOWNLINK DIGITAL ENDPOINT: NOT EXPOSED BY PUBLIC APP AUDIO GRAPH")
+                            .font(.caption.bold())
+                            .frame(maxWidth: .infinity, alignment: .leading)
+
                         TextField("Phone number", text: $number)
                             .keyboardType(.phonePad)
                             .textFieldStyle(.roundedBorder)
+
+                        Button("ARM APP AUDIO BEFORE CALL") {
+                            Task { await probe.armAudioBeforeCall() }
+                        }
+                        .buttonStyle(.bordered)
 
                         Button("START CELLULAR TEST") {
                             Task { await probe.startCellularTest(number: number) }
@@ -456,14 +628,17 @@ struct IOSCellularAudioProbeView: View {
 
                         Text("Cellular services: \(probe.cellularServicesSummary)")
                             .font(.caption)
-                        Text(probe.verdict.cellularCallConnected ? "CELLULAR CALL: CONNECTED" : "CELLULAR CALL: NOT CONNECTED")
-                            .font(.caption.bold())
 
-                        Button("START AUDIO PROBE") {
-                            Task { await probe.startAudioProbe() }
+                        Button("TRY APP AUDIO AFTER CONNECT") {
+                            Task { await probe.tryAudioAfterConnect() }
                         }
                         .buttonStyle(.bordered)
-                        .disabled(probe.isAudioProbeRunning)
+
+                        Button("TRY RESUME APP AUDIO") {
+                            Task { await probe.tryResumeAppAudio() }
+                        }
+                        .buttonStyle(.bordered)
+                        .disabled(!probe.probeState.resumeAvailable || probe.probeState.resumeAttempted)
 
                         Text("Спочатку вимкніть мікрофон саме системного cellular-дзвінка (Mute), потім поверніться сюди і натисніть CONFIRM CELLULAR MIC MUTED.")
                             .font(.caption)
@@ -478,7 +653,20 @@ struct IOSCellularAudioProbeView: View {
                             probe.runUplinkTone()
                         }
                         .buttonStyle(.borderedProminent)
-                        .disabled(!probe.verdict.cellularCallConnected || !probe.verdict.userConfirmedCellularMicMuted || !probe.isAudioProbeRunning || probe.verdict.uplinkToneWasRun)
+                        .disabled(!probe.uplinkToneBlockReasons.isEmpty)
+
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("UPLINK TONE BLOCKED BECAUSE:").bold()
+                            if probe.uplinkToneBlockReasons.isEmpty {
+                                Text("NONE — READY")
+                            } else {
+                                ForEach(probe.uplinkToneBlockReasons, id: \.rawValue) { reason in
+                                    Text(reason.rawValue)
+                                }
+                            }
+                        }
+                        .font(.caption.monospaced())
+                        .frame(maxWidth: .infinity, alignment: .leading)
 
                         HStack {
                             Button("REMOTE HEARD TONE") { probe.reportRemoteHeardTone(true) }
