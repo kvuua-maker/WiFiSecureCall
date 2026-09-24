@@ -10,9 +10,18 @@ final class IOSDefaultCallingSceneDelegate: NSObject, UIWindowSceneDelegate {
         for activity in connectionOptions.userActivities {
             _ = IOSSystemDialCoordinator.shared.handleDefaultCallingActivity(activity)
         }
+        for context in connectionOptions.urlContexts {
+            _ = IOSSystemDialCoordinator.shared.handleDefaultCallingURL(context.url)
+        }
     }
 
     func scene(_ scene: UIScene, continue userActivity: NSUserActivity) {
         _ = IOSSystemDialCoordinator.shared.handleDefaultCallingActivity(userActivity)
+    }
+
+    func scene(_ scene: UIScene, openURLContexts URLContexts: Set<UIOpenURLContext>) {
+        for context in URLContexts {
+            _ = IOSSystemDialCoordinator.shared.handleDefaultCallingURL(context.url)
+        }
     }
 }

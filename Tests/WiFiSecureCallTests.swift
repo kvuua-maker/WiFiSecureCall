@@ -156,6 +156,104 @@ final class SystemDialDiagnosticTests: XCTestCase {
         XCTAssertNil(SystemDialTelephonyURL.make(handle: ""))
     }
 
+    func testIOSInfoPlistDeclaresSupportedCallIntentActivities() throws {
+        let repository = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let data = try Data(contentsOf: repository.appendingPathComponent("iOS/Info.plist"))
+        let plist = try XCTUnwrap(PropertyListSerialization.propertyList(from: data, format: nil) as? [String: Any])
+        let types = try XCTUnwrap(plist["NSUserActivityTypes"] as? [String])
+        XCTAssertEqual(Set(types), Set(["INStartCallIntent", "INStartAudioCallIntent", "INStartVideoCallIntent"]))
+    }
+
+    func testDefaultCallingTelURLParsesInternationalHandle() throws {
+        let url = try XCTUnwrap(URL(string: "tel:+380501234567"))
+        XCTAssertEqual(WSCDefaultCallingURLParser.handle(from: url), "+380501234567")
+    }
+
+    func testDefaultCallingTelURLParsesLocalHandle() throws {
+        let url = try XCTUnwrap(URL(string: "tel:0501234567"))
+        XCTAssertEqual(WSCDefaultCallingURLParser.handle(from: url), "0501234567")
+    }
+
+    func testDefaultCallingTelURLSafelyDecodesPercentEncodedHandle() throws {
+        let url = try XCTUnwrap(URL(string: "tel:%2B380501234567"))
+        XCTAssertEqual(WSCDefaultCallingURLParser.handle(from: url), "+380501234567")
+    }
+
+    func testDefaultCallingURLRejectsEmptyAndNonTelSchemes() throws {
+        XCTAssertNil(WSCDefaultCallingURLParser.handle(from: try XCTUnwrap(URL(string: "tel:"))))
+        for value in ["telephony:+380501234567", "http://example.com", "https://example.com"] {
+            XCTAssertNil(WSCDefaultCallingURLParser.handle(from: try XCTUnwrap(URL(string: value))), value)
+        }
+    }
+
+    func testTelURLCreatesStandaloneAttemptAndTriggersTelephonyFallback() throws {
+        let store = makeStore()
+        var openedURL: URL?
+        let coordinator = makeIOSCoordinator(store: store) { url, completion in
+            openedURL = url
+            completion(true)
+        }
+        XCTAssertTrue(coordinator.handleDefaultCallingURL(try XCTUnwrap(URL(string: "tel:+380501234567"))))
+        XCTAssertEqual(store.attempts.count, 1)
+        XCTAssertEqual(store.attempts[0].numberDigitCount, 12)
+        XCTAssertTrue(store.attempts[0].events.contains { $0.event == "default_call_url_received" })
+        XCTAssertNotNil(store.attempts[0].iPhoneDefaultCallingRequestAt)
+        XCTAssertNotNil(store.attempts[0].iPhoneTelephonyFallbackRequestedAt)
+        XCTAssertEqual(openedURL?.scheme, "telephony")
+        XCTAssertEqual(openedURL?.path, "+380501234567")
+    }
+
+    func testTelURLDiagnosticsPersistNoRawNumber() async throws {
+        let url = temporaryStoreURL()
+        let store = SystemDialDiagnosticStore(fileURL: url)
+        let coordinator = makeIOSCoordinator(store: store) { _, completion in completion(true) }
+        XCTAssertTrue(coordinator.handleDefaultCallingURL(try XCTUnwrap(URL(string: "tel:+380501234567"))))
+        await store.flush()
+        let persisted = String(decoding: try Data(contentsOf: url), as: UTF8.self)
+        XCTAssertFalse(persisted.contains("+380501234567"))
+        XCTAssertTrue(persisted.contains("scheme=tel digitCount=12"))
+    }
+
+    func testActivityThenTelURLRequestsOnlyOneFallbackAndUsesOneAttempt() throws {
+        let store = makeStore()
+        var openCount = 0
+        let coordinator = makeIOSCoordinator(store: store) { _, completion in
+            openCount += 1
+            completion(true)
+        }
+        XCTAssertTrue(coordinator.handleDefaultCallingActivityEvidence(
+            activityType: "INStartCallIntent",
+            interactionPresent: true,
+            intentType: "INStartCallIntent",
+            handle: "+380501234567"
+        ))
+        XCTAssertTrue(coordinator.handleDefaultCallingURL(try XCTUnwrap(URL(string: "tel:+380501234567"))))
+        XCTAssertEqual(openCount, 1)
+        XCTAssertEqual(store.attempts.count, 1)
+        XCTAssertEqual(store.attempts[0].events.filter { $0.event == "telephony_fallback_requested" }.count, 1)
+    }
+
+    func testTelURLThenActivityRequestsOnlyOneFallbackAndUsesOneAttempt() throws {
+        let store = makeStore()
+        var openCount = 0
+        let coordinator = makeIOSCoordinator(store: store) { _, completion in
+            openCount += 1
+            completion(true)
+        }
+        XCTAssertTrue(coordinator.handleDefaultCallingURL(try XCTUnwrap(URL(string: "tel:0501234567"))))
+        XCTAssertTrue(coordinator.handleDefaultCallingActivityEvidence(
+            activityType: "INStartCallIntent",
+            interactionPresent: true,
+            intentType: "INStartCallIntent",
+            handle: "0501234567"
+        ))
+        XCTAssertEqual(openCount, 1)
+        XCTAssertEqual(store.attempts.count, 1)
+        XCTAssertEqual(store.attempts[0].events.filter { $0.event == "telephony_fallback_requested" }.count, 1)
+    }
+
     func testDuplicateDefaultCallDeliveryIsSuppressed() {
         let gate = SystemDialDefaultCallAdmissionGate(duplicateWindow: 3)
         let now = Date(timeIntervalSince1970: 100)

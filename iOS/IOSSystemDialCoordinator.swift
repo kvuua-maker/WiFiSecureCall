@@ -98,6 +98,28 @@ final class IOSSystemDialCoordinator: NSObject {
         )
 
         guard let handle else { return false }
+        return handleExtractedDefaultCall(handle, attemptID: attemptID, requestAt: requestAt)
+    }
+
+    @discardableResult
+    func handleDefaultCallingURL(_ url: URL) -> Bool {
+        guard let handle = WSCDefaultCallingURLParser.handle(from: url) else { return false }
+        let requestAt = Date()
+        let digitCount = handle.filter(\.isNumber).count
+        let attemptID = ensureDefaultActivityAttempt(at: requestAt, numberDigitCount: digitCount)
+        store.record(
+            id: attemptID,
+            source: "iPhone",
+            event: "default_call_url_received",
+            status: "received",
+            detail: "scheme=tel digitCount=\(digitCount)",
+            at: requestAt
+        )
+        return handleExtractedDefaultCall(handle, attemptID: attemptID, requestAt: requestAt)
+    }
+
+    private func handleExtractedDefaultCall(_ handle: String, attemptID: UUID, requestAt: Date) -> Bool {
+        let digitCount = handle.filter(\.isNumber).count
         store.updateAndRecord(
             id: attemptID,
             source: "iPhone",
@@ -106,7 +128,7 @@ final class IOSSystemDialCoordinator: NSObject {
             detail: "digitCount=\(digitCount)",
             at: requestAt
         ) {
-            $0.iPhoneDefaultCallingRequestAt = requestAt
+            if $0.iPhoneDefaultCallingRequestAt == nil { $0.iPhoneDefaultCallingRequestAt = requestAt }
         }
         startObservationIfNeeded(attemptID: attemptID, startedAt: requestAt)
 
@@ -472,6 +494,15 @@ enum WSCDefaultCallingHandleExtractor {
         return contacts?
             .compactMap { $0.personHandle?.value }
             .first { !$0.isEmpty }
+    }
+}
+
+enum WSCDefaultCallingURLParser {
+    static func handle(from url: URL) -> String? {
+        guard url.scheme?.caseInsensitiveCompare("tel") == .orderedSame,
+              let components = URLComponents(url: url, resolvingAgainstBaseURL: false) else { return nil }
+        let handle = components.percentEncodedPath.removingPercentEncoding ?? components.path
+        return handle.isEmpty ? nil : handle
     }
 }
 

@@ -43,6 +43,14 @@ final class IOSNotificationController: NSObject, UIApplicationDelegate, UNUserNo
         return configuration
     }
 
+    func application(
+        _ application: UIApplication,
+        continue userActivity: NSUserActivity,
+        restorationHandler: @escaping ([UIUserActivityRestoring]?) -> Void
+    ) -> Bool {
+        IOSSystemDialCoordinator.shared.handleDefaultCallingActivity(userActivity)
+    }
+
     func application(_ application: UIApplication, didRegisterForRemoteNotificationsWithDeviceToken token: Data) { upload(token, pushType: .alert) }
     func application(_ application: UIApplication, didFailToRegisterForRemoteNotificationsWithError error: Error) { registrationFailed(error) }
 
