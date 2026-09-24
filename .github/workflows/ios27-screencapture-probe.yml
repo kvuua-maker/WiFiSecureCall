@@ -1,0 +1,54 @@
+name: iOS 27 ScreenCaptureKit environment probe
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - experiment/iphone-cellular-audio-probe
+    paths:
+      - .github/workflows/ios27-screencapture-probe.yml
+
+permissions:
+  contents: write
+
+jobs:
+  environment:
+    runs-on: xcode-27
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: experiment/iphone-cellular-audio-probe
+      - name: Capture environment
+        shell: bash
+        run: |
+          set -euo pipefail
+          result=.github/ios27-environment-result.txt
+          {
+            echo '=== sw_vers ==='
+            sw_vers
+            echo '=== uname -m ==='
+            uname -m
+            echo '=== xcode-select -p ==='
+            xcode-select -p
+            echo '=== xcodebuild -version ==='
+            xcodebuild -version
+            echo '=== xcodebuild -showsdks ==='
+            xcodebuild -showsdks
+            echo '=== Xcode applications ==='
+            ls -1 /Applications | grep -i '^Xcode' || true
+            echo '=== Xcode application versions ==='
+            for app in /Applications/Xcode*.app; do
+              [ -d "$app" ] || continue
+              echo "--- $app"
+              "$app/Contents/Developer/usr/bin/xcodebuild" -version || true
+            done
+          } | tee "$result"
+      - name: Return environment result to experiment branch
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add .github/ios27-environment-result.txt
+          git diff --cached --quiet || git commit -m 'Record iOS 27 runner environment'
+          git push origin HEAD:experiment/iphone-cellular-audio-probe
