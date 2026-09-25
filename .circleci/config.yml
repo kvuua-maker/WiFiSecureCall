@@ -1,44 +1,48 @@
 version: 2.1
 
 jobs:
-  sdk27-exact-compile:
+  exact-api-typecheck:
     macos:
       xcode: 27.0.0
     resource_class: m4pro.medium
     steps:
       - run:
-          name: Typecheck exact iOS 27 public APIs
+          name: Exact iOS 27 API typecheck
           command: |
             set -euo pipefail
             SDK="$(xcrun --sdk iphoneos --show-sdk-path)"
 
-            cat > /tmp/SDK27Probe.swift <<'SWIFT'
+            cat > /tmp/Probe.swift <<'SWIFT'
             import AVFAudio
             import MediaDevice
+            import UniformTypeIdentifiers
 
             @available(iOS 27.0, *)
-            func mediaDeviceProbe() {
+            func mediaDeviceSymbols() {
                 _ = AVAudioSession.Port.mediaDeviceExtension
                 _ = MediaOutputDevice.Capabilities.realtimeAudioStreaming
             }
 
-            @available(iOS 27.0, *)
-            func mediaExtensionTypeProbe<T: MediaDeviceExtension>(_: T.Type) {}
-
-            @available(iOS 27.0, *)
-            func realtimeTypeProbe<T: RealtimeSampleHandling>(_: T.Type) {}
-
-            func microphoneInjectionProbe() throws {
+            func micInjectionSymbols() throws {
                 let session = AVAudioSession.sharedInstance()
                 _ = session.isMicrophoneInjectionAvailable
                 _ = session.preferredMicrophoneInjectionMode
                 try session.setPreferredMicrophoneInjectionMode(.spokenAudio)
             }
+
+            @available(iOS 27.0, *)
+            struct TypeChecks {
+                static func acceptExtension<T: MediaDeviceExtension>(_: T.Type) {}
+                static func acceptRealtime<T: RealtimeSampleHandling>(_: T.Type) {}
+            }
             SWIFT
 
-            xcrun swiftc               -target arm64-apple-ios27.0               -sdk "$SDK"               -typecheck /tmp/SDK27Probe.swift
+            xcrun swiftc \
+              -target arm64-apple-ios27.0 \
+              -sdk "$SDK" \
+              -typecheck /tmp/Probe.swift
 
 workflows:
-  sdk27-exact-compile:
+  exact-api-typecheck:
     jobs:
-      - sdk27-exact-compile
+      - exact-api-typecheck
