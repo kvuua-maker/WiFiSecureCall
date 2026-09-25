@@ -7,72 +7,60 @@ jobs:
     resource_class: m4pro.medium
     steps:
       - run:
-          name: Scan iOS 27 public SDK symbols
+          name: Scan iOS 27 public SDK
           command: |
             set -euo pipefail
+
             SDK="$(xcrun --sdk iphoneos --show-sdk-path)"
-            test "$(xcrun --sdk iphoneos --show-sdk-version | cut -d. -f1)" -ge 27
+            echo "XCODE=$(xcodebuild -version | tr '\n' ' ')"
+            echo "IOS_SDK=$(xcrun --sdk iphoneos --show-sdk-version)"
 
             mkdir -p /tmp/sdk27probe
             OUT=/tmp/sdk27probe/results.env
             : > "$OUT"
 
-            flag() {
-              local name="$1"
-              shift
-              if "$@"; then
-                echo "export ${name}=1" >> "$OUT"
-              else
-                echo "export ${name}=0" >> "$OUT"
-              fi
-            }
-
             MDE="$SDK/System/Library/Frameworks/MediaDevice.framework"
             AVFA="$SDK/System/Library/Frameworks/AVFAudio.framework"
             LCK="$SDK/System/Library/Frameworks/LiveCommunicationKit.framework"
 
-            flag MDE_FRAMEWORK test -d "$MDE"
-
             if [ -d "$MDE" ]; then
-              flag MDE_REALTIME bash -lc "grep -R -q 'realtimeAudioStreaming' '$MDE/Modules' '$MDE/Headers' 2>/dev/null"
+              echo 'export MDE_FRAMEWORK=1' >> "$OUT"
             else
-              echo "export MDE_REALTIME=0" >> "$OUT"
+              echo 'export MDE_FRAMEWORK=0' >> "$OUT"
             fi
 
-            if [ -d "$AVFA" ]; then
-              flag MDE_PORT bash -lc "grep -R -q -i 'mediaDeviceExtension' '$AVFA/Modules' '$AVFA/Headers' 2>/dev/null"
-              flag MIC_INJECTION bash -lc "grep -R -q -E 'MicrophoneInjection|microphoneInjection' '$AVFA/Modules' '$AVFA/Headers' 2>/dev/null"
+            if grep -R -q 'realtimeAudioStreaming' "$MDE/Modules" "$MDE/Headers" 2>/dev/null; then
+              echo 'export MDE_REALTIME=1' >> "$OUT"
             else
-              echo "export MDE_PORT=0" >> "$OUT"
-              echo "export MIC_INJECTION=0" >> "$OUT"
+              echo 'export MDE_REALTIME=0' >> "$OUT"
             fi
 
-            if [ -d "$LCK" ]; then
-              python3 - "$LCK" "$OUT" <<'PY'
-            import os, re, sys
-            root, out = sys.argv[1], sys.argv[2]
-            text = ""
-            for base, _, files in os.walk(root):
-                for fn in files:
-                    if fn.endswith((".swiftinterface", ".swift", ".h")):
-                        try:
-                            text += open(os.path.join(base, fn), errors="ignore").read() + "\n"
-                        except Exception:
-                            pass
-
-            start = text.find("TelephonyConversationManager")
-            block = text[start:start+12000] if start >= 0 else ""
-            media = bool(re.search(r"\b(audio|media|route|stream|sampleBuffer|PCM|AVAudio)\b", block, re.I))
-            with open(out, "a") as f:
-                f.write(f"export TCM_MEDIA_ROUTE={1 if media else 0}\n")
-                f.write(f"export LIVE_ASSISTANCE={1 if 'LiveAssistanceExtension' in text else 0}\n")
-            PY
+            if grep -R -q -i 'mediaDeviceExtension' "$AVFA/Modules" "$AVFA/Headers" 2>/dev/null; then
+              echo 'export MDE_PORT=1' >> "$OUT"
             else
-              echo "export TCM_MEDIA_ROUTE=0" >> "$OUT"
-              echo "export LIVE_ASSISTANCE=0" >> "$OUT"
+              echo 'export MDE_PORT=0' >> "$OUT"
+            fi
+
+            if grep -R -q -E 'MicrophoneInjection|microphoneInjection' "$AVFA/Modules" "$AVFA/Headers" 2>/dev/null; then
+              echo 'export MIC_INJECTION=1' >> "$OUT"
+            else
+              echo 'export MIC_INJECTION=0' >> "$OUT"
+            fi
+
+            if grep -R -q 'LiveAssistanceExtension' "$LCK/Modules" "$LCK/Headers" 2>/dev/null; then
+              echo 'export LIVE_ASSISTANCE=1' >> "$OUT"
+            else
+              echo 'export LIVE_ASSISTANCE=0' >> "$OUT"
+            fi
+
+            if grep -R -A 160 'TelephonyConversationManager' "$LCK/Modules" "$LCK/Headers" 2>/dev/null | grep -Eiq 'audio|media|route|stream|sampleBuffer|PCM|AVAudio'; then
+              echo 'export TCM_MEDIA_ROUTE=1' >> "$OUT"
+            else
+              echo 'export TCM_MEDIA_ROUTE=0' >> "$OUT"
             fi
 
             cat "$OUT"
+
       - persist_to_workspace:
           root: /tmp/sdk27probe
           paths:
@@ -84,7 +72,8 @@ jobs:
     steps:
       - attach_workspace:
           at: /tmp/sdk27probe
-      - run: source /tmp/sdk27probe/results.env && test "$MDE_FRAMEWORK" = 1
+      - run:
+          command: source /tmp/sdk27probe/results.env && test "$MDE_FRAMEWORK" = 1
 
   mde-realtime-audio-present:
     docker:
@@ -92,7 +81,8 @@ jobs:
     steps:
       - attach_workspace:
           at: /tmp/sdk27probe
-      - run: source /tmp/sdk27probe/results.env && test "$MDE_REALTIME" = 1
+      - run:
+          command: source /tmp/sdk27probe/results.env && test "$MDE_REALTIME" = 1
 
   avaudio-mediadevice-port-present:
     docker:
@@ -100,7 +90,8 @@ jobs:
     steps:
       - attach_workspace:
           at: /tmp/sdk27probe
-      - run: source /tmp/sdk27probe/results.env && test "$MDE_PORT" = 1
+      - run:
+          command: source /tmp/sdk27probe/results.env && test "$MDE_PORT" = 1
 
   microphone-injection-present:
     docker:
@@ -108,7 +99,8 @@ jobs:
     steps:
       - attach_workspace:
           at: /tmp/sdk27probe
-      - run: source /tmp/sdk27probe/results.env && test "$MIC_INJECTION" = 1
+      - run:
+          command: source /tmp/sdk27probe/results.env && test "$MIC_INJECTION" = 1
 
   live-assistance-present:
     docker:
@@ -116,7 +108,8 @@ jobs:
     steps:
       - attach_workspace:
           at: /tmp/sdk27probe
-      - run: source /tmp/sdk27probe/results.env && test "$LIVE_ASSISTANCE" = 1
+      - run:
+          command: source /tmp/sdk27probe/results.env && test "$LIVE_ASSISTANCE" = 1
 
   tcm-public-media-route-symbol:
     docker:
@@ -124,23 +117,28 @@ jobs:
     steps:
       - attach_workspace:
           at: /tmp/sdk27probe
-      - run: source /tmp/sdk27probe/results.env && test "$TCM_MEDIA_ROUTE" = 1
+      - run:
+          command: source /tmp/sdk27probe/results.env && test "$TCM_MEDIA_ROUTE" = 1
 
 workflows:
   sdk27-symbol-probe:
     jobs:
       - sdk27-scan
       - mde-framework-present:
-          requires: [sdk27-scan]
+          requires:
+            - sdk27-scan
       - mde-realtime-audio-present:
-          requires: [sdk27-scan]
+          requires:
+            - sdk27-scan
       - avaudio-mediadevice-port-present:
-          requires: [sdk27-scan]
+          requires:
+            - sdk27-scan
       - microphone-injection-present:
-          requires: [sdk27-scan]
+          requires:
+            - sdk27-scan
       - live-assistance-present:
-          requires: [sdk27-scan]
+          requires:
+            - sdk27-scan
       - tcm-public-media-route-symbol:
-          requires: [sdk27-scan]
-
-# deep-probe-trigger-1
+          requires:
+            - sdk27-scan
