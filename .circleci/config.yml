@@ -40,6 +40,29 @@ jobs:
             MediaDeviceProbe/verify_archive.sh \
               /tmp/WiFiSecureCallMediaDeviceProbe.xcarchive \
               /tmp/wsc-media-artifacts/verification.txt
+      - run:
+          name: Export and verify isolated App Store IPA
+          command: |
+            set -euo pipefail
+            export_path=/tmp/WiFiSecureCallMediaDeviceProbeExport
+            xcodebuild \
+              -exportArchive \
+              -archivePath /tmp/WiFiSecureCallMediaDeviceProbe.xcarchive \
+              -exportPath "$export_path" \
+              -exportOptionsPlist MediaDeviceProbe/ExportOptions.plist
+            ipa_path="$(find "$export_path" -maxdepth 1 -type f -name '*.ipa' -print -quit)"
+            test -n "$ipa_path"
+            chmod +x MediaDeviceProbe/verify_ipa.sh
+            MediaDeviceProbe/verify_ipa.sh \
+              "$ipa_path" \
+              /tmp/wsc-media-artifacts/ipa-verification.txt
+            cp "$ipa_path" /tmp/wsc-media-artifacts/WiFiSecureCallMediaDeviceProbe.ipa
+            shasum -a 256 /tmp/wsc-media-artifacts/WiFiSecureCallMediaDeviceProbe.ipa \
+              > /tmp/wsc-media-artifacts/WiFiSecureCallMediaDeviceProbe.ipa.sha256
+      - run:
+          name: Package signed archive artifact
+          command: |
+            set -euo pipefail
             ditto -c -k --sequesterRsrc --keepParent \
               /tmp/WiFiSecureCallMediaDeviceProbe.xcarchive \
               /tmp/wsc-media-artifacts/WiFiSecureCallMediaDeviceProbe.xcarchive.zip
