@@ -1,0 +1,47 @@
+version: 2.1
+
+jobs:
+  xcode27-sdk-probe:
+    macos:
+      xcode: 27.0.0
+    resource_class: m4pro.medium
+    steps:
+      - checkout
+      - run:
+          name: Xcode 27 SDK probe
+          command: |
+            set -euo pipefail
+            echo "=== XCODE ==="
+            xcodebuild -version
+
+            SDK="$(xcrun --sdk iphoneos --show-sdk-path)"
+            echo "=== IOS SDK ==="
+            xcrun --sdk iphoneos --show-sdk-version
+            echo "$SDK"
+
+            echo "=== AUDIO / TELEPHONY API PROBE ==="
+            PATTERN='MediaDeviceExtension|realtimeAudioStreaming|mediaDeviceExtension|MicrophoneInjection|microphoneInjection|TelephonyConversationManager|StartCellularConversationAction|LiveAssistanceExtension|HFP|handsFree|hands-free'
+
+            for FW in MediaDevice AVFAudio AVFoundation AVSystemRouting LiveCommunicationKit AudioAccessoryKit AccessorySetupKit ExternalAccessory; do
+              echo "===== $FW ====="
+              DIR="$SDK/System/Library/Frameworks/$FW.framework"
+              if [ ! -d "$DIR" ]; then
+                echo "FRAMEWORK_NOT_PRESENT"
+                continue
+              fi
+              grep -R -n -E "$PATTERN" "$DIR/Modules" "$DIR/Headers" 2>/dev/null | head -n 200 || true
+            done
+
+            echo "=== EXACT mediaDeviceExtension OCCURRENCES ==="
+            for FW in MediaDevice AVFAudio AVFoundation AVSystemRouting; do
+              DIR="$SDK/System/Library/Frameworks/$FW.framework"
+              [ -d "$DIR" ] || continue
+              grep -R -n -i 'mediaDeviceExtension' "$DIR/Modules" "$DIR/Headers" 2>/dev/null | head -n 120 || true
+            done
+
+            echo "=== PROBE COMPLETE ==="
+
+workflows:
+  xcode27-probe:
+    jobs:
+      - xcode27-sdk-probe
