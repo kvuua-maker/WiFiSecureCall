@@ -1,0 +1,66 @@
+name: WiFiSecureCallMediaDeviceProbe
+
+options:
+  minimumXcodeGenVersion: 2.46.0
+
+settings:
+  base:
+    SWIFT_VERSION: 6.0
+    IPHONEOS_DEPLOYMENT_TARGET: 27.0
+
+targets:
+  MediaDeviceProbe:
+    type: application
+    platform: iOS
+    deploymentTarget: "27.0"
+    sources:
+      - path: App
+    info:
+      path: Generated/App-Info.plist
+      properties:
+        CFBundleDisplayName: WiFi Secure Call Media Probe
+        UILaunchScreen: {}
+        MDESupportedProtocols:
+          - media-device-protocol.com.vkapps.wifisecurecall.mediadeviceprobe
+    entitlements:
+      path: Generated/App.entitlements
+      properties:
+        com.apple.developer.media-device-extension:
+          - media-device-protocol.com.vkapps.wifisecurecall.mediadeviceprobe
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.vkapps.wifisecurecall.mediadeviceprobe
+        TARGETED_DEVICE_FAMILY: "1"
+        CODE_SIGN_STYLE: Manual
+    dependencies:
+      - target: MediaDeviceProbeExtension
+        embed: true
+    scheme: {}
+
+  MediaDeviceProbeExtension:
+    type: app-extension
+    platform: iOS
+    deploymentTarget: "27.0"
+    sources:
+      - path: Extension
+    info:
+      path: Generated/Extension-Info.plist
+      properties:
+        CFBundleDisplayName: WiFi Secure Call Media Probe
+        EXAppExtensionAttributes:
+          EXExtensionPointIdentifier: com.apple.media-device-extension
+        UTExportedTypeDeclarations:
+          - UTTypeIdentifier: media-device-protocol.com.vkapps.wifisecurecall.mediadeviceprobe
+            UTTypeDescription: WiFi Secure Call Probe
+            UTTypeConformsTo:
+              - public.media-sharing-protocol
+    entitlements:
+      path: Generated/Extension.entitlements
+      properties:
+        com.apple.developer.media-device-extension:
+          - media-device-protocol.com.vkapps.wifisecurecall.mediadeviceprobe
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.vkapps.wifisecurecall.mediadeviceprobe.extension
+        CODE_SIGN_STYLE: Manual
+        SKIP_INSTALL: YES
