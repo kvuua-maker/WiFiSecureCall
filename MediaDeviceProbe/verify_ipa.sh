@@ -13,8 +13,11 @@ trap 'rm -rf "$verification_dir"' EXIT
 ditto -x -k "$ipa_path" "$verification_dir/unpacked"
 app_path="$(find "$verification_dir/unpacked/Payload" -maxdepth 1 -type d -name '*.app' -print -quit)"
 [[ -n "$app_path" ]]
-extension_path="$app_path/PlugIns/MediaDeviceProbeExtension.appex"
+extension_path="$app_path/Extensions/MediaDeviceProbeExtension.appex"
 [[ -d "$extension_path" ]]
+[[ ! -e "$app_path/PlugIns/MediaDeviceProbeExtension.appex" ]]
+
+[[ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIconName' "$app_path/Info.plist")" == "AppIcon" ]]
 
 actual_container_id="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$app_path/Info.plist")"
 actual_extension_id="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$extension_path/Info.plist")"

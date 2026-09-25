@@ -9,12 +9,15 @@ container_id="com.vkapps.wifisecurecall.mediadeviceprobe"
 extension_id="com.vkapps.wifisecurecall.mediadeviceprobe.extension"
 
 app_path="$archive_path/Products/Applications/MediaDeviceProbe.app"
-extension_path="$app_path/PlugIns/MediaDeviceProbeExtension.appex"
+extension_path="$app_path/Extensions/MediaDeviceProbeExtension.appex"
 verification_dir="$(mktemp -d /tmp/wsc-media-archive-verification.XXXXXX)"
 trap 'rm -rf "$verification_dir"' EXIT
 
 [[ -d "$app_path" ]]
 [[ -d "$extension_path" ]]
+[[ ! -e "$app_path/PlugIns/MediaDeviceProbeExtension.appex" ]]
+
+[[ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIconName' "$app_path/Info.plist")" == "AppIcon" ]]
 
 actual_container_id="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$app_path/Info.plist")"
 actual_extension_id="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$extension_path/Info.plist")"
