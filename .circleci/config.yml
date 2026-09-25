@@ -1,48 +1,31 @@
 version: 2.1
 
 jobs:
-  exact-api-typecheck:
+  mediadevice-probe-compile:
     macos:
       xcode: 27.0.0
     resource_class: m4pro.medium
     steps:
+      - checkout
       - run:
-          name: Exact iOS 27 API typecheck
+          name: Install XcodeGen
           command: |
             set -euo pipefail
-            SDK="$(xcrun --sdk iphoneos --show-sdk-path)"
-
-            cat > /tmp/Probe.swift <<'SWIFT'
-            import AVFAudio
-            import MediaDevice
-            import UniformTypeIdentifiers
-
-            @available(iOS 27.0, *)
-            func mediaDeviceSymbols() {
-                _ = AVAudioSession.Port.mediaDeviceExtension
-                _ = MediaOutputDevice.Capabilities.realtimeAudioStreaming
-            }
-
-            func micInjectionSymbols() throws {
-                let session = AVAudioSession.sharedInstance()
-                _ = session.isMicrophoneInjectionAvailable
-                _ = session.preferredMicrophoneInjectionMode
-                try session.setPreferredMicrophoneInjectionMode(.spokenAudio)
-            }
-
-            @available(iOS 27.0, *)
-            struct TypeChecks {
-                static func acceptExtension<T: MediaDeviceExtension>(_: T.Type) {}
-                static func acceptRealtime<T: RealtimeSampleHandling>(_: T.Type) {}
-            }
-            SWIFT
-
-            xcrun swiftc \
-              -target arm64-apple-ios27.0 \
-              -sdk "$SDK" \
-              -typecheck /tmp/Probe.swift
+            brew list xcodegen >/dev/null 2>&1 || brew install xcodegen
+      - run:
+          name: Generate isolated probe project
+          command: |
+            set -euo pipefail
+            cd MediaDeviceProbe
+            xcodegen generate
+      - run:
+          name: Build isolated MediaDevice probe without signing
+          command: |
+            set -euo pipefail
+            cd MediaDeviceProbe
+            xcodebuild               -project WiFiSecureCallMediaDeviceProbe.xcodeproj               -scheme MediaDeviceProbe               -configuration Release               -sdk iphoneos               -destination 'generic/platform=iOS'               CODE_SIGNING_ALLOWED=NO               CODE_SIGNING_REQUIRED=NO               build
 
 workflows:
-  exact-api-typecheck:
+  mediadevice-probe-compile:
     jobs:
-      - exact-api-typecheck
+      - mediadevice-probe-compile
