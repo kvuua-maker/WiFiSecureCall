@@ -1,80 +1,135 @@
 version: 2.1
 
 jobs:
-  archive-mediadevice-probe:
+  ua-ios27-speech-sdk-probe:
     macos:
       xcode: 27.0.0
-      code_signing:
-        - wifisecurecall-mediadevice-probe
     resource_class: m4pro.medium
     steps:
-      - install_signing_bundle
       - checkout
       - run:
-          name: Generate isolated MediaDeviceProbe project
+          name: Probe iOS 27 Speech SDK for UniversalAssistant
           command: |
             set -euo pipefail
-            if ! command -v xcodegen >/dev/null 2>&1; then
-              brew install xcodegen
+            OUT=/tmp/ua-ios27-speech-probe
+            mkdir -p "$OUT"
+            REPORT="$OUT/report.txt"
+            : > "$REPORT"
+            {
+              echo "XCODE"
+              xcodebuild -version
+              echo "IOS_SDK=$(xcrun --sdk iphoneos --show-sdk-version)"
+              echo "SWIFT=$(swift --version | head -1)"
+            } | tee -a "$REPORT"
+
+            SDK="$(xcrun --sdk iphoneos --show-sdk-path)"
+            cat > /tmp/UAiOS27SpeechProbe.swift <<'SWIFT'
+            import Foundation
+            import Speech
+
+            #if canImport(FoundationModels)
+            import FoundationModels
+            #endif
+
+            @available(iOS 27.0, *)
+            func probeDictationTranscriber() async throws {
+                let locale = Locale(identifier: "uk-UA")
+                _ = await DictationTranscriber.supportedLocale(equivalentTo: locale)
+                _ = await DictationTranscriber.supportedLocales
+                _ = await DictationTranscriber.installedLocales
+
+                let preset = DictationTranscriber.Preset.progressiveShortDictation
+                let transcriber = DictationTranscriber(
+                    locale: locale,
+                    contentHints: preset.contentHints,
+                    transcriptionOptions: preset.transcriptionOptions,
+                    reportingOptions: preset.reportingOptions.union([.alternativeTranscriptions]),
+                    attributeOptions: preset.attributeOptions.union([.transcriptionConfidence])
+                )
+
+                var context = AnalysisContext()
+                context.contextualStrings[.general] = [
+                    "Viber", "вайбер", "Telegram", "телеграм",
+                    "WhatsApp", "Spotify", "Київ", "Львів", "QR", "PDF"
+                ]
+
+                let analyzer = SpeechAnalyzer(modules: [transcriber])
+                try await analyzer.setContext(context)
+                _ = transcriber.results
+            }
+
+            @available(iOS 27.0, *)
+            func probeSpeechTranscriber() async throws {
+                _ = SpeechTranscriber.isAvailable
+                let locale = Locale(identifier: "uk-UA")
+                _ = await SpeechTranscriber.supportedLocale(equivalentTo: locale)
+                _ = await SpeechTranscriber.supportedLocales
+                _ = await SpeechTranscriber.installedLocales
+
+                if let supported = await SpeechTranscriber.supportedLocale(equivalentTo: locale) {
+                    let transcriber = SpeechTranscriber(locale: supported, preset: .progressiveTranscription)
+                    let analyzer = SpeechAnalyzer(modules: [transcriber])
+                    _ = analyzer
+                    _ = transcriber.results
+                }
+            }
+
+            @available(iOS 27.0, *)
+            func probeSpeechDetector() async throws {
+                let transcriber = DictationTranscriber(
+                    locale: Locale(identifier: "uk-UA"),
+                    preset: .progressiveShortDictation
+                )
+                let detector = SpeechDetector()
+                let analyzer = SpeechAnalyzer(modules: [detector, transcriber])
+                _ = analyzer
+                _ = detector.results
+            }
+
+            #if canImport(FoundationModels)
+            @available(iOS 27.0, *)
+            func probeFoundationModels() {
+                let model = SystemLanguageModel.default
+                _ = model.availability
+                _ = model.supportedLanguages
+                _ = model.supportsLocale(Locale(identifier: "uk-UA"))
+            }
+            #endif
+            SWIFT
+
+            set +e
+            xcrun swiftc               -sdk "$SDK"               -target arm64-apple-ios18.0               -parse-as-library               -typecheck /tmp/UAiOS27SpeechProbe.swift               >"$OUT/swiftc.stdout.txt" 2>"$OUT/swiftc.stderr.txt"
+            RC=$?
+            set -e
+            if [[ "$RC" -eq 0 ]]; then
+              echo "SDK_PROBE_COMPILE=PASS" | tee -a "$REPORT"
+            else
+              echo "SDK_PROBE_COMPILE=FAIL rc=$RC" | tee -a "$REPORT"
+              cat "$OUT/swiftc.stderr.txt" | tee -a "$REPORT"
             fi
-            cd MediaDeviceProbe
-            xcodegen generate
-      - run:
-          name: Archive isolated MediaDeviceProbe
-          command: |
-            set -euo pipefail
-            archive_path=/tmp/WiFiSecureCallMediaDeviceProbe.xcarchive
-            xcodebuild \
-              -project MediaDeviceProbe/WiFiSecureCallMediaDeviceProbe.xcodeproj \
-              -scheme MediaDeviceProbe \
-              -configuration Release \
-              -destination 'generic/platform=iOS' \
-              -archivePath "$archive_path" \
-              archive
-      - run:
-          name: Verify signed archive and entitlements
-          command: |
-            set -euo pipefail
-            mkdir -p /tmp/wsc-media-artifacts
-            chmod +x MediaDeviceProbe/verify_archive.sh
-            MediaDeviceProbe/verify_archive.sh \
-              /tmp/WiFiSecureCallMediaDeviceProbe.xcarchive \
-              /tmp/wsc-media-artifacts/verification.txt
-      - run:
-          name: Export and verify isolated App Store IPA
-          command: |
-            set -euo pipefail
-            export_path=/tmp/WiFiSecureCallMediaDeviceProbeExport
-            xcodebuild \
-              -exportArchive \
-              -archivePath /tmp/WiFiSecureCallMediaDeviceProbe.xcarchive \
-              -exportPath "$export_path" \
-              -exportOptionsPlist MediaDeviceProbe/ExportOptions.plist
-            ipa_path="$(find "$export_path" -maxdepth 1 -type f -name '*.ipa' -print -quit)"
-            test -n "$ipa_path"
-            chmod +x MediaDeviceProbe/verify_ipa.sh
-            MediaDeviceProbe/verify_ipa.sh \
-              "$ipa_path" \
-              /tmp/wsc-media-artifacts/ipa-verification.txt
-            cp "$ipa_path" /tmp/wsc-media-artifacts/WiFiSecureCallMediaDeviceProbe.ipa
-            shasum -a 256 /tmp/wsc-media-artifacts/WiFiSecureCallMediaDeviceProbe.ipa \
-              > /tmp/wsc-media-artifacts/WiFiSecureCallMediaDeviceProbe.ipa.sha256
-      - run:
-          name: Package signed archive artifact
-          command: |
-            set -euo pipefail
-            ditto -c -k --sequesterRsrc --keepParent \
-              /tmp/WiFiSecureCallMediaDeviceProbe.xcarchive \
-              /tmp/wsc-media-artifacts/WiFiSecureCallMediaDeviceProbe.xcarchive.zip
+
+            SPEECH_IFACE="$(find "$SDK/System/Library/Frameworks/Speech.framework/Modules/Speech.swiftmodule" -name '*.swiftinterface' | head -1 || true)"
+            if [[ -n "$SPEECH_IFACE" ]]; then
+              echo "SPEECH_INTERFACE=$SPEECH_IFACE" | tee -a "$REPORT"
+              grep -n -E 'DictationTranscriber|SpeechTranscriber|SpeechAnalyzer|AnalysisContext|SpeechDetector' "$SPEECH_IFACE"                 | head -160 | tee "$OUT/speech-symbols.txt" >> "$REPORT" || true
+            fi
+
+            FM_IFACE="$(find "$SDK/System/Library/Frameworks/FoundationModels.framework/Modules/FoundationModels.swiftmodule" -name '*.swiftinterface' 2>/dev/null | head -1 || true)"
+            if [[ -n "$FM_IFACE" ]]; then
+              echo "FOUNDATIONMODELS_INTERFACE=$FM_IFACE" | tee -a "$REPORT"
+              grep -n -E 'SystemLanguageModel|LanguageModelSession|supportsLocale|supportedLanguages' "$FM_IFACE"                 | head -160 | tee "$OUT/foundationmodels-symbols.txt" >> "$REPORT" || true
+            fi
+
+            exit "$RC"
       - store_artifacts:
-          path: /tmp/wsc-media-artifacts
-          destination: signed-mediadevice-probe
+          path: /tmp/ua-ios27-speech-probe
+          destination: ua-ios27-speech-probe
 
 workflows:
-  isolated-mediadevice-probe-signing:
+  ua-ios27-speech-sdk-probe:
     jobs:
-      - archive-mediadevice-probe:
+      - ua-ios27-speech-sdk-probe:
           filters:
             branches:
               only:
-                - circleci-project-setup
+                - experiment/ua-ios27-speech-sdk-probe
