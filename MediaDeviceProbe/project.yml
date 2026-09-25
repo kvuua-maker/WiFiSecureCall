@@ -32,6 +32,9 @@ targets:
         PRODUCT_BUNDLE_IDENTIFIER: com.vkapps.wifisecurecall.mediadeviceprobe
         TARGETED_DEVICE_FAMILY: "1"
         CODE_SIGN_STYLE: Manual
+        CODE_SIGN_IDENTITY: Apple Distribution
+        DEVELOPMENT_TEAM: 9V5XXDXF3N
+        PROVISIONING_PROFILE_SPECIFIER: WiFiSecureCallMediaDeviceProbeAppStore
     dependencies:
       - target: MediaDeviceProbeExtension
         embed: true
@@ -63,4 +66,7 @@ targets:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.vkapps.wifisecurecall.mediadeviceprobe.extension
         CODE_SIGN_STYLE: Manual
+        CODE_SIGN_IDENTITY: Apple Distribution
+        DEVELOPMENT_TEAM: 9V5XXDXF3N
+        PROVISIONING_PROFILE_SPECIFIER: WiFiSecureCallMediaDeviceExtensionAppStore
         SKIP_INSTALL: YES

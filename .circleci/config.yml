@@ -1,64 +1,57 @@
 version: 2.1
 
 jobs:
-  signing-scan:
+  archive-mediadevice-probe:
     macos:
       xcode: 27.0.0
+      code_signing:
+        - wifisecurecall-mediadevice-probe
     resource_class: m4pro.medium
     steps:
+      - install_signing_bundle
+      - checkout
       - run:
-          name: Inspect signing state
+          name: Generate isolated MediaDeviceProbe project
           command: |
             set -euo pipefail
-            mkdir -p /tmp/signingprobe
-            OUT=/tmp/signingprobe/results.env
-            : > "$OUT"
-
-            if security find-identity -v -p codesigning 2>/dev/null | grep -q "Apple Distribution"; then
-              echo 'export DIST_IDENTITY=1' >> "$OUT"
-            else
-              echo 'export DIST_IDENTITY=0' >> "$OUT"
+            if ! command -v xcodegen >/dev/null 2>&1; then
+              brew install xcodegen
             fi
-
-            PROFILE_DIR="$HOME/Library/MobileDevice/Provisioning Profiles"
-            if [ -d "$PROFILE_DIR" ] && find "$PROFILE_DIR" -type f \( -name '*.mobileprovision' -o -name '*.provisionprofile' \) | grep -q .; then
-              echo 'export PROFILES_PRESENT=1' >> "$OUT"
-            else
-              echo 'export PROFILES_PRESENT=0' >> "$OUT"
-            fi
-
-            cat "$OUT"
-
-      - persist_to_workspace:
-          root: /tmp/signingprobe
-          paths:
-            - results.env
-
-  distribution-identity-present:
-    docker:
-      - image: cimg/base:current
-    steps:
-      - attach_workspace:
-          at: /tmp/signingprobe
+            cd MediaDeviceProbe
+            xcodegen generate
       - run:
-          command: source /tmp/signingprobe/results.env && test "$DIST_IDENTITY" = 1
-
-  provisioning-profiles-present:
-    docker:
-      - image: cimg/base:current
-    steps:
-      - attach_workspace:
-          at: /tmp/signingprobe
+          name: Archive isolated MediaDeviceProbe
+          command: |
+            set -euo pipefail
+            archive_path=/tmp/WiFiSecureCallMediaDeviceProbe.xcarchive
+            xcodebuild \
+              -project MediaDeviceProbe/WiFiSecureCallMediaDeviceProbe.xcodeproj \
+              -scheme MediaDeviceProbe \
+              -configuration Release \
+              -destination 'generic/platform=iOS' \
+              -archivePath "$archive_path" \
+              archive
       - run:
-          command: source /tmp/signingprobe/results.env && test "$PROFILES_PRESENT" = 1
+          name: Verify signed archive and entitlements
+          command: |
+            set -euo pipefail
+            mkdir -p /tmp/wsc-media-artifacts
+            chmod +x MediaDeviceProbe/verify_archive.sh
+            MediaDeviceProbe/verify_archive.sh \
+              /tmp/WiFiSecureCallMediaDeviceProbe.xcarchive \
+              /tmp/wsc-media-artifacts/verification.txt
+            ditto -c -k --sequesterRsrc --keepParent \
+              /tmp/WiFiSecureCallMediaDeviceProbe.xcarchive \
+              /tmp/wsc-media-artifacts/WiFiSecureCallMediaDeviceProbe.xcarchive.zip
+      - store_artifacts:
+          path: /tmp/wsc-media-artifacts
+          destination: signed-mediadevice-probe
 
 workflows:
-  signing-diagnostic:
+  isolated-mediadevice-probe-signing:
     jobs:
-      - signing-scan
-      - distribution-identity-present:
-          requires:
-            - signing-scan
-      - provisioning-profiles-present:
-          requires:
-            - signing-scan
+      - archive-mediadevice-probe:
+          filters:
+            branches:
+              only:
+                - circleci-project-setup
