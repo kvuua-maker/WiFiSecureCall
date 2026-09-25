@@ -1,7 +1,7 @@
 version: 2.1
 
 jobs:
-  mediadevice-probe-compile:
+  mediadevice-signing-preflight:
     macos:
       xcode: 27.0.0
     resource_class: m4pro.medium
@@ -19,13 +19,19 @@ jobs:
             cd MediaDeviceProbe
             xcodegen generate
       - run:
-          name: Build isolated MediaDevice probe without signing
+          name: Inspect available signing identities
+          command: |
+            set -euo pipefail
+            security find-identity -v -p codesigning || true
+            ls -la "$HOME/Library/MobileDevice/Provisioning Profiles" 2>/dev/null || true
+      - run:
+          name: Attempt automatic signed archive
           command: |
             set -euo pipefail
             cd MediaDeviceProbe
-            xcodebuild               -project WiFiSecureCallMediaDeviceProbe.xcodeproj               -scheme MediaDeviceProbe               -configuration Release               -sdk iphoneos               -destination 'generic/platform=iOS'               CODE_SIGNING_ALLOWED=NO               CODE_SIGNING_REQUIRED=NO               build
+            xcodebuild               -project WiFiSecureCallMediaDeviceProbe.xcodeproj               -scheme MediaDeviceProbe               -configuration Release               -destination 'generic/platform=iOS'               -archivePath /tmp/WiFiSecureCallMediaDeviceProbe.xcarchive               DEVELOPMENT_TEAM=9V5XXDXF3N               CODE_SIGN_STYLE=Automatic               -allowProvisioningUpdates               archive
 
 workflows:
-  mediadevice-probe-compile:
+  mediadevice-signing-preflight:
     jobs:
-      - mediadevice-probe-compile
+      - mediadevice-signing-preflight
