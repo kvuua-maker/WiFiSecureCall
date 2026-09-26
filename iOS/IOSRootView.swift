@@ -48,7 +48,7 @@ struct IOSRootView: View {
         case .idle:
             VStack {
                 Button("Secure Call to Watch") { beginSecureCall() }.buttonStyle(.borderedProminent)
-                Button(accountStore.activeAccount?.phoneNumber ?? "Account") { showAccount = true }.font(.footnote)
+                Button(accountStore.activeAccount?.displayLabel ?? "Account") { showAccount = true }.font(.footnote)
                 Button("Dial diagnostics") { showDialDiagnostics = true }.font(.footnote)
             }
         case .outgoingRinging:

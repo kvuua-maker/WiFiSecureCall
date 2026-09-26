@@ -10,10 +10,49 @@ enum E164Phone {
     }
 }
 
+struct VerifiedPhone: Codable, Equatable, Sendable, Identifiable {
+    let id: UUID
+    let maskedNumber: String
+}
+
+struct UserProfile: Codable, Equatable, Sendable {
+    let userID: UUID
+    let username: String
+    let displayName: String?
+    let email: String?
+    let verifiedPhones: [String]
+    let publicIdentity: String
+}
+
 struct AccountSummary: Codable, Identifiable, Equatable, Sendable {
     let accountID: UUID
-    let phoneNumber: String
+    let userID: UUID?
+    let phoneNumber: String?
+    let displayLabel: String
     var id: UUID { accountID }
+
+    init(accountID: UUID, phoneNumber: String) {
+        self.accountID = accountID
+        self.userID = nil
+        self.phoneNumber = phoneNumber
+        self.displayLabel = phoneNumber
+    }
+
+    init(accountID: UUID, userID: UUID?, phoneNumber: String?, displayLabel: String) {
+        self.accountID = accountID
+        self.userID = userID
+        self.phoneNumber = phoneNumber
+        self.displayLabel = displayLabel.isEmpty ? (phoneNumber ?? "Secure account") : displayLabel
+    }
+
+    private enum CodingKeys: String, CodingKey { case accountID, userID, phoneNumber, displayLabel }
+    init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        accountID = try values.decode(UUID.self, forKey: .accountID)
+        userID = try values.decodeIfPresent(UUID.self, forKey: .userID)
+        phoneNumber = try values.decodeIfPresent(String.self, forKey: .phoneNumber)
+        displayLabel = try values.decodeIfPresent(String.self, forKey: .displayLabel) ?? phoneNumber ?? "Secure account"
+    }
 }
 
 struct AccountTokens: Codable, Equatable, Sendable {
@@ -30,6 +69,11 @@ struct AccountSessionResponse: Codable, Sendable {
     let accessExpiresAt: Date
     let refreshToken: String
     let refreshExpiresAt: Date
+    let user: UserProfile?
+    init(account: AccountSummary, deviceID: UUID, accessToken: String, accessExpiresAt: Date, refreshToken: String, refreshExpiresAt: Date, user: UserProfile? = nil) {
+        self.account = account; self.deviceID = deviceID; self.accessToken = accessToken; self.accessExpiresAt = accessExpiresAt
+        self.refreshToken = refreshToken; self.refreshExpiresAt = refreshExpiresAt; self.user = user
+    }
     var tokens: AccountTokens { AccountTokens(accessToken: accessToken, accessExpiresAt: accessExpiresAt, refreshToken: refreshToken, refreshExpiresAt: refreshExpiresAt) }
 }
 
@@ -38,6 +82,18 @@ struct PhoneStartRequest: Codable, Sendable { let requestID: UUID; let phoneNumb
 struct PhoneVerifyRequest: Codable, Sendable { let requestID: UUID; let verificationID: UUID; let code: String; let deviceID: UUID; let platform: String }
 struct AccountRefreshRequest: Codable, Sendable { let refreshToken: String; let deviceID: UUID }
 struct AccountDeleteRequest: Codable, Sendable { let confirm: String }
+struct AppleSignInRequest: Codable, Sendable {
+    let requestID: UUID
+    let deviceID: UUID
+    let platform: String
+    let identityToken: String
+    let authorizationCode: String
+    let nonce: String
+    let displayName: String
+    let email: String
+}
+struct UsernameUpdateRequest: Codable, Sendable { let username: String }
+struct PhoneBindingVerifyRequest: Codable, Sendable { let verificationID: UUID; let code: String }
 
 struct AccountDeviceRegistrationRequest: Codable, Sendable {
     let requestID: UUID
@@ -85,7 +141,7 @@ struct AccountCallResponse: Codable, Equatable, Sendable {
 
 struct AccountMeResponse: Codable, Sendable {
     let accountID: UUID
-    let phoneNumber: String
+    let phoneNumber: String?
     let deviceID: UUID
     let platform: String
 }
@@ -98,10 +154,16 @@ struct WatchLinkStatusResponse: Codable, Sendable {
     let status: String
     let accountID: UUID?
     let phoneNumber: String?
+    let displayLabel: String?
+    let userID: UUID?
     let accessToken: String?
     let accessExpiresAt: Date?
     let refreshToken: String?
     let refreshExpiresAt: Date?
+    init(status: String, accountID: UUID?, phoneNumber: String?, displayLabel: String? = nil, userID: UUID? = nil, accessToken: String?, accessExpiresAt: Date?, refreshToken: String?, refreshExpiresAt: Date?) {
+        self.status = status; self.accountID = accountID; self.phoneNumber = phoneNumber; self.displayLabel = displayLabel; self.userID = userID
+        self.accessToken = accessToken; self.accessExpiresAt = accessExpiresAt; self.refreshToken = refreshToken; self.refreshExpiresAt = refreshExpiresAt
+    }
 }
 
 struct AccountAPIErrorResponse: Codable, Error, Sendable { let error: String; let retryAt: Date? }

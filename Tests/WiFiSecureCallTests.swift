@@ -3131,3 +3131,43 @@ private struct AnyEncodable: Encodable {
     init(_ value: Encodable) { encodeValue = value.encode }
     func encode(to encoder: Encoder) throws { try encodeValue(encoder) }
 }
+
+@MainActor
+final class AppleIdentityFoundationTests: XCTestCase {
+    func testLegacyAccountSummaryDecodingRemainsCompatible() throws {
+        let id = UUID()
+        let data = try JSONSerialization.data(withJSONObject: ["accountID": id.uuidString, "phoneNumber": "+380501234567"])
+        let value = try JSONDecoder().decode(AccountSummary.self, from: data)
+        XCTAssertEqual(value.accountID, id)
+        XCTAssertEqual(value.phoneNumber, "+380501234567")
+        XCTAssertEqual(value.displayLabel, "+380501234567")
+        XCTAssertNil(value.userID)
+    }
+
+    func testZeroPhoneAppleAccountIsValidAndPersistsProfile() throws {
+        let suite = "AppleIdentityFoundationTests.\(UUID())"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite)); defaults.removePersistentDomain(forName: suite)
+        let tokenStore = InMemorySecureTokenStore()
+        let store = AccountSessionStore(tokenStore: tokenStore, defaults: defaults)
+        let accountID = UUID(), userID = UUID()
+        let profile = UserProfile(userID: userID, username: "user-test", displayName: nil, email: nil, verifiedPhones: [], publicIdentity: "wsc:user:user-test")
+        let response = AccountSessionResponse(account: AccountSummary(accountID: accountID, userID: userID, phoneNumber: nil, displayLabel: "@user-test"), deviceID: UUID(), accessToken: "access", accessExpiresAt: .distantFuture, refreshToken: "refresh", refreshExpiresAt: .distantFuture, user: profile)
+        try store.add(response)
+        XCTAssertEqual(store.accounts.first?.displayLabel, "@user-test")
+        XCTAssertNil(store.accounts.first?.phoneNumber)
+        XCTAssertEqual(store.profiles[accountID], profile)
+        XCTAssertNotNil(try tokenStore.tokens(for: accountID))
+        let reloaded = AccountSessionStore(tokenStore: tokenStore, defaults: defaults)
+        XCTAssertEqual(reloaded.profiles[accountID], profile)
+        XCTAssertNotNil(try tokenStore.tokens(for: accountID))
+    }
+
+    func testWatchLinkCanDecodeWithoutPhone() throws {
+        let accountID = UUID(), userID = UUID()
+        let data = try JSONSerialization.data(withJSONObject: ["status":"claimed", "accountID":accountID.uuidString, "userID":userID.uuidString, "displayLabel":"@user-test"])
+        let response = try JSONDecoder().decode(WatchLinkStatusResponse.self, from: data)
+        XCTAssertEqual(response.accountID, accountID)
+        XCTAssertEqual(response.userID, userID)
+        XCTAssertNil(response.phoneNumber)
+    }
+}

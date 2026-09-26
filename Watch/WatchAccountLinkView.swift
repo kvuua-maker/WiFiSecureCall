@@ -36,7 +36,7 @@ struct WatchAccountLinkView: View {
                             selectedAccountID = account.accountID
                         } label: {
                             HStack {
-                                Text(account.phoneNumber)
+                                Text(account.displayLabel)
                                     .lineLimit(1)
                                     .minimumScaleFactor(0.65)
                                 if account.accountID == store.activeAccountID {
@@ -122,10 +122,10 @@ struct WatchAccountLinkView: View {
                 await MainActor.run { code = link.code; message = "Enter this code on iPhone" }
                 while !Task.isCancelled && Date() < link.expiresAt {
                     let status = try await client.watchLinkStatus(linkID: link.linkID, secret: link.linkSecret)
-                    if status.status == "claimed", let accountID = status.accountID, let phone = status.phoneNumber,
+                    if status.status == "claimed", let accountID = status.accountID,
                        let access = status.accessToken, let accessExpiry = status.accessExpiresAt,
                        let refresh = status.refreshToken, let refreshExpiry = status.refreshExpiresAt {
-                        try await MainActor.run { try store.addLinkedAccount(accountID: accountID, phoneNumber: phone, tokens: AccountTokens(accessToken: access, accessExpiresAt: accessExpiry, refreshToken: refresh, refreshExpiresAt: refreshExpiry)) }
+                        try await MainActor.run { try store.addLinkedAccount(accountID: accountID, userID: status.userID, phoneNumber: status.phoneNumber, displayLabel: status.displayLabel ?? status.phoneNumber ?? "Secure account", tokens: AccountTokens(accessToken: access, accessExpiresAt: accessExpiry, refreshToken: refresh, refreshExpiresAt: refreshExpiry)) }
                         await AccountPushRegistrationCoordinator.shared.registerKnownTokens(for: accountID)
                         await MainActor.run {
                             selectedAccountID = accountID

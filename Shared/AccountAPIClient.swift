@@ -31,6 +31,7 @@ actor AccountRefreshCoordinator {
 
 actor AccountAPIClient {
     private let baseURL: URL
+    private let v3BaseURL: URL
     private let session: URLSession
     private let tokenStore: SecureTokenStore
     private let deviceID: UUID
@@ -45,6 +46,7 @@ actor AccountAPIClient {
     ) {
         let root = config.apiBaseURL.deletingLastPathComponent()
         self.baseURL = root.appendingPathComponent("v2", isDirectory: true)
+        self.v3BaseURL = root.appendingPathComponent("v3", isDirectory: true)
         self.tokenStore = tokenStore
         self.deviceID = deviceID
         self.beforeRefresh = beforeRefresh
@@ -56,6 +58,30 @@ actor AccountAPIClient {
             configuration.waitsForConnectivity = false
             self.session = URLSession(configuration: configuration)
         }
+    }
+
+    func signInWithApple(identityToken: String, authorizationCode: String, nonce: String, displayName: String, email: String, requestID: UUID = UUID()) async throws -> AccountSessionResponse {
+        try await request("auth/apple", body: AppleSignInRequest(requestID: requestID, deviceID: deviceID, platform: "iOS", identityToken: identityToken, authorizationCode: authorizationCode, nonce: nonce, displayName: displayName, email: email), root: v3BaseURL)
+    }
+
+    func userProfile(accountID: UUID) async throws -> UserProfile {
+        try await authorizedV3("me", method: "GET", accountID: accountID, body: Optional<EmptyAccountRequest>.none)
+    }
+
+    func updateUsername(_ username: String, accountID: UUID) async throws -> UserProfile {
+        try await authorizedV3("me/username", method: "PUT", accountID: accountID, body: UsernameUpdateRequest(username: username))
+    }
+
+    func startPhoneBinding(_ phoneNumber: String, accountID: UUID, requestID: UUID = UUID()) async throws -> PhoneStartResponse {
+        try await authorizedV3("phones/start", accountID: accountID, body: PhoneStartRequest(requestID: requestID, phoneNumber: phoneNumber))
+    }
+
+    func verifyPhoneBinding(verificationID: UUID, code: String, accountID: UUID) async throws -> UserProfile {
+        try await authorizedV3("phones/verify", accountID: accountID, body: PhoneBindingVerifyRequest(verificationID: verificationID, code: code))
+    }
+
+    func removePhoneBinding(_ bindingID: UUID, accountID: UUID) async throws {
+        let _: EmptyAccountResponse = try await authorizedV3("phones/\(bindingID.uuidString.lowercased())", method: "DELETE", accountID: accountID, body: Optional<EmptyAccountRequest>.none)
     }
 
     func startPhone(_ phoneNumber: String, requestID: UUID = UUID()) async throws -> PhoneStartResponse {
@@ -124,6 +150,17 @@ actor AccountAPIClient {
         try await authorized("calls/\(callID.uuidString.lowercased())/\(action.rawValue)", accountID: accountID, body: AccountCallMutationRequest(requestID: requestID))
     }
 
+    private func authorizedV3<T: Decodable, B: Encodable>(_ path: String, method: String = "POST", accountID: UUID, body: B?) async throws -> T {
+        var tokens = try tokenStore.tokens(for: accountID) ?? { throw AccountAPIError.missingSession }()
+        if tokens.accessExpiresAt <= Date() { tokens = try await refresh(accountID: accountID, expectedRefreshToken: tokens.refreshToken) }
+        do { return try await request(path, method: method, body: body, bearer: tokens.accessToken, root: v3BaseURL) }
+        catch let error as AccountAPIError {
+            guard case .status(401, _) = error else { throw error }
+            tokens = try await refresh(accountID: accountID, expectedRefreshToken: tokens.refreshToken)
+            return try await request(path, method: method, body: body, bearer: tokens.accessToken, root: v3BaseURL)
+        }
+    }
+
     private func authorized<T: Decodable, B: Encodable>(_ path: String, method: String = "POST", accountID: UUID, body: B?) async throws -> T {
         var tokens = try tokenStore.tokens(for: accountID) ?? { throw AccountAPIError.missingSession }()
         if tokens.accessExpiresAt <= Date() {
@@ -182,8 +219,8 @@ actor AccountAPIClient {
         }
     }
 
-    private func request<T: Decodable, B: Encodable>(_ path: String, method: String = "POST", body: B?, bearer: String? = nil) async throws -> T {
-        var value = URLRequest(url: baseURL.appendingPathComponent(path))
+    private func request<T: Decodable, B: Encodable>(_ path: String, method: String = "POST", body: B?, bearer: String? = nil, root: URL? = nil) async throws -> T {
+        var value = URLRequest(url: (root ?? baseURL).appendingPathComponent(path))
         value.httpMethod = method
         value.timeoutInterval = 10
         if let body { value.httpBody = try JSONEncoder.account.encode(body) }
