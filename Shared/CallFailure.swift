@@ -16,4 +16,5 @@ enum CallFailure: String, Codable, Error, Equatable, Sendable {
     case accountSessionInvalid
     case targetUnavailable
     case targetAmbiguous
+    case answeredElsewhere
 }

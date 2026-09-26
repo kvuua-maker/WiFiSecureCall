@@ -90,6 +90,33 @@ final class NotificationRuntime {
         await callSession.startCall(signaling: signaling)
     }
 
+    func resolveRecipient(_ input: String, accountID: UUID) async throws -> ResolvedRecipient {
+        guard accountStore.accounts.contains(where: { $0.accountID == accountID }),
+              try accountStore.tokenStore.tokens(for: accountID) != nil else {
+            throw AccountAPIError.missingSession
+        }
+        return try await accountAPI.resolveRecipient(input, accountID: accountID)
+    }
+
+    func startUserCall(targetUserID: UUID, accountID: UUID) async {
+        guard accountStore.accounts.contains(where: { $0.accountID == accountID }) else {
+            callSession.failToStart(.accountSessionInvalid)
+            return
+        }
+        do {
+            guard try accountStore.tokenStore.tokens(for: accountID) != nil else {
+                callSession.failToStart(.accountSessionInvalid)
+                return
+            }
+        } catch {
+            callSession.failToStart(.accountSessionInvalid)
+            return
+        }
+        _ = ensureCallKit()
+        let signaling = CrossUserCallSignaling(client: accountAPI, accountID: accountID, targetUserID: targetUserID, localSide: .caller)
+        await callSession.startCall(signaling: signaling)
+    }
+
     func handleIncomingVoIP(callID: UUID) async {
         callSession.recordLifecycleDiagnostic("push_received", status: "voip", callID: callID)
         guard ensureCallKit() != nil else {
@@ -160,6 +187,31 @@ final class NotificationRuntime {
     func handleIncomingAlert(callID: UUID, accountID: UUID, requestAnswer: Bool) async {
         guard let signaling = accountIncomingSignaling(accountID: accountID, callID: callID), ensureCallKit() != nil else { return }
         await callSession.handleIncoming(callID: callID, requestAnswer: requestAnswer, signaling: signaling)
+    }
+
+    func handleIncomingUserVoIP(callID: UUID, accountID: UUID, caller: CrossUserCallerIdentity) async {
+        callSession.recordLifecycleDiagnostic("push_received", status: "user", callID: callID)
+        guard let signaling = userIncomingSignaling(accountID: accountID, caller: caller), ensureCallKit() != nil else { return }
+        await callSession.handleIncomingVoIP(callID: callID, signaling: signaling)
+    }
+
+    func handleIncomingUserBackgroundNotification(callID: UUID, accountID: UUID, caller: CrossUserCallerIdentity) async -> Bool {
+        callSession.recordLifecycleDiagnostic("watch_background_notification_received", status: "user", callID: callID)
+        if let duplicate = duplicateIncomingResult(callID: callID) { return duplicate }
+        guard let signaling = userIncomingSignaling(accountID: accountID, caller: caller), ensureCallKit() != nil else { return false }
+        await callSession.handleIncomingVoIP(callID: callID, signaling: signaling)
+        return liveStateBelongs(to: callID)
+    }
+
+    func handleIncomingUserAlert(callID: UUID, accountID: UUID, caller: CrossUserCallerIdentity, requestAnswer: Bool) async {
+        guard let signaling = userIncomingSignaling(accountID: accountID, caller: caller), ensureCallKit() != nil else { return }
+        await callSession.handleIncoming(callID: callID, requestAnswer: requestAnswer, signaling: signaling)
+    }
+
+    private func userIncomingSignaling(accountID: UUID, caller: CrossUserCallerIdentity) -> CrossUserCallSignaling? {
+        guard accountStore.accounts.map(\.accountID).contains(accountID),
+              (try? accountStore.tokenStore.tokens(for: accountID)) != nil else { return nil }
+        return CrossUserCallSignaling(client: accountAPI, accountID: accountID, localSide: .callee, callerIdentity: caller)
     }
 
     private func accountIncomingSignaling(accountID: UUID, callID: UUID) -> AccountCallSignaling? {
@@ -253,6 +305,7 @@ enum VoIPIncomingNotification {
 enum IncomingNotificationEnvelope: Equatable, Sendable {
     case legacy(callID: UUID)
     case account(callID: UUID, accountID: UUID)
+    case user(callID: UUID, accountID: UUID, caller: CrossUserCallerIdentity)
 
     static func parse(_ payload: [AnyHashable: Any]) -> IncomingNotificationEnvelope? {
         guard let event = payload["event"] as? String else { return nil }
@@ -263,6 +316,23 @@ enum IncomingNotificationEnvelope: Equatable, Sendable {
            let rawAccountID = payload["accountID"] as? String,
            let accountID = UUID(uuidString: rawAccountID) {
             return .account(callID: callID, accountID: accountID)
+        }
+        if event == "incoming_call_v3",
+           let rawAccountID = payload["accountID"] as? String,
+           let accountID = UUID(uuidString: rawAccountID),
+           let rawUsername = payload["callerUsername"] as? String {
+            let username = rawUsername.lowercased()
+            guard username.range(of: "^[a-z0-9][a-z0-9._-]{2,29}$", options: .regularExpression) != nil,
+                  payload["callerPublicIdentity"] as? String == "wsc:user:" + username else { return nil }
+            var displayName: String?
+            if let rawDisplayName = payload["callerDisplayName"] as? String, !rawDisplayName.isEmpty {
+                guard rawDisplayName.count <= 80, rawDisplayName.unicodeScalars.allSatisfy({ $0.value >= 0x20 && $0.value != 0x7f }) else { return nil }
+                displayName = rawDisplayName
+            }
+            return .user(
+                callID: callID, accountID: accountID,
+                caller: CrossUserCallerIdentity(username: username, displayName: displayName, publicIdentity: "wsc:user:" + username)
+            )
         }
         return nil
     }

@@ -21,12 +21,19 @@ protocol CallKitHandling: AnyObject {
     var onProviderReset: ((UUID?) -> Void)? { get set }
     func startOutgoing(id: UUID) async throws
     func reportIncoming(id: UUID) async throws
+    func reportIncoming(id: UUID, callerName: String?) async throws
     func requestAnswer(id: UUID) async throws
     func requestEnd(id: UUID) async throws
     func requestSetMuted(id: UUID, muted: Bool) async throws
     func reportOutgoingStartedConnecting(id: UUID)
     func reportOutgoingConnected(id: UUID)
     func reportEnded(id: UUID, reason: CallEndReason)
+}
+
+extension CallKitHandling {
+    func reportIncoming(id: UUID, callerName: String?) async throws {
+        try await reportIncoming(id: id)
+    }
 }
 
 struct AudioSendQueuePolicy { static let maximumFrames = 6 }
@@ -64,6 +71,7 @@ final class CallSession: ObservableObject {
     @Published private(set) var state: CallState = .idle
     @Published private(set) var isMuted = false
     @Published private(set) var elapsedSeconds = 0
+    @Published private(set) var incomingCallerName: String?
 
     private let api: APIClient
     private let config: AppConfig
@@ -273,12 +281,13 @@ final class CallSession: ObservableObject {
         }
         do {
             recordLifecycleDiagnostic("incoming_callkit_report_started", status: "prompt", callID: callID)
-            try await callKit.reportIncoming(id: localID)
+            try await callKit.reportIncoming(id: localID, callerName: signaling.incomingCallerName)
             guard isCurrent(current) else { return }
             callKitReported = true
             recordRuntimeDiagnostic("incoming_callkit_reported", status: "success", callID: callID)
             if requestAnswer { await accept() }
             if let validation { reconcileIncoming(current, validation: validation) }
+            if signaling.requiresIncomingReconciliation, isCurrent(current), case .incomingRinging = state { startIncomingReconciliation(current) }
         } catch {
             validation?.cancel()
             guard isCurrent(current) else { return }
@@ -295,7 +304,7 @@ final class CallSession: ObservableObject {
                 let response = try await validation.value
                 guard self.isCurrent(current) else { return }
                 self.recordLifecycleDiagnostic("validation_result", status: response.state.rawValue, callID: current.serverCallID)
-                if response.state != .ringing && response.state != .accepted {
+                if response.answeredElsewhere || response.state != .ringing && response.state != .accepted {
                     self.recordLifecycleDiagnostic("stale_incoming_ended", status: response.state.rawValue, callID: current.serverCallID)
                     await self.remoteTerminal(response, generation: current)
                 }
@@ -373,8 +382,12 @@ final class CallSession: ObservableObject {
         let requestID = acceptRequestID ?? UUID(); acceptRequestID = requestID
         let response = try await callSignaling.mutate(.accept, callID: current.serverCallID, requestID: requestID)
         guard isCurrent(current) else {
-            if response.state == .accepted { registerTerminalCompensation(current, mutation: .end, signaling: callSignaling, requestID: UUID()); await deliverTerminalCompensation(current) }
+            if response.state == .accepted, !response.answeredElsewhere, response.mediaToken?.isEmpty == false { registerTerminalCompensation(current, mutation: .end, signaling: callSignaling, requestID: UUID()); await deliverTerminalCompensation(current) }
             throw CancellationError()
+        }
+        if response.answeredElsewhere {
+            await teardownLocal(current, finalState: .failed(current.serverCallID, .answeredElsewhere), reportReason: .declined)
+            throw CallFailure.answeredElsewhere
         }
         guard Date() < deadline, response.callID == current.serverCallID, response.state == .accepted, let token = response.mediaToken, !token.isEmpty else {
             if response.state == .accepted { await compensateAfterAccept(current, signaling: callSignaling) }
@@ -472,7 +485,8 @@ final class CallSession: ObservableObject {
                 if self.serverCallAccepted { await self.compensateAfterAccept(current, signaling: callSignaling) }
                 else { await self.terminalMutationForIncomingFailure(current, signaling: callSignaling) }
             }
-            await self.fail(current, .callKitRejected, reportCallKit: self.callKitReported)
+            let failure = stage == "start" ? (error as? CallFailure ?? .callKitRejected) : .callKitRejected
+            await self.fail(current, failure, reportCallKit: self.callKitReported)
         }
     }
 
@@ -678,6 +692,26 @@ final class CallSession: ObservableObject {
         )
     }
 
+    private func startIncomingReconciliation(_ current: CallGeneration) {
+        spawn { [weak self] in
+            guard let self else { return }
+            while !Task.isCancelled, self.isCurrent(current), case .incomingRinging = self.state {
+                do { try await Task.sleep(nanoseconds: 500_000_000) } catch { return }
+                guard self.isCurrent(current), case .incomingRinging = self.state else { return }
+                do {
+                    let response = try await self.signaling(for: current).call(current.serverCallID)
+                    guard self.isCurrent(current) else { return }
+                    if response.answeredElsewhere || response.state != .ringing {
+                        await self.remoteTerminal(response, generation: current)
+                        return
+                    }
+                } catch {
+                    self.recordRuntimeDiagnostic("incoming_reconcile_failed", status: "transient", callID: current.serverCallID)
+                }
+            }
+        }
+    }
+
     private func startTerminalObserver(_ current: CallGeneration) {
         terminalObserver?.cancel()
         terminalObserver = Task { [weak self] in
@@ -693,6 +727,10 @@ final class CallSession: ObservableObject {
 
     private func remoteTerminal(_ response: CallSignalView, generation current: CallGeneration) async {
         guard isCurrent(current), response.callID == current.serverCallID else { return }
+        if response.answeredElsewhere {
+            await teardownLocal(current, finalState: .failed(current.serverCallID, .answeredElsewhere), reportReason: .declined)
+            return
+        }
         let failure: CallFailure?
         let reason: CallEndReason
         switch response.state {
@@ -850,7 +888,7 @@ final class CallSession: ObservableObject {
     @discardableResult private func beginGeneration(serverID: UUID, localID: UUID, outgoing: Bool, signaling: any CallSignaling) -> CallGeneration {
         cancelCallTasks(); audio.stop()
         let next = CallGeneration(id: UUID(), serverCallID: serverID, localCallKitUUID: localID)
-        generation = next; activeSignaling = signaling; activeCallKitUUID = localID; isOutgoingCall = outgoing; callKitReported = false
+        generation = next; activeSignaling = signaling; activeCallKitUUID = localID; isOutgoingCall = outgoing; callKitReported = false; incomingCallerName = outgoing ? nil : signaling.incomingCallerName
         let events = runtimeEventContinuation
         audio.onDiagnostic = { value in events?.yield(.audioDiagnostic(next.id, value)) }
         audio.onFailure = { value in events?.yield(.audioFailure(next.id, value)) }
@@ -866,7 +904,7 @@ final class CallSession: ObservableObject {
     private func invalidateGeneration(expected: CallGeneration? = nil) {
         if let expected, generation != expected { return }
         cancelCallTasks(); sendContinuation?.finish(); sendContinuation = nil; sendStream = nil; sendTask?.cancel(); sendTask = nil
-        generation = nil; activeSignaling = nil; activeCallKitUUID = nil; mediaEpoch = nil; mediaToken = nil; isOutgoingCall = false; callKitReported = false; suppressedSystemEndDuringAcceptance = false
+        generation = nil; activeSignaling = nil; activeCallKitUUID = nil; mediaEpoch = nil; mediaToken = nil; isOutgoingCall = false; callKitReported = false; incomingCallerName = nil; suppressedSystemEndDuringAcceptance = false
     }
 
     private func cancelCallTasks() {

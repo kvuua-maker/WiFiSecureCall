@@ -5,6 +5,7 @@ struct IOSRootView: View {
     @StateObject private var accountStore = AccountSessionStore.shared
     @State private var showAccount = false
     @State private var showAccountPicker = false
+    @State private var showCallUser = false
     @State private var showDialDiagnostics = false
 
     var body: some View {
@@ -26,6 +27,7 @@ struct IOSRootView: View {
                 }
             }
         }
+        .sheet(isPresented: $showCallUser) { CallUserView(store: accountStore) }
         .sheet(isPresented: $showDialDiagnostics) { SystemDialDiagnosticsView() }
     }
 
@@ -33,7 +35,7 @@ struct IOSRootView: View {
         switch session.state {
         case .idle: return "Ready"
         case .outgoingRinging: return "Calling…"
-        case .incomingRinging: return "Incoming Wi-Fi call"
+        case .incomingRinging: return session.incomingCallerName.map { "Incoming call from " + $0 } ?? "Incoming Wi-Fi call"
         case .connecting: return "Connecting…"
         case .active: return String(format: "%02d:%02d", session.elapsedSeconds / 60, session.elapsedSeconds % 60)
         case .reconnecting: return "Reconnecting…"
@@ -48,6 +50,7 @@ struct IOSRootView: View {
         case .idle:
             VStack {
                 Button("Secure Call to Watch") { beginSecureCall() }.buttonStyle(.borderedProminent)
+                Button("Call user") { if accountStore.callableAccounts.isEmpty { showAccount = true } else { showCallUser = true } }
                 Button(accountStore.activeAccount?.displayLabel ?? "Account") { showAccount = true }.font(.footnote)
                 Button("Dial diagnostics") { showDialDiagnostics = true }.font(.footnote)
             }

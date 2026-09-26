@@ -43,10 +43,12 @@ final class IOSCallKitAdapter: NSObject, CallKitHandling, CXProviderDelegate {
         }
     }
 
-    func reportIncoming(id: UUID) async throws {
+    func reportIncoming(id: UUID) async throws { try await reportIncoming(id: id, callerName: nil) }
+
+    func reportIncoming(id: UUID, callerName: String?) async throws {
         provider.configuration = Self.configuration()
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
-            provider.reportNewIncomingCall(with: id, update: Self.callUpdate()) { error in
+            provider.reportNewIncomingCall(with: id, update: Self.callUpdate(callerName: callerName)) { error in
                 if let error { continuation.resume(throwing: error) }
                 else { continuation.resume(returning: ()) }
             }
@@ -78,9 +80,9 @@ final class IOSCallKitAdapter: NSObject, CallKitHandling, CXProviderDelegate {
         return configuration
     }
 
-    private static func callUpdate() -> CXCallUpdate {
+    private static func callUpdate(callerName: String? = nil) -> CXCallUpdate {
         let update = CXCallUpdate()
-        update.localizedCallerName = "Incoming Wi-Fi call"
+        update.localizedCallerName = callerName ?? "Incoming Wi-Fi call"
         update.remoteHandle = CXHandle(type: .generic, value: "Wi-Fi call")
         update.hasVideo = false
         update.supportsHolding = false

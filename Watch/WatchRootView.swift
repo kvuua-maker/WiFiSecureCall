@@ -5,6 +5,7 @@ struct WatchRootView: View {
     @StateObject private var accountStore = AccountSessionStore.shared
     @State private var showAccount = false
     @State private var showAccountPicker = false
+    @State private var showCallUser = false
     @State private var showSystemDialer = false
     var body: some View {
         VStack(spacing: 8) {
@@ -25,13 +26,14 @@ struct WatchRootView: View {
                 }
             }
         }
+        .sheet(isPresented: $showCallUser) { CallUserView(store: accountStore) }
         .sheet(isPresented: $showSystemDialer) { WatchSystemDialerView() }
     }
     private var status: String {
         switch session.state {
         case .idle: return "Ready"
         case .outgoingRinging: return "Calling…"
-        case .incomingRinging: return "Incoming Wi-Fi call"
+        case .incomingRinging: return session.incomingCallerName.map { "Incoming call from " + $0 } ?? "Incoming Wi-Fi call"
         case .connecting: return "Connecting…"
         case .active: return String(format: "%02d:%02d", session.elapsedSeconds / 60, session.elapsedSeconds % 60)
         case .reconnecting: return "Reconnecting…"
@@ -45,6 +47,7 @@ struct WatchRootView: View {
         case .idle:
             VStack(spacing: 6) {
                 Button("Secure Call") { beginSecureCall() }
+                Button("Call user") { if accountStore.callableAccounts.isEmpty { showAccount = true } else { showCallUser = true } }
                 Button("Mobile Call") { showSystemDialer = true }
                 Button(accountStore.accounts.isEmpty ? "Link Account" : "Account") { showAccount = true }
                     .font(.caption2)

@@ -180,6 +180,22 @@ actor AccountAPIClient {
         try await authorized("calls/\(callID.uuidString.lowercased())/\(action.rawValue)", accountID: accountID, body: AccountCallMutationRequest(requestID: requestID))
     }
 
+    func resolveRecipient(_ recipient: String, accountID: UUID) async throws -> ResolvedRecipient {
+        try await authorizedV3("recipients/resolve", accountID: accountID, body: RecipientResolveRequest(recipient: recipient))
+    }
+
+    func createUserCall(accountID: UUID, callID: UUID, requestID: UUID, targetUserID: UUID) async throws -> CrossUserCallResponse {
+        try await authorizedV3("calls", accountID: accountID, body: CrossUserCallCreateRequest(requestID: requestID, callID: callID, targetUserID: targetUserID))
+    }
+
+    func userCall(accountID: UUID, callID: UUID) async throws -> CrossUserCallResponse {
+        try await authorizedV3("calls/\(callID.uuidString.lowercased())", method: "GET", accountID: accountID, body: Optional<EmptyAccountRequest>.none)
+    }
+
+    func mutateUserCall(accountID: UUID, action: CallMutation, callID: UUID, requestID: UUID) async throws -> CrossUserCallResponse {
+        try await authorizedV3("calls/\(callID.uuidString.lowercased())/\(action.rawValue)", accountID: accountID, body: AccountCallMutationRequest(requestID: requestID))
+    }
+
     private func authorizedV3<T: Decodable, B: Encodable>(_ path: String, method: String = "POST", accountID: UUID, body: B?) async throws -> T {
         var tokens = try tokenStore.tokens(for: accountID) ?? { throw AccountAPIError.missingSession }()
         if tokens.accessExpiresAt <= Date() { tokens = try await refresh(accountID: accountID, expectedRefreshToken: tokens.refreshToken) }

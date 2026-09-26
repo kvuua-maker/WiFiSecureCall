@@ -289,6 +289,62 @@ struct AccountCallCreateRequest: Codable, Sendable {
 
 struct AccountCallMutationRequest: Codable, Sendable { let requestID: UUID }
 
+struct RecipientResolveRequest: Codable, Sendable { let recipient: String }
+
+struct ResolvedRecipient: Codable, Equatable, Sendable {
+    let userID: UUID
+    let username: String
+    let displayName: String?
+    let publicIdentity: String
+    let phoneNumber: String?
+}
+
+struct CrossUserCallCreateRequest: Codable, Sendable {
+    let requestID: UUID
+    let callID: UUID
+    let targetUserID: UUID
+}
+
+enum CrossUserLegState: String, Codable, Sendable {
+    case ringing
+    case accepted
+    case rejected
+    case answeredElsewhere = "answered_elsewhere"
+    case unavailable
+    case cancelled
+    case expired
+    case ended
+}
+
+struct CrossUserCallerIdentity: Codable, Equatable, Sendable {
+    let username: String
+    let displayName: String?
+    let publicIdentity: String
+
+    var callKitName: String {
+        if let displayName, !displayName.isEmpty { return "\(displayName) (@\(username))" }
+        return "@\(username)"
+    }
+}
+
+struct CrossUserCallResponse: Codable, Equatable, Sendable {
+    let callID: UUID
+    let localSide: CallPartySide
+    let state: ServerCallState
+    let legState: CrossUserLegState?
+    let expiresAt: Date
+    let mediaToken: String?
+    let ringExpiresAt: Date?
+    let acceptedAt: Date?
+    let terminalAt: Date?
+    let terminalReason: String?
+    let deliveryStatus: String?
+    let peerReady: Bool?
+    let createdNew: Bool?
+    let mutationApplied: Bool?
+    let caller: CrossUserCallerIdentity?
+}
+
 struct AccountCallResponse: Codable, Equatable, Sendable {
     let callID: UUID
     let localSide: CallPartySide

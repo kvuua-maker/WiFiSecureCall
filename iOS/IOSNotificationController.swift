@@ -83,6 +83,9 @@ final class IOSNotificationController: NSObject, UIApplicationDelegate, UNUserNo
         case let .account(callID, accountID):
             if voip { await NotificationRuntime.shared.handleIncomingVoIP(callID: callID, accountID: accountID) }
             else { await NotificationRuntime.shared.handleIncomingAlert(callID: callID, accountID: accountID, requestAnswer: requestAnswer) }
+        case let .user(callID, accountID, caller):
+            if voip { await NotificationRuntime.shared.handleIncomingUserVoIP(callID: callID, accountID: accountID, caller: caller) }
+            else { await NotificationRuntime.shared.handleIncomingUserAlert(callID: callID, accountID: accountID, caller: caller, requestAnswer: requestAnswer) }
         }
     }
 }

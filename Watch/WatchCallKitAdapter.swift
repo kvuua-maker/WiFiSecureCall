@@ -39,10 +39,11 @@ final class WatchCallKitAdapter: NSObject, CallKitHandling, CXProviderDelegate {
         }
         catch { clear(id); throw error }
     }
-    func reportIncoming(id: UUID) async throws {
+    func reportIncoming(id: UUID) async throws { try await reportIncoming(id: id, callerName: nil) }
+    func reportIncoming(id: UUID, callerName: String?) async throws {
         provider.configuration = Self.configuration()
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
-            provider.reportNewIncomingCall(with: id, update: Self.callUpdate()) { error in
+            provider.reportNewIncomingCall(with: id, update: Self.callUpdate(callerName: callerName)) { error in
                 if let error { continuation.resume(throwing: error) } else { continuation.resume(returning: ()) }
             }
         }
@@ -64,8 +65,8 @@ final class WatchCallKitAdapter: NSObject, CallKitHandling, CXProviderDelegate {
         configuration.supportsVideo = false; configuration.maximumCallGroups = 1; configuration.maximumCallsPerCallGroup = 1; configuration.supportedHandleTypes = [.generic]
         return configuration
     }
-    private static func callUpdate() -> CXCallUpdate {
-        let update = CXCallUpdate(); update.localizedCallerName = "Incoming Wi-Fi call"; update.remoteHandle = CXHandle(type: .generic, value: "Wi-Fi call"); update.hasVideo = false
+    private static func callUpdate(callerName: String? = nil) -> CXCallUpdate {
+        let update = CXCallUpdate(); update.localizedCallerName = callerName ?? "Incoming Wi-Fi call"; update.remoteHandle = CXHandle(type: .generic, value: "Wi-Fi call"); update.hasVideo = false
         update.supportsHolding = false; update.supportsGrouping = false; update.supportsUngrouping = false; update.supportsDTMF = false
         return update
     }

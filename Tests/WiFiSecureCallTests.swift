@@ -1803,6 +1803,7 @@ private final class RetainedCallKitMock: CallKitHandling {
     var startError: Error?
     var startedIDs: [UUID] = []
     var incomingIDs: [UUID] = []
+    var incomingNames: [String?] = []
     var answerIDs: [UUID] = []
     var endRequestIDs: [UUID] = []
     var endedIDs: [UUID] = []
@@ -1811,7 +1812,8 @@ private final class RetainedCallKitMock: CallKitHandling {
     var mutedRequests: [(UUID, Bool)] = []
     var onReportIncoming: (() -> Void)?
     func startOutgoing(id: UUID) async throws { startedIDs.append(id); if let startError { throw startError } }
-    func reportIncoming(id: UUID) async throws { incomingIDs.append(id); onReportIncoming?() }
+    func reportIncoming(id: UUID) async throws { try await reportIncoming(id: id, callerName: nil) }
+    func reportIncoming(id: UUID, callerName: String?) async throws { incomingIDs.append(id); incomingNames.append(callerName); onReportIncoming?() }
     func requestAnswer(id: UUID) async throws { answerIDs.append(id) }
     func requestEnd(id: UUID) async throws { endRequestIDs.append(id) }
     func requestSetMuted(id: UUID, muted: Bool) async throws { mutedRequests.append((id, muted)); try onMutedRequested?(id, muted) }

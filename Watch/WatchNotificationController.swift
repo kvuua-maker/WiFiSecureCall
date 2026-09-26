@@ -39,6 +39,7 @@ final class WatchNotificationController: NSObject, WKApplicationDelegate, UNUser
             switch envelope {
             case let .legacy(callID): handled = await NotificationRuntime.shared.handleIncomingBackgroundNotification(callID: callID)
             case let .account(callID, accountID): handled = await NotificationRuntime.shared.handleIncomingBackgroundNotification(callID: callID, accountID: accountID)
+            case let .user(callID, accountID, caller): handled = await NotificationRuntime.shared.handleIncomingUserBackgroundNotification(callID: callID, accountID: accountID, caller: caller)
             }
             completionHandler(handled ? .newData : .noData)
         }
@@ -108,7 +109,7 @@ final class WatchNotificationController: NSObject, WKApplicationDelegate, UNUser
     nonisolated func userNotificationCenter(_ center: UNUserNotificationCenter, didReceive response: UNNotificationResponse) async {
         guard let envelope = IncomingNotificationEnvelope.parse(response.notification.request.content.userInfo) else { return }
         let callID: UUID
-        switch envelope { case let .legacy(value): callID = value; case let .account(value, _): callID = value }
+        switch envelope { case let .legacy(value): callID = value; case let .account(value, _): callID = value; case let .user(value, _, _): callID = value }
         let actionStatus: String
         if response.actionIdentifier == "REJECT" { actionStatus = "reject" }
         else if response.actionIdentifier == "ACCEPT" { actionStatus = "accept" }
@@ -128,6 +129,9 @@ final class WatchNotificationController: NSObject, WKApplicationDelegate, UNUser
         case let .account(callID, accountID):
             if voip { await NotificationRuntime.shared.handleIncomingVoIP(callID: callID, accountID: accountID) }
             else { await NotificationRuntime.shared.handleIncomingAlert(callID: callID, accountID: accountID, requestAnswer: requestAnswer) }
+        case let .user(callID, accountID, caller):
+            if voip { await NotificationRuntime.shared.handleIncomingUserVoIP(callID: callID, accountID: accountID, caller: caller) }
+            else { await NotificationRuntime.shared.handleIncomingUserAlert(callID: callID, accountID: accountID, caller: caller, requestAnswer: requestAnswer) }
         }
     }
 }
