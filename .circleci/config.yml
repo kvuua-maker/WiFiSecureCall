@@ -13,13 +13,14 @@ jobs:
             set -euo pipefail
             OUT=/tmp/carrier-probe-validation
             mkdir -p "$OUT"
-            xcodebuild -version | tee "$OUT/versions.txt"
+            xcodebuild -version > "$OUT/versions.txt"
+            cat "$OUT/versions.txt"
             IOS_SDK="$(xcrun --sdk iphoneos --show-sdk-version)"
             WATCH_SDK="$(xcrun --sdk watchos --show-sdk-version)"
             echo "IOS_SDK=$IOS_SDK" | tee -a "$OUT/versions.txt"
             echo "WATCHOS_SDK=$WATCH_SDK" | tee -a "$OUT/versions.txt"
-            xcodebuild -version | grep -qx "Xcode 27.0"
-            xcodebuild -version | grep -qx "Build version 27A266a"
+            test "$(sed -n '1p' "$OUT/versions.txt")" = "Xcode 27.0"
+            test "$(sed -n '2p' "$OUT/versions.txt")" = "Build version 27A266a"
             test "$IOS_SDK" = "27.0"
             test "$WATCH_SDK" = "27.0"
       - run:
