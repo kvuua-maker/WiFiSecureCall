@@ -1992,6 +1992,32 @@ final class AccountFoundationTests: XCTestCase {
         XCTAssertFalse(defaultsText.contains(first.accessToken)); XCTAssertFalse(defaultsText.contains(second.refreshToken))
     }
 
+    func testAccountStoreRetainsThreeIndependentAccountsAndRemovalIsIsolated() throws {
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: "AccountFoundationTests.Three.\(UUID())"))
+        let secrets = InMemorySecureTokenStore()
+        let store = AccountSessionStore(tokenStore: secrets, defaults: defaults)
+        let first = accountResponse(phone: "+380501111111", access: "access-a", refresh: "refresh-a")
+        let second = accountResponse(phone: "+380502222222", access: "access-b", refresh: "refresh-b")
+        let third = accountResponse(phone: "+380503333333", access: "access-c", refresh: "refresh-c")
+
+        try store.add(first)
+        try store.add(second)
+        try store.add(third)
+
+        XCTAssertEqual(store.accounts, [first.account, second.account, third.account])
+        XCTAssertEqual(store.callableAccounts.count, 3)
+        XCTAssertEqual(try secrets.tokens(for: first.account.accountID)?.accessToken, "access-a")
+        XCTAssertEqual(try secrets.tokens(for: second.account.accountID)?.accessToken, "access-b")
+        XCTAssertEqual(try secrets.tokens(for: third.account.accountID)?.accessToken, "access-c")
+
+        try store.logout(accountID: second.account.accountID)
+
+        XCTAssertEqual(store.accounts, [first.account, third.account])
+        XCTAssertNil(try secrets.tokens(for: second.account.accountID))
+        XCTAssertEqual(try secrets.tokens(for: first.account.accountID)?.refreshToken, "refresh-a")
+        XCTAssertEqual(try secrets.tokens(for: third.account.accountID)?.refreshToken, "refresh-c")
+    }
+
     func testSharedAccountStoreAndCustomInjection() throws {
         XCTAssertTrue(AccountSessionStore.shared === AccountSessionStore.shared)
         let defaults = try XCTUnwrap(UserDefaults(suiteName: "AccountStoreInjection.\(UUID())"))
@@ -2339,8 +2365,10 @@ final class AccountFoundationTests: XCTestCase {
         let store = AccountSessionStore(tokenStore: secrets, defaults: defaults)
         let first = accountResponse(phone: "+380501234567", access: "access-one", refresh: "refresh-one")
         let second = accountResponse(phone: "+14155550123", access: "access-two", refresh: "refresh-two")
+        let third = accountResponse(phone: "+442071838750", access: "access-three", refresh: "refresh-three")
         try store.add(first)
         try store.add(second)
+        try store.add(third)
         let requests = LockedRequests()
         let session = accountTestSession { request in
             requests.append(request)
@@ -2356,8 +2384,8 @@ final class AccountFoundationTests: XCTestCase {
         let caps = DeviceCapabilities(voipPush: true, alertPush: true, notificationsAuthorized: true, microphoneReady: true)
 
         await coordinator.update(token: Data([0xaa, 0xbb]), pushType: .alert, capabilities: caps)
-        XCTAssertEqual(requests.values.count, 2)
-        XCTAssertEqual(Set(requests.values.compactMap { $0.value(forHTTPHeaderField: "Authorization") }), ["Bearer access-one", "Bearer access-two"])
+        XCTAssertEqual(requests.values.count, 3)
+        XCTAssertEqual(Set(requests.values.compactMap { $0.value(forHTTPHeaderField: "Authorization") }), ["Bearer access-one", "Bearer access-two", "Bearer access-three"])
         for request in requests.values {
             let body = try JSONDecoder.account.decode(AccountDeviceRegistrationRequest.self, from: try XCTUnwrap(request.httpBody))
             XCTAssertEqual(body.deviceID, deviceID)
@@ -2368,16 +2396,16 @@ final class AccountFoundationTests: XCTestCase {
 
         store.switchAccount(to: first.account.accountID)
         await coordinator.update(token: Data([0xcc, 0xdd]), pushType: .voip, capabilities: caps)
-        XCTAssertEqual(requests.values.count, 4)
-
-        let linked = accountResponse(phone: "+442071838750", access: "access-watch", refresh: "refresh-watch")
-        try store.addLinkedAccount(accountID: linked.account.accountID, phoneNumber: linked.account.phoneNumber, tokens: linked.tokens)
-        await coordinator.registerKnownTokens(for: linked.account.accountID)
         XCTAssertEqual(requests.values.count, 6)
 
+        let linked = accountResponse(phone: "+14155559876", access: "access-watch", refresh: "refresh-watch")
+        try store.addLinkedAccount(accountID: linked.account.accountID, phoneNumber: linked.account.phoneNumber, tokens: linked.tokens)
+        await coordinator.registerKnownTokens(for: linked.account.accountID)
+        XCTAssertEqual(requests.values.count, 8)
+
         await coordinator.invalidate(pushType: .voip, expectedToken: Data([0xcc, 0xdd]))
-        XCTAssertEqual(requests.values.count, 9)
-        let invalidations = try requests.values.suffix(3).map { try JSONDecoder.account.decode(AccountDeviceRegistrationRequest.self, from: XCTUnwrap($0.httpBody)) }
+        XCTAssertEqual(requests.values.count, 12)
+        let invalidations = try requests.values.suffix(4).map { try JSONDecoder.account.decode(AccountDeviceRegistrationRequest.self, from: XCTUnwrap($0.httpBody)) }
         XCTAssertTrue(invalidations.allSatisfy { $0.token.isEmpty && $0.invalidatedToken == "ccdd" })
     }
 
@@ -2562,6 +2590,94 @@ final class AccountCallFoundationTests: XCTestCase {
         for _ in 0..<100 where !runtime.callSession.state.isTerminal || mutationCount.value == 0 { try? await Task.sleep(nanoseconds: 10_000_000) }
         XCTAssertTrue(runtime.callSession.state.isTerminal)
         XCTAssertEqual(mutationCount.value, 1)
+    }
+
+    func testExplicitOutgoingUsesSelectedAccountWithoutChangingActiveAccount() async throws {
+        let activeID = UUID(), secondID = UUID(), selectedID = UUID(), targetID = UUID()
+        let secrets = InMemorySecureTokenStore()
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: "ExplicitOutgoingAccount.\(UUID())"))
+        let store = AccountSessionStore(tokenStore: secrets, defaults: defaults)
+        try store.add(accountSession(accountID: activeID))
+        try store.add(accountSession(accountID: secondID))
+        try store.add(accountSession(accountID: selectedID))
+        store.switchAccount(to: activeID)
+        let requests = LockedRequests()
+        let callIDBox = LockedUUID()
+        let session = accountCallTestSession { request in
+            requests.append(request)
+            XCTAssertEqual(request.value(forHTTPHeaderField: "Authorization"), "Bearer access-\(selectedID)")
+            if request.url!.path.hasSuffix("/devices") {
+                return (200, [AccountDeviceSummary(deviceID: targetID, platform: "watchOS", callReady: true, lastSeenAt: Date())])
+            }
+            if request.httpMethod == "POST", request.url!.path.hasSuffix("/calls") {
+                let body = try JSONDecoder.account.decode(AccountCallCreateRequest.self, from: try XCTUnwrap(request.httpBody))
+                XCTAssertEqual(body.targetDeviceID, targetID)
+                callIDBox.set(body.callID)
+                return (200, self.accountCallResponse(callID: body.callID, side: .caller, state: .ringing))
+            }
+            return (200, self.accountCallResponse(callID: try XCTUnwrap(callIDBox.value), side: .caller, state: .ringing))
+        }
+        let runtime = NotificationRuntime(config: accountCallConfig(), accountStore: store, accountAPI: AccountAPIClient(config: accountCallConfig(), tokenStore: secrets, session: session), audio: AudioEngineMock(), media: MediaTransportMock())
+        let adapter = RetainedCallKitMock()
+        runtime.configureCallKitFactory { adapter }
+
+        await runtime.startPreferredCall(targetPlatform: "watchOS", accountID: selectedID)
+
+        XCTAssertEqual(store.activeAccountID, activeID)
+        let localID = try XCTUnwrap(adapter.startedIDs.first)
+        try await adapter.approveStart(localID)
+        await eventually { requests.values.contains { $0.url?.path.hasSuffix("/calls") == true } }
+        XCTAssertTrue(requests.values.contains { $0.url?.path.hasSuffix("/calls") == true })
+        XCTAssertEqual(store.activeAccountID, activeID)
+    }
+
+    func testExplicitOutgoingMissingAccountFailsWithoutNetworkOrCallKit() async throws {
+        let secrets = InMemorySecureTokenStore()
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: "ExplicitOutgoingMissing.\(UUID())"))
+        let store = AccountSessionStore(tokenStore: secrets, defaults: defaults)
+        let requests = LockedCounter()
+        let session = accountCallTestSession { _ in
+            requests.increment()
+            return (500, AccountAPIErrorResponse(error: "unexpected", retryAt: nil))
+        }
+        let runtime = NotificationRuntime(config: accountCallConfig(), accountStore: store, accountAPI: AccountAPIClient(config: accountCallConfig(), tokenStore: secrets, session: session), audio: AudioEngineMock(), media: MediaTransportMock())
+        let adapter = RetainedCallKitMock()
+        runtime.configureCallKitFactory { adapter }
+
+        await runtime.startPreferredCall(targetPlatform: "watchOS", accountID: UUID())
+
+        XCTAssertEqual(requests.value, 0)
+        XCTAssertTrue(adapter.startedIDs.isEmpty)
+        switch runtime.callSession.state {
+        case .failed(_, let failure): XCTAssertEqual(failure, .accountSessionInvalid)
+        default: XCTFail("unexpected state \(runtime.callSession.state)")
+        }
+    }
+
+    func testIncomingUsesRequestedAccountWhenDifferentAccountIsActive() async throws {
+        let activeID = UUID(), incomingID = UUID(), callID = UUID()
+        let secrets = InMemorySecureTokenStore()
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: "IncomingSelectedAccount.\(UUID())"))
+        let store = AccountSessionStore(tokenStore: secrets, defaults: defaults)
+        try store.add(accountSession(accountID: activeID))
+        try store.add(accountSession(accountID: incomingID))
+        store.switchAccount(to: activeID)
+        let requests = LockedRequests()
+        let session = accountCallTestSession { request in
+            requests.append(request)
+            XCTAssertEqual(request.value(forHTTPHeaderField: "Authorization"), "Bearer access-\(incomingID)")
+            return (200, self.accountCallResponse(callID: callID, side: .callee, state: .ringing))
+        }
+        let runtime = NotificationRuntime(config: accountCallConfig(), accountStore: store, accountAPI: AccountAPIClient(config: accountCallConfig(), tokenStore: secrets, session: session), audio: AudioEngineMock(), media: MediaTransportMock())
+        let adapter = RetainedCallKitMock()
+        runtime.configureCallKitFactory { adapter }
+
+        await runtime.handleIncomingVoIP(callID: callID, accountID: incomingID)
+        await eventually { !requests.values.isEmpty }
+
+        XCTAssertEqual(adapter.incomingIDs.count, 1)
+        XCTAssertFalse(requests.values.isEmpty)
+        XCTAssertEqual(store.activeAccountID, activeID)
     }
 
     func testIncomingV2MissingAccountIgnoredAndSignedInAccountUsesSameProvider() async throws {

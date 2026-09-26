@@ -18,7 +18,7 @@ struct AccountView: View {
                 if store.accounts.isEmpty {
                     Button("Register phone") { showRegistration = true }
                 } else {
-                    Section("Accounts") {
+                    Section {
                         ForEach(store.accounts) { account in
                             Button {
                                 store.switchAccount(to: account.accountID)
@@ -27,6 +27,10 @@ struct AccountView: View {
                             }
                         }
                         Button("Add account") { showRegistration = true }
+                    } header: {
+                        Text("Accounts")
+                    } footer: {
+                        Text("The checkmark is the default for account management and Watch linking. Choose the outgoing Secure Call account for each call.")
                     }
                     if let active = store.activeAccountID {
                         Section("Link Apple Watch") {

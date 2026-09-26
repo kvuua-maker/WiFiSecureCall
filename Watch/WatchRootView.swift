@@ -4,6 +4,7 @@ struct WatchRootView: View {
     @ObservedObject var session: CallSession
     @StateObject private var accountStore = AccountSessionStore.shared
     @State private var showAccount = false
+    @State private var showAccountPicker = false
     @State private var showSystemDialer = false
     var body: some View {
         VStack(spacing: 8) {
@@ -13,6 +14,17 @@ struct WatchRootView: View {
         }
         .padding(4)
         .sheet(isPresented: $showAccount) { WatchAccountLinkView(store: accountStore) }
+        .sheet(isPresented: $showAccountPicker) {
+            SecureOutgoingAccountPicker(choices: accountStore.callableAccounts.map(SecureAccountChoice.init)) { choice in
+                showAccountPicker = false
+                Task {
+                    await NotificationRuntime.shared.startPreferredCall(
+                        targetPlatform: "iOS",
+                        accountID: choice.accountID
+                    )
+                }
+            }
+        }
         .sheet(isPresented: $showSystemDialer) { WatchSystemDialerView() }
     }
     private var status: String {
@@ -31,10 +43,11 @@ struct WatchRootView: View {
     @ViewBuilder private var controls: some View {
         switch session.state {
         case .idle:
-            VStack {
-                Button("Call iPhone") { Task { await NotificationRuntime.shared.startPreferredCall(targetPlatform: "iOS") } }
-                Button(accountStore.activeAccount == nil ? "Link account" : "Account") { showAccount = true }.font(.caption2)
-                Button("Dial number") { showSystemDialer = true }.font(.caption2)
+            VStack(spacing: 6) {
+                Button("Secure Call") { beginSecureCall() }
+                Button("Mobile Call") { showSystemDialer = true }
+                Button(accountStore.accounts.isEmpty ? "Link Account" : "Account") { showAccount = true }
+                    .font(.caption2)
             }
         case .outgoingRinging: Button("Cancel", role: .destructive) { Task { await session.cancel() } }
         case .incomingRinging:
@@ -44,6 +57,22 @@ struct WatchRootView: View {
         case .connecting, .reconnecting: VStack { ProgressView(); Button("End", role: .destructive) { Task { await session.endCall() } } }
         case .ending: ProgressView()
         case .ended, .failed: Button("Done") { session.reset() }
+        }
+    }
+
+    private func beginSecureCall() {
+        let accounts = accountStore.callableAccounts
+        if accounts.isEmpty {
+            showAccount = true
+        } else if accounts.count == 1, let account = accounts.first {
+            Task {
+                await NotificationRuntime.shared.startPreferredCall(
+                    targetPlatform: "iOS",
+                    accountID: account.accountID
+                )
+            }
+        } else {
+            showAccountPicker = true
         }
     }
 }

@@ -54,9 +54,17 @@ final class NotificationRuntime {
     }
 
     func startPreferredCall(targetPlatform: String) async {
-        guard let account = accountStore.activeAccount else { await startCall(); return }
+        guard let accountID = accountStore.activeAccountID else { await startCall(); return }
+        await startPreferredCall(targetPlatform: targetPlatform, accountID: accountID)
+    }
+
+    func startPreferredCall(targetPlatform: String, accountID: UUID) async {
+        guard accountStore.accounts.contains(where: { $0.accountID == accountID }) else {
+            callSession.failToStart(.accountSessionInvalid)
+            return
+        }
         do {
-            guard try accountStore.tokenStore.tokens(for: account.accountID) != nil else {
+            guard try accountStore.tokenStore.tokens(for: accountID) != nil else {
                 callSession.failToStart(.accountSessionInvalid)
                 return
             }
@@ -66,7 +74,7 @@ final class NotificationRuntime {
         }
         let matches: [AccountDeviceSummary]
         do {
-            matches = try await accountAPI.devices(accountID: account.accountID).filter {
+            matches = try await accountAPI.devices(accountID: accountID).filter {
                 $0.deviceID != InstallationIdentity.shared.id && $0.callReady && $0.platform == targetPlatform
             }
         } catch {
@@ -78,7 +86,7 @@ final class NotificationRuntime {
             return
         }
         _ = ensureCallKit()
-        let signaling = AccountCallSignaling(client: accountAPI, accountID: account.accountID, targetDeviceID: matches[0].deviceID, localSide: .caller)
+        let signaling = AccountCallSignaling(client: accountAPI, accountID: accountID, targetDeviceID: matches[0].deviceID, localSide: .caller)
         await callSession.startCall(signaling: signaling)
     }
 

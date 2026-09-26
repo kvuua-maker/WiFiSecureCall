@@ -23,6 +23,12 @@ final class AccountSessionStore: ObservableObject {
 
     var activeAccount: AccountSummary? { accounts.first { $0.accountID == activeAccountID } }
 
+    var callableAccounts: [AccountSummary] {
+        accounts.filter { account in
+            (try? tokenStore.tokens(for: account.accountID)) != nil
+        }
+    }
+
     func add(_ response: AccountSessionResponse) throws {
         try tokenStore.save(response.tokens, for: response.account.accountID)
         if let index = accounts.firstIndex(where: { $0.accountID == response.account.accountID }) { accounts[index] = response.account }

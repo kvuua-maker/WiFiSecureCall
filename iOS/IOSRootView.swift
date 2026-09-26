@@ -4,6 +4,7 @@ struct IOSRootView: View {
     @ObservedObject var session: CallSession
     @StateObject private var accountStore = AccountSessionStore.shared
     @State private var showAccount = false
+    @State private var showAccountPicker = false
     @State private var showDialDiagnostics = false
 
     var body: some View {
@@ -14,6 +15,17 @@ struct IOSRootView: View {
         }
         .padding(32)
         .sheet(isPresented: $showAccount) { AccountView(store: accountStore) }
+        .sheet(isPresented: $showAccountPicker) {
+            SecureOutgoingAccountPicker(choices: accountStore.callableAccounts.map(SecureAccountChoice.init)) { choice in
+                showAccountPicker = false
+                Task {
+                    await NotificationRuntime.shared.startPreferredCall(
+                        targetPlatform: "watchOS",
+                        accountID: choice.accountID
+                    )
+                }
+            }
+        }
         .sheet(isPresented: $showDialDiagnostics) { SystemDialDiagnosticsView() }
     }
 
@@ -35,7 +47,7 @@ struct IOSRootView: View {
         switch session.state {
         case .idle:
             VStack {
-                Button("Call Watch") { Task { await NotificationRuntime.shared.startPreferredCall(targetPlatform: "watchOS") } }.buttonStyle(.borderedProminent)
+                Button("Secure Call to Watch") { beginSecureCall() }.buttonStyle(.borderedProminent)
                 Button(accountStore.activeAccount?.phoneNumber ?? "Account") { showAccount = true }.font(.footnote)
                 Button("Dial diagnostics") { showDialDiagnostics = true }.font(.footnote)
             }
@@ -51,6 +63,22 @@ struct IOSRootView: View {
             HStack { Button(session.isMuted ? "Unmute" : "Mute") { session.toggleMute() }; Button("End", role: .destructive) { Task { await session.endCall() } } }
         case .ended, .failed:
             Button("Done") { session.reset() }
+        }
+    }
+
+    private func beginSecureCall() {
+        let accounts = accountStore.callableAccounts
+        if accounts.isEmpty {
+            showAccount = true
+        } else if accounts.count == 1, let account = accounts.first {
+            Task {
+                await NotificationRuntime.shared.startPreferredCall(
+                    targetPlatform: "watchOS",
+                    accountID: account.accountID
+                )
+            }
+        } else {
+            showAccountPicker = true
         }
     }
 }
