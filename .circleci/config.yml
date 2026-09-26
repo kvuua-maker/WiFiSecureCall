@@ -31,7 +31,7 @@ jobs:
                 ROOT="$SDK/System/Library/Frameworks/$FW.framework"
                 if [ -d "$ROOT" ]; then
                   echo "===== $FW PRESENT =====" >> "$OUT"
-                  find "$ROOT/Headers" "$ROOT/Modules" -type f 2>/dev/null | sort | while read -r FILE; do
+                  find "$ROOT" -type f 2>/dev/null | sort | while read -r FILE; do
                     grep -HnEi "$TERMS" "$FILE" 2>/dev/null || true
                   done >> "$OUT"
                 else
@@ -51,7 +51,7 @@ jobs:
               for FW in CoreTelephony LiveCommunicationKit; do
                 ROOT="$SDK/System/Library/Frameworks/$FW.framework"
                 [ -d "$ROOT" ] || continue
-                find "$ROOT/Headers" "$ROOT/Modules" -type f 2>/dev/null | sort | while read -r FILE; do
+                find "$ROOT" -type f 2>/dev/null | sort | while read -r FILE; do
                   grep -HnE "(^|[[:space:]])(open|public)[[:space:]]+(final[[:space:]]+)?(class|struct|enum|protocol|actor|func|var|let|typealias)|^[[:space:]]*(API_AVAILABLE|NS_CLASS_AVAILABLE|@interface|@protocol|typedef|FOUNDATION_EXPORT)" "$FILE" 2>/dev/null || true
                 done >> "$OUT"
               done
