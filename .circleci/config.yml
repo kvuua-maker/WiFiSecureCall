@@ -36,10 +36,10 @@ jobs:
             printf '%s' "$WSC_BUILD45_SECRETS_B64" | /usr/bin/base64 -D > Config/Secrets.xcconfig
             chmod 600 Config/Secrets.xcconfig
             /usr/bin/ruby -e '
-              values = File.readlines(ARGV[0]).filter_map { |line|
+              values = File.readlines(ARGV[0]).each_with_object({}) { |line, result|
                 match = line.match(/^\s*(IOS_BEARER_TOKEN|WATCH_BEARER_TOKEN)\s*=\s*(.*?)\s*$/)
-                [match[1], match[2]] if match
-              }.to_h
+                result[match[1]] = match[2] if match
+              }
               abort "missing protected token" unless %w[IOS_BEARER_TOKEN WATCH_BEARER_TOKEN].all? { |key|
                 value = values[key]
                 value && value.length >= 32 && value !~ /\s/
