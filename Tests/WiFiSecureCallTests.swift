@@ -3197,6 +3197,220 @@ final class AppleNonceContractTests: XCTestCase {
         )
     }
 
+    func testWatchAppleAttemptUsesSecureIndependentStateAndLowercaseHexNonce() throws {
+        let attempts = try (0..<16).map { _ in try AppleSignInAttempt.make() }
+        XCTAssertEqual(Set(attempts.map(\.rawNonce)).count, attempts.count)
+        XCTAssertEqual(Set(attempts.map(\.state)).count, attempts.count)
+        for attempt in attempts {
+            XCTAssertNotEqual(attempt.rawNonce, attempt.state)
+            XCTAssertEqual(attempt.requestNonce, AppleSignInNonceContract.requestNonce(forRawNonce: attempt.rawNonce))
+            XCTAssertNotNil(attempt.requestNonce.range(of: #"^[0-9a-f]{64}$"#, options: .regularExpression))
+        }
+    }
+
+    func testInvalidWatchAppleCredentialsCauseZeroServerPosts() async throws {
+        let requests = LockedRequests()
+        let client = AccountAPIClient(
+            config: AppConfig(apiBaseURL: URL(string: "https://example.invalid/wifi-secure-call/v1")!, mediaURL: URL(string: "wss://example.invalid/media")!, role: .B, bearerToken: String(repeating: "b", count: 64)),
+            tokenStore: InMemorySecureTokenStore(),
+            session: testSession { request in
+                requests.append(request)
+                return (500, AccountAPIErrorResponse(error: "unexpected", retryAt: nil))
+            },
+            deviceID: UUID(),
+            platform: "watchOS"
+        )
+
+        let validToken = Data("identity-token".utf8)
+        let validCode = Data("authorization-code".utf8)
+        let cases: [(AppleNativeCredentialInput, String, String, AppleCredentialValidationError)] = [
+            (
+                AppleNativeCredentialInput(state: "wrong", identityToken: validToken, authorizationCode: validCode, displayName: "", email: ""),
+                "expected", "raw-nonce", .stateMismatch
+            ),
+            (
+                AppleNativeCredentialInput(state: "expected", identityToken: nil, authorizationCode: validCode, displayName: "", email: ""),
+                "expected", "raw-nonce", .missingIdentityToken
+            ),
+            (
+                AppleNativeCredentialInput(state: "expected", identityToken: validToken, authorizationCode: nil, displayName: "", email: ""),
+                "expected", "raw-nonce", .missingAuthorizationCode
+            ),
+            (
+                AppleNativeCredentialInput(state: "expected", identityToken: validToken, authorizationCode: validCode, displayName: "", email: ""),
+                "expected", "", .missingNonce
+            ),
+        ]
+
+        for (credential, expectedState, rawNonce, expectedError) in cases {
+            do {
+                _ = try await client.signInWithAppleFromWatch(
+                    credential: credential,
+                    expectedState: expectedState,
+                    rawNonce: rawNonce
+                )
+                XCTFail("invalid native credential was submitted")
+            } catch let error as AppleCredentialValidationError {
+                XCTAssertEqual(error, expectedError)
+            } catch {
+                XCTFail("unexpected error type: \(type(of: error))")
+            }
+        }
+        XCTAssertTrue(requests.values.isEmpty)
+    }
+
+    func testValidWatchAppleCredentialProducesOneV3PostWithRawNonceAndWatchPlatform() async throws {
+        let requests = LockedRequests()
+        let accountID = UUID(), userID = UUID(), deviceID = UUID(), requestID = UUID()
+        let response = AccountSessionResponse(
+            account: AccountSummary(accountID: accountID, userID: userID, phoneNumber: nil, displayLabel: "@watch-user"),
+            deviceID: deviceID,
+            accessToken: "access", accessExpiresAt: .distantFuture,
+            refreshToken: "refresh", refreshExpiresAt: .distantFuture,
+            user: UserProfile(userID: userID, username: "watch-user", displayName: nil, email: nil, verifiedPhones: [], publicIdentity: "wsc:user:watch-user")
+        )
+        let client = AccountAPIClient(
+            config: AppConfig(apiBaseURL: URL(string: "https://example.invalid/wifi-secure-call/v1")!, mediaURL: URL(string: "wss://example.invalid/media")!, role: .B, bearerToken: String(repeating: "b", count: 64)),
+            tokenStore: InMemorySecureTokenStore(),
+            session: testSession { request in requests.append(request); return (200, response) },
+            deviceID: deviceID,
+            platform: "watchOS"
+        )
+        let rawNonce = "watch-raw-nonce"
+        let credential = AppleNativeCredentialInput(
+            state: "watch-state",
+            identityToken: Data("identity-token".utf8),
+            authorizationCode: Data("authorization-code".utf8),
+            displayName: "Watch User",
+            email: "relay@example.invalid"
+        )
+
+        _ = try await client.signInWithAppleFromWatch(
+            credential: credential,
+            expectedState: "watch-state",
+            rawNonce: rawNonce,
+            requestID: requestID
+        )
+
+        XCTAssertEqual(requests.values.count, 1)
+        let request = try XCTUnwrap(requests.values.first)
+        XCTAssertEqual(request.url?.path, "/wifi-secure-call/v3/auth/apple")
+        XCTAssertEqual(request.httpMethod, "POST")
+        let body = try JSONDecoder.account.decode(AppleSignInRequest.self, from: try XCTUnwrap(request.httpBody))
+        XCTAssertEqual(body.requestID, requestID)
+        XCTAssertEqual(body.deviceID, deviceID)
+        XCTAssertEqual(body.platform, "watchOS")
+        XCTAssertEqual(body.nonce, rawNonce)
+        XCTAssertNotEqual(body.nonce, AppleSignInNonceContract.requestNonce(forRawNonce: rawNonce))
+    }
+
+    func testPhoneLessWatchAppleAccountCoexistsWithLinkedPhoneAccountAndTokensPersist() throws {
+        let suite = "WatchAppleCoexistence.\(UUID())"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defaults.removePersistentDomain(forName: suite)
+        let tokens = InMemorySecureTokenStore()
+        let store = AccountSessionStore(tokenStore: tokens, defaults: defaults)
+        let legacyID = UUID(), appleID = UUID(), userID = UUID()
+        let legacyTokens = AccountTokens(accessToken: "legacy-access", accessExpiresAt: .distantFuture, refreshToken: "legacy-refresh", refreshExpiresAt: .distantFuture)
+        try store.addLinkedAccount(accountID: legacyID, phoneNumber: "+380••••4567", tokens: legacyTokens)
+        let appleResponse = AccountSessionResponse(
+            account: AccountSummary(accountID: appleID, userID: userID, phoneNumber: nil, displayLabel: "@watch-user"),
+            deviceID: UUID(),
+            accessToken: "apple-access", accessExpiresAt: .distantFuture,
+            refreshToken: "apple-refresh", refreshExpiresAt: .distantFuture,
+            user: UserProfile(userID: userID, username: "watch-user", displayName: nil, email: nil, verifiedPhones: [], publicIdentity: "wsc:user:watch-user")
+        )
+        try store.add(appleResponse)
+
+        XCTAssertEqual(Set(store.accounts.map(\.accountID)), [legacyID, appleID])
+        XCTAssertNil(store.accounts.first(where: { $0.accountID == appleID })?.phoneNumber)
+        XCTAssertEqual(try tokens.tokens(for: legacyID), legacyTokens)
+        XCTAssertEqual(try tokens.tokens(for: appleID), appleResponse.tokens)
+
+        let reloaded = AccountSessionStore(tokenStore: tokens, defaults: defaults)
+        XCTAssertEqual(Set(reloaded.accounts.map(\.accountID)), [legacyID, appleID])
+        XCTAssertEqual(try tokens.tokens(for: legacyID), legacyTokens)
+        XCTAssertEqual(try tokens.tokens(for: appleID), appleResponse.tokens)
+    }
+
+    func testWatchPushRegistrationUsesWatchDeviceAndPlatformAfterAccountStorage() async throws {
+        let suite = "WatchApplePush.\(UUID())"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defaults.removePersistentDomain(forName: suite)
+        let tokens = InMemorySecureTokenStore()
+        let store = AccountSessionStore(tokenStore: tokens, defaults: defaults)
+        let requests = LockedRequests()
+        let watchDeviceID = UUID(), accountID = UUID(), userID = UUID()
+        let client = AccountAPIClient(
+            config: AppConfig(apiBaseURL: URL(string: "https://example.invalid/wifi-secure-call/v1")!, mediaURL: URL(string: "wss://example.invalid/media")!, role: .B, bearerToken: String(repeating: "b", count: 64)),
+            tokenStore: tokens,
+            session: testSession { request in requests.append(request); return (204, AccountAPIErrorResponse(error: "", retryAt: nil)) },
+            deviceID: watchDeviceID,
+            platform: "watchOS"
+        )
+        let coordinator = AccountPushRegistrationCoordinator(
+            store: store,
+            client: client,
+            platform: "watchOS",
+            generation: 17
+        )
+        let capabilities = DeviceCapabilities(voipPush: true, alertPush: true, notificationsAuthorized: true, microphoneReady: true)
+        await coordinator.update(token: Data([0xaa, 0xbb]), pushType: .alert, capabilities: capabilities)
+        XCTAssertTrue(requests.values.isEmpty)
+
+        let response = AccountSessionResponse(
+            account: AccountSummary(accountID: accountID, userID: userID, phoneNumber: nil, displayLabel: "@watch-user"),
+            deviceID: watchDeviceID,
+            accessToken: "access", accessExpiresAt: .distantFuture,
+            refreshToken: "refresh", refreshExpiresAt: .distantFuture,
+            user: UserProfile(userID: userID, username: "watch-user", displayName: nil, email: nil, verifiedPhones: [], publicIdentity: "wsc:user:watch-user")
+        )
+        try store.add(response)
+        await coordinator.registerKnownTokens(for: accountID)
+
+        XCTAssertEqual(requests.values.count, 1)
+        let request = try XCTUnwrap(requests.values.first)
+        let body = try JSONDecoder.account.decode(AccountDeviceRegistrationRequest.self, from: try XCTUnwrap(request.httpBody))
+        XCTAssertEqual(body.deviceID, watchDeviceID)
+        XCTAssertEqual(body.platform, "watchOS")
+        XCTAssertEqual(body.installationGeneration, 17)
+        XCTAssertEqual(body.pushType, .alert)
+        XCTAssertEqual(body.token, "aabb")
+    }
+
+    func testWatchNativeAppleSourcePreservesOfficialButtonAndSixDigitLinking() throws {
+        let repository = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let source = try String(contentsOf: repository.appendingPathComponent("Watch/WatchAccountLinkView.swift"), encoding: .utf8)
+        XCTAssertTrue(source.contains("WKInterfaceAuthorizationAppleIDButton"))
+        XCTAssertTrue(source.contains("WKInterfaceObjectRepresentable"))
+        XCTAssertTrue(source.contains("ASAuthorizationAppleIDProvider().createRequest()"))
+        XCTAssertTrue(source.contains("ASAuthorizationController(authorizationRequests:"))
+        XCTAssertTrue(source.contains("client.watchLinkStart()"))
+        XCTAssertTrue(source.contains("client.watchLinkStatus("))
+        XCTAssertFalse(source.contains("print("))
+        XCTAssertFalse(source.contains("NSLog("))
+    }
+
+    func testAppleValidationErrorsContainNoCredentialMaterial() {
+        let secrets = ["identity-secret", "authorization-secret", "nonce-secret", "state-secret", "email@example.invalid"]
+        let credential = AppleNativeCredentialInput(
+            state: "wrong-state",
+            identityToken: Data(secrets[0].utf8),
+            authorizationCode: Data(secrets[1].utf8),
+            displayName: "Private Name",
+            email: secrets[4]
+        )
+        do {
+            _ = try AppleCredentialContract.validate(credential, expectedState: secrets[3], rawNonce: secrets[2])
+            XCTFail("state mismatch accepted")
+        } catch {
+            let text = String(reflecting: error)
+            for secret in secrets { XCTAssertFalse(text.contains(secret)) }
+        }
+    }
+
     func testNormalPersistentTransportPolicyRemainsUnchanged() {
         let configuration = AccountTransportPolicy.configuration()
         XCTAssertEqual(AccountTransportPolicy.requestTimeout, 10)

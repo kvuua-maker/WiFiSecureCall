@@ -28,6 +28,76 @@ enum AppleSignInNonceContract {
     static func serverNonce(forRawNonce rawNonce: String) -> String { rawNonce }
 }
 
+struct AppleSignInAttempt: Equatable, Sendable {
+    let rawNonce: String
+    let requestNonce: String
+    let state: String
+
+    static func make() throws -> Self {
+        let rawNonce = try AppleSignInNonceContract.makeRawNonce()
+        var state = try AppleSignInNonceContract.makeRawNonce()
+        while state == rawNonce {
+            state = try AppleSignInNonceContract.makeRawNonce()
+        }
+        return Self(
+            rawNonce: rawNonce,
+            requestNonce: AppleSignInNonceContract.requestNonce(forRawNonce: rawNonce),
+            state: state
+        )
+    }
+}
+
+struct AppleNativeCredentialInput: Sendable {
+    let state: String?
+    let identityToken: Data?
+    let authorizationCode: Data?
+    let displayName: String
+    let email: String
+}
+
+struct ValidatedAppleCredential: Equatable, Sendable {
+    let identityToken: String
+    let authorizationCode: String
+    let rawNonce: String
+    let displayName: String
+    let email: String
+}
+
+enum AppleCredentialValidationError: String, Error, Equatable, Sendable {
+    case stateMismatch = "APPLE_STATE_MISMATCH"
+    case missingIdentityToken = "APPLE_IDENTITY_TOKEN_MISSING"
+    case missingAuthorizationCode = "APPLE_AUTHORIZATION_CODE_MISSING"
+    case missingNonce = "APPLE_NONCE_MISSING"
+}
+
+enum AppleCredentialContract {
+    static func validate(
+        _ credential: AppleNativeCredentialInput,
+        expectedState: String,
+        rawNonce: String
+    ) throws -> ValidatedAppleCredential {
+        guard !rawNonce.isEmpty else { throw AppleCredentialValidationError.missingNonce }
+        guard credential.state == expectedState else { throw AppleCredentialValidationError.stateMismatch }
+        guard let identityTokenData = credential.identityToken,
+              let identityToken = String(data: identityTokenData, encoding: .utf8),
+              !identityToken.isEmpty else {
+            throw AppleCredentialValidationError.missingIdentityToken
+        }
+        guard let authorizationCodeData = credential.authorizationCode,
+              let authorizationCode = String(data: authorizationCodeData, encoding: .utf8),
+              !authorizationCode.isEmpty else {
+            throw AppleCredentialValidationError.missingAuthorizationCode
+        }
+        return ValidatedAppleCredential(
+            identityToken: identityToken,
+            authorizationCode: authorizationCode,
+            rawNonce: AppleSignInNonceContract.serverNonce(forRawNonce: rawNonce),
+            displayName: credential.displayName,
+            email: credential.email
+        )
+    }
+}
+
 enum AppleVerificationDiagnostic: String, Codable, Sendable {
     case jwtFormat = "APPLE_VERIFY_JWT_FORMAT"
     case header = "APPLE_VERIFY_HEADER"

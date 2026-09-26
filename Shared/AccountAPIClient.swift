@@ -49,6 +49,7 @@ actor AccountAPIClient {
     private let session: URLSession
     private let tokenStore: SecureTokenStore
     private let deviceID: UUID
+    private let devicePlatform: String
     private let beforeRefresh: (@Sendable (UUID, String) async -> Void)?
 
     init(
@@ -56,6 +57,7 @@ actor AccountAPIClient {
         tokenStore: SecureTokenStore,
         session: URLSession? = nil,
         deviceID: UUID = InstallationIdentity.shared.id,
+        platform: String? = nil,
         beforeRefresh: (@Sendable (UUID, String) async -> Void)? = nil
     ) {
         let root = config.apiBaseURL.deletingLastPathComponent()
@@ -63,12 +65,31 @@ actor AccountAPIClient {
         self.v3BaseURL = root.appendingPathComponent("v3", isDirectory: true)
         self.tokenStore = tokenStore
         self.deviceID = deviceID
+        self.devicePlatform = platform ?? Self.currentPlatform
         self.beforeRefresh = beforeRefresh
         self.session = session ?? URLSession(configuration: AccountTransportPolicy.configuration())
     }
 
     func signInWithApple(identityToken: String, authorizationCode: String, nonce: String, displayName: String, email: String, requestID: UUID = UUID()) async throws -> AccountSessionResponse {
         try await request("auth/apple", body: AppleSignInRequest(requestID: requestID, deviceID: deviceID, platform: "iOS", identityToken: identityToken, authorizationCode: authorizationCode, nonce: nonce, displayName: displayName, email: email), root: v3BaseURL)
+    }
+
+    func signInWithAppleFromWatch(
+        credential: AppleNativeCredentialInput,
+        expectedState: String,
+        rawNonce: String,
+        requestID: UUID = UUID()
+    ) async throws -> AccountSessionResponse {
+        let value = try AppleCredentialContract.validate(credential, expectedState: expectedState, rawNonce: rawNonce)
+        return try await submitAppleSignIn(
+            identityToken: value.identityToken,
+            authorizationCode: value.authorizationCode,
+            nonce: value.rawNonce,
+            displayName: value.displayName,
+            email: value.email,
+            platform: "watchOS",
+            requestID: requestID
+        )
     }
 
     func userProfile(accountID: UUID) async throws -> UserProfile {
@@ -127,7 +148,7 @@ actor AccountAPIClient {
 
     func registerDevice(accountID: UUID, token: Data, pushType: DevicePushType, capabilities: DeviceCapabilities, installationGeneration: UInt64 = InstallationIdentity.shared.generation, environment: APNSEnvironment = .production) async throws {
         let _: EmptyAccountResponse = try await authorized("devices/register", accountID: accountID, body: AccountDeviceRegistrationRequest(
-            requestID: UUID(), deviceID: deviceID, platform: Self.platform, pushType: pushType,
+            requestID: UUID(), deviceID: deviceID, platform: devicePlatform, pushType: pushType,
             token: token.hexString, invalidatedToken: nil, installationGeneration: installationGeneration,
             environment: environment, capabilities: capabilities
         ))
@@ -135,7 +156,7 @@ actor AccountAPIClient {
 
     func invalidateDevice(accountID: UUID, pushType: DevicePushType, expectedToken: Data?, capabilities: DeviceCapabilities, installationGeneration: UInt64 = InstallationIdentity.shared.generation, environment: APNSEnvironment = .production) async throws {
         let _: EmptyAccountResponse = try await authorized("devices/register", accountID: accountID, body: AccountDeviceRegistrationRequest(
-            requestID: UUID(), deviceID: deviceID, platform: Self.platform, pushType: pushType,
+            requestID: UUID(), deviceID: deviceID, platform: devicePlatform, pushType: pushType,
             token: "", invalidatedToken: expectedToken?.hexString, installationGeneration: installationGeneration,
             environment: environment, capabilities: capabilities
         ))
@@ -247,7 +268,32 @@ actor AccountAPIClient {
         return decoded
     }
 
-    private static var platform: String {
+    private func submitAppleSignIn(
+        identityToken: String,
+        authorizationCode: String,
+        nonce: String,
+        displayName: String,
+        email: String,
+        platform: String,
+        requestID: UUID
+    ) async throws -> AccountSessionResponse {
+        try await request(
+            "auth/apple",
+            body: AppleSignInRequest(
+                requestID: requestID,
+                deviceID: deviceID,
+                platform: platform,
+                identityToken: identityToken,
+                authorizationCode: authorizationCode,
+                nonce: nonce,
+                displayName: displayName,
+                email: email
+            ),
+            root: v3BaseURL
+        )
+    }
+
+    private static var currentPlatform: String {
         #if os(watchOS)
         "watchOS"
         #else

@@ -1,7 +1,164 @@
+import AuthenticationServices
 import SwiftUI
+import WatchKit
+
+@MainActor
+final class WatchAppleAuthenticationCoordinator: NSObject, ObservableObject, ASAuthorizationControllerDelegate {
+    @Published private(set) var isAuthenticating = false
+    @Published private(set) var message = ""
+    @Published private(set) var lastSignedInAccountID: UUID?
+
+    private let store: AccountSessionStore
+    private let client: AccountAPIClient
+    private let pushRegistration: AccountPushRegistrationCoordinator
+    private var attempt: AppleSignInAttempt?
+    private var authorizationController: ASAuthorizationController?
+    private var submissionTask: Task<Void, Never>?
+
+    init(
+        store: AccountSessionStore,
+        client: AccountAPIClient? = nil,
+        pushRegistration: AccountPushRegistrationCoordinator? = nil
+    ) {
+        self.store = store
+        self.client = client ?? AccountAPIClient(
+            config: .load(),
+            tokenStore: store.tokenStore,
+            platform: "watchOS"
+        )
+        self.pushRegistration = pushRegistration ?? .shared
+        super.init()
+    }
+
+    func start() {
+        guard !isAuthenticating else { return }
+        do {
+            let attempt = try AppleSignInAttempt.make()
+            let request = ASAuthorizationAppleIDProvider().createRequest()
+            request.requestedScopes = [.fullName, .email]
+            request.nonce = attempt.requestNonce
+            request.state = attempt.state
+
+            let controller = ASAuthorizationController(authorizationRequests: [request])
+            controller.delegate = self
+            self.attempt = attempt
+            authorizationController = controller
+            isAuthenticating = true
+            message = ""
+            controller.performRequests()
+        } catch {
+            clearAttempt()
+            isAuthenticating = false
+            message = "Apple sign-in unavailable"
+        }
+    }
+
+    func authorizationController(
+        controller: ASAuthorizationController,
+        didCompleteWithAuthorization authorization: ASAuthorization
+    ) {
+        guard controller === authorizationController,
+              let attempt,
+              let credential = authorization.credential as? ASAuthorizationAppleIDCredential else {
+            clearAttempt()
+            isAuthenticating = false
+            message = "Apple credential unavailable"
+            return
+        }
+
+        let input = AppleNativeCredentialInput(
+            state: credential.state,
+            identityToken: credential.identityToken,
+            authorizationCode: credential.authorizationCode,
+            displayName: Self.displayName(from: credential.fullName),
+            email: credential.email ?? ""
+        )
+        clearAttempt()
+        submissionTask = Task { [self] in
+            await complete(input: input, attempt: attempt)
+        }
+    }
+
+    func authorizationController(
+        controller: ASAuthorizationController,
+        didCompleteWithError error: Error
+    ) {
+        guard controller === authorizationController else { return }
+        clearAttempt()
+        isAuthenticating = false
+        message = "Apple sign-in cancelled or unavailable"
+    }
+
+    private func complete(input: AppleNativeCredentialInput, attempt: AppleSignInAttempt) async {
+        defer {
+            submissionTask = nil
+            isAuthenticating = false
+        }
+        do {
+            let response = try await client.signInWithAppleFromWatch(
+                credential: input,
+                expectedState: attempt.state,
+                rawNonce: attempt.rawNonce
+            )
+            try store.add(response)
+            await pushRegistration.registerKnownTokens(for: response.account.accountID)
+            lastSignedInAccountID = response.account.accountID
+            message = "Signed in with Apple"
+        } catch let error as AppleCredentialValidationError {
+            message = error == .stateMismatch
+                ? "Apple sign-in state verification failed"
+                : "Apple credential unavailable"
+        } catch {
+            message = "Apple sign-in could not be verified"
+        }
+    }
+
+    private func clearAttempt() {
+        attempt = nil
+        authorizationController = nil
+    }
+
+    private static func displayName(from components: PersonNameComponents?) -> String {
+        guard let components else { return "" }
+        return [components.givenName, components.middleName, components.familyName]
+            .compactMap { value in
+                guard let value else { return nil }
+                let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+                return trimmed.isEmpty ? nil : trimmed
+            }
+            .joined(separator: " ")
+    }
+}
+
+private struct WatchNativeAppleIDButton: WKInterfaceObjectRepresentable {
+    let action: () -> Void
+
+    @MainActor
+    final class Coordinator: NSObject {
+        let action: () -> Void
+        init(action: @escaping () -> Void) { self.action = action }
+        @objc func activate() { action() }
+    }
+
+    func makeCoordinator() -> Coordinator { Coordinator(action: action) }
+
+    func makeWKInterfaceObject(context: Context) -> WKInterfaceAuthorizationAppleIDButton {
+        WKInterfaceAuthorizationAppleIDButton(
+            style: .default,
+            target: context.coordinator,
+            action: #selector(Coordinator.activate)
+        )
+    }
+
+    func updateWKInterfaceObject(
+        _ wkInterfaceObject: WKInterfaceAuthorizationAppleIDButton,
+        context: Context
+    ) {}
+}
 
 struct WatchAccountLinkView: View {
     @ObservedObject var store: AccountSessionStore
+    @EnvironmentObject private var appleAuthentication: WatchAppleAuthenticationCoordinator
     private let client: AccountAPIClient
     @State private var code = ""
     @State private var message = ""
@@ -18,7 +175,7 @@ struct WatchAccountLinkView: View {
         ScrollView {
             VStack(spacing: 8) {
                 if isAdding {
-                    Text(code.isEmpty ? "Link another account" : code)
+                    Text(code.isEmpty ? "Link with iPhone" : code)
                         .font(code.isEmpty ? .headline : .title2.monospacedDigit())
                     if code.isEmpty {
                         Button("Create code") { begin() }
@@ -26,52 +183,69 @@ struct WatchAccountLinkView: View {
                     }
                     Button("Cancel") { cancelLinking() }
                         .font(.caption2)
-                } else if store.accounts.isEmpty {
-                    Text("Link account").font(.headline)
-                    Button("Create code") { startAdding() }
                 } else {
-                    Text("Linked accounts").font(.headline)
-                    ForEach(store.accounts) { account in
-                        Button {
-                            selectedAccountID = account.accountID
-                        } label: {
-                            HStack {
-                                Text(account.displayLabel)
-                                    .lineLimit(1)
-                                    .minimumScaleFactor(0.65)
-                                if account.accountID == store.activeAccountID {
-                                    Image(systemName: "checkmark")
+                    if store.accounts.isEmpty {
+                        Text("Account").font(.headline)
+                    } else {
+                        Text("Linked accounts").font(.headline)
+                        ForEach(store.accounts) { account in
+                            Button {
+                                selectedAccountID = account.accountID
+                            } label: {
+                                HStack {
+                                    Text(account.displayLabel)
+                                        .lineLimit(1)
+                                        .minimumScaleFactor(0.65)
+                                    if account.accountID == store.activeAccountID {
+                                        Image(systemName: "checkmark")
+                                    }
                                 }
                             }
                         }
+
+                        if let selected = selectedAccount {
+                            if selected.accountID != store.activeAccountID {
+                                Button("Set as default") {
+                                    store.switchAccount(to: selected.accountID)
+                                }
+                                .font(.caption2)
+                            }
+                            if needsRelinking(selected.accountID) {
+                                Text("Account needs relinking")
+                                Button("Relink account") { relink(selected.accountID) }
+                            } else {
+                                Button("Sign out", role: .destructive) {
+                                    Task { await signOut(selected.accountID) }
+                                }
+                            }
+                        }
+
+                        Text("Add account").font(.caption)
                     }
 
-                    if let selected = selectedAccount {
-                        if selected.accountID != store.activeAccountID {
-                            Button("Set as default") {
-                                store.switchAccount(to: selected.accountID)
-                            }
-                            .font(.caption2)
-                        }
-                        if needsRelinking(selected.accountID) {
-                            Text("Account needs relinking")
-                            Button("Relink account") { relink(selected.accountID) }
-                        } else {
-                            Button("Sign out", role: .destructive) {
-                                Task { await signOut(selected.accountID) }
-                            }
-                        }
-                    }
+                    WatchNativeAppleIDButton { appleAuthentication.start() }
+                        .frame(height: 34)
+                        .allowsHitTesting(!appleAuthentication.isAuthenticating)
+                        .opacity(appleAuthentication.isAuthenticating ? 0.6 : 1)
 
-                    Button("Add account") { startAdding() }
+                    Button("Link with iPhone") { startAdding() }
                 }
                 if !message.isEmpty { Text(message).font(.caption) }
+                if !appleAuthentication.message.isEmpty {
+                    Text(appleAuthentication.message).font(.caption)
+                }
             }
         }
         .onAppear {
             if selectedAccountID == nil {
                 selectedAccountID = store.activeAccountID ?? store.accounts.first?.accountID
             }
+        }
+        .onChange(of: appleAuthentication.lastSignedInAccountID) { accountID in
+            guard let accountID else { return }
+            selectedAccountID = accountID
+            isAdding = false
+            code = ""
         }
         .onDisappear { polling?.cancel(); polling = nil }
     }
