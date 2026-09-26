@@ -10,7 +10,13 @@ import WatchConnectivity
 private struct IOSSystemCellularPlanStatusClient: CarrierCellularPlanStatusChecking {
     func authorizationStatus(for phoneNumber: String) async -> CarrierCellularPlanAuthorizationResult {
         do {
-            return Self.mapAuthorization(try await CTCellularPlanStatus.authorizationStatus(forPhoneNumber: phoneNumber))
+            switch try await CTCellularPlanStatus.authorizationStatus(forPhoneNumber: phoneNumber) {
+            case .notAuthorized: return .notAuthorized
+            case .authorized: return .authorized
+            case .restricted: return .restricted
+            case .notSupported: return .notSupported
+            @unknown default: return .unknown
+            }
         } catch {
             return .errorSafe
         }
@@ -18,7 +24,13 @@ private struct IOSSystemCellularPlanStatusClient: CarrierCellularPlanStatusCheck
 
     func requestAuthorization(for phoneNumber: String) async -> CarrierCellularPlanAuthorizationResult {
         do {
-            return Self.mapAuthorization(try await CTCellularPlanStatus.requestAuthorization(forPhoneNumber: phoneNumber))
+            switch try await CTCellularPlanStatus.requestAuthorization(forPhoneNumber: phoneNumber) {
+            case .notAuthorized: return .notAuthorized
+            case .authorized: return .authorized
+            case .restricted: return .restricted
+            case .notSupported: return .notSupported
+            @unknown default: return .unknown
+            }
         } catch {
             return .errorSafe
         }
@@ -36,18 +48,6 @@ private struct IOSSystemCellularPlanStatusClient: CarrierCellularPlanStatusCheck
             }
         } catch {
             return .errorSafe
-        }
-    }
-
-    private static func mapAuthorization(
-        _ value: CTCellularPlanStatus.Authorization
-    ) -> CarrierCellularPlanAuthorizationResult {
-        switch value {
-        case .notAuthorized: return .notAuthorized
-        case .authorized: return .authorized
-        case .restricted: return .restricted
-        case .notSupported: return .notSupported
-        @unknown default: return .unknown
         }
     }
 }
