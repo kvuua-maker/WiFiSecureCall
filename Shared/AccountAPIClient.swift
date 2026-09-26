@@ -44,53 +44,51 @@ enum AccountTransportPolicy {
     }
 }
 
+private struct ApplePathObservation: Sendable {
+    let pathStart: AppleTransportPathSnapshot
+    let firstCallbackMilliseconds: Int?
+    let firstCallback: AppleTransportPathSnapshot?
+    let pathEnd: AppleTransportPathSnapshot
+}
+
 private final class AppleNWPathTracker: @unchecked Sendable {
     private let monitor = NWPathMonitor()
     private let queue = DispatchQueue(label: "com.vkapps.wifisecurecall.apple-transport-path")
     private let lock = NSLock()
+    private var firstCallbackMilliseconds: Int?
+    private var firstCallback: AppleTransportPathSnapshot?
     private var latest = AppleTransportPathSnapshot(status: .unknown, interfaces: [], isExpensive: false, isConstrained: false)
 
-    func start() -> AppleTransportPathSnapshot {
+    func start(startedAt: Date) {
         monitor.pathUpdateHandler = { [weak self] path in
             guard let self else { return }
             let value = Self.snapshot(path)
+            let elapsed = max(0, Int((Date().timeIntervalSince(startedAt) * 1_000).rounded()))
             self.lock.lock()
+            if self.firstCallback == nil {
+                self.firstCallback = value
+                self.firstCallbackMilliseconds = elapsed
+            }
             self.latest = value
             self.lock.unlock()
         }
         monitor.start(queue: queue)
-        return AppleTransportPathSnapshot(status: .unknown, interfaces: [], isExpensive: false, isConstrained: false)
     }
 
-    func finish(pathStart: AppleTransportPathSnapshot, startedAt: Date, error: AccountAPIError?) -> AppleTransportDiagnosticReport {
-        let pathEnd = current()
-        cancel()
-        let errorComponents: (String?, Int?)
-        if let error, case .transport(let domain, let code) = error {
-            errorComponents = (domain, code)
-        } else {
-            errorComponents = (nil, nil)
-        }
-        return AppleTransportDiagnosticReport(
-            pathStart: pathStart,
-            pathEnd: pathEnd,
-            transactions: [],
-            redirectCount: 0,
-            totalMilliseconds: max(0, Int((Date().timeIntervalSince(startedAt) * 1_000).rounded())),
-            errorDomain: errorComponents.0,
-            errorCode: errorComponents.1
-        )
-    }
-
-    private func current() -> AppleTransportPathSnapshot {
+    func finish() -> ApplePathObservation {
         lock.lock()
-        defer { lock.unlock() }
-        return latest
-    }
-
-    private func cancel() {
+        let firstMilliseconds = firstCallbackMilliseconds
+        let first = firstCallback
+        let end = latest
+        lock.unlock()
         monitor.pathUpdateHandler = nil
         monitor.cancel()
+        return ApplePathObservation(
+            pathStart: AppleTransportPathSnapshot(status: .unknown, interfaces: [], isExpensive: false, isConstrained: false),
+            firstCallbackMilliseconds: firstMilliseconds,
+            firstCallback: first,
+            pathEnd: end
+        )
     }
 
     private static func snapshot(_ path: NWPath) -> AppleTransportPathSnapshot {
@@ -110,10 +108,309 @@ private final class AppleNWPathTracker: @unchecked Sendable {
     }
 }
 
+struct AppleTaskExecutionResult: @unchecked Sendable {
+    let data: Data
+    let response: URLResponse?
+    let error: AccountAPIError?
+    let transactions: [AppleTransportTransactionSnapshot]
+    let redirectCount: Int
+    let lifecycle: AppleTaskLifecycleSnapshot
+}
+
+final class AppleTaskLifecycleDelegate: NSObject, URLSessionDataDelegate, @unchecked Sendable {
+    typealias TaskCreatedObserver = @Sendable (URLSessionDataTask) -> Void
+
+    private final class Context {
+        let task: URLSessionDataTask
+        let continuation: CheckedContinuation<AppleTaskExecutionResult, Never>
+        let startedAt: Date
+        let bodyByteCount: Int
+        var data = Data()
+        var response: URLResponse?
+        var transactions: [AppleTransportTransactionSnapshot] = []
+        var redirectCount = 0
+        var events: [AppleTaskLifecycleEvent] = []
+        var resumeCount = 0
+        var afterResumeRecorded = false
+        var dataEventRecorded = false
+
+        init(task: URLSessionDataTask, continuation: CheckedContinuation<AppleTaskExecutionResult, Never>, startedAt: Date, bodyByteCount: Int) {
+            self.task = task
+            self.continuation = continuation
+            self.startedAt = startedAt
+            self.bodyByteCount = bodyByteCount
+        }
+    }
+
+    private let condition = NSCondition()
+    private var contexts: [Int: Context] = [:]
+    private let taskCreatedObserver: TaskCreatedObserver?
+
+    init(taskCreatedObserver: TaskCreatedObserver? = nil) {
+        self.taskCreatedObserver = taskCreatedObserver
+        super.init()
+    }
+
+    var activeTaskCount: Int {
+        condition.lock()
+        defer { condition.unlock() }
+        return contexts.count
+    }
+
+    func perform(_ request: URLRequest, session: URLSession, startedAt: Date) async -> AppleTaskExecutionResult {
+        await withCheckedContinuation { continuation in
+            let task = session.dataTask(with: request)
+            let context = Context(
+                task: task,
+                continuation: continuation,
+                startedAt: startedAt,
+                bodyByteCount: request.httpBody?.count ?? 0
+            )
+            condition.lock()
+            contexts[task.taskIdentifier] = context
+            context.events.append(event(.taskCreated, task: task, context: context))
+            condition.unlock()
+
+            taskCreatedObserver?(task)
+
+            condition.lock()
+            context.events.append(event(.beforeResume, task: task, context: context))
+            condition.unlock()
+
+            task.resume()
+
+            condition.lock()
+            context.resumeCount += 1
+            context.events.append(event(.afterResume, task: task, context: context))
+            context.afterResumeRecorded = true
+            condition.broadcast()
+            condition.unlock()
+        }
+    }
+
+    func urlSession(_ session: URLSession, taskIsWaitingForConnectivity task: URLSessionTask) {
+        condition.lock()
+        guard let context = contextAfterResume(for: task.taskIdentifier) else {
+            condition.unlock()
+            return
+        }
+        context.events.append(event(.waitingForConnectivity, task: task, context: context))
+        condition.unlock()
+    }
+
+    func urlSession(
+        _ session: URLSession,
+        dataTask: URLSessionDataTask,
+        didReceive response: URLResponse,
+        completionHandler: @escaping (URLSession.ResponseDisposition) -> Void
+    ) {
+        condition.lock()
+        if let context = contextAfterResume(for: dataTask.taskIdentifier) {
+            context.response = response
+            context.events.append(event(.responseReceived, task: dataTask, context: context))
+        }
+        condition.unlock()
+        completionHandler(.allow)
+    }
+
+    func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
+        condition.lock()
+        if let context = contextAfterResume(for: dataTask.taskIdentifier) {
+            context.data.append(data)
+            if !context.dataEventRecorded {
+                context.dataEventRecorded = true
+                context.events.append(event(.dataReceived, task: dataTask, context: context))
+            }
+        }
+        condition.unlock()
+    }
+
+    func urlSession(
+        _ session: URLSession,
+        task: URLSessionTask,
+        willPerformHTTPRedirection response: HTTPURLResponse,
+        newRequest request: URLRequest,
+        completionHandler: @escaping (URLRequest?) -> Void
+    ) {
+        condition.lock()
+        if let context = contextAfterResume(for: task.taskIdentifier) {
+            context.redirectCount += 1
+        }
+        condition.unlock()
+        completionHandler(request)
+    }
+
+    func urlSession(_ session: URLSession, task: URLSessionTask, didFinishCollecting metrics: URLSessionTaskMetrics) {
+        condition.lock()
+        guard let context = contextAfterResume(for: task.taskIdentifier) else {
+            condition.unlock()
+            return
+        }
+        context.transactions = metrics.transactionMetrics.map { transaction in
+            Self.transactionSnapshot(transaction, relativeTo: context.startedAt)
+        }
+        context.events.append(event(
+            .metricsCollected,
+            task: task,
+            context: context,
+            transactionCount: context.transactions.count
+        ))
+        condition.unlock()
+    }
+
+    func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
+        condition.lock()
+        guard let context = contextAfterResume(for: task.taskIdentifier) else {
+            condition.unlock()
+            return
+        }
+        let safeError = error.map(AccountAPIError.wrappingTransport)
+        let errorParts = Self.errorParts(safeError)
+        context.events.append(event(
+            .taskCompleted,
+            task: task,
+            context: context,
+            errorDomain: errorParts.0,
+            errorCode: errorParts.1
+        ))
+        let lifecycle = AppleTaskLifecycleSnapshot(
+            taskIdentifier: task.taskIdentifier,
+            resumeCount: context.resumeCount,
+            events: context.events,
+            request: Self.requestSnapshot(task: task, bodyByteCount: context.bodyByteCount)
+        )
+        let result = AppleTaskExecutionResult(
+            data: context.data,
+            response: context.response,
+            error: safeError,
+            transactions: context.transactions,
+            redirectCount: context.redirectCount,
+            lifecycle: lifecycle
+        )
+        contexts[task.taskIdentifier] = nil
+        let continuation = context.continuation
+        condition.unlock()
+        continuation.resume(returning: result)
+    }
+
+    func urlSession(_ session: URLSession, didBecomeInvalidWithError error: Error?) {
+        let safeError = error.map(AccountAPIError.wrappingTransport)
+        let errorParts = Self.errorParts(safeError)
+        condition.lock()
+        for context in contexts.values {
+            context.events.append(event(
+                .sessionInvalidated,
+                task: context.task,
+                context: context,
+                errorDomain: errorParts.0,
+                errorCode: errorParts.1
+            ))
+        }
+        condition.unlock()
+    }
+
+    private func contextAfterResume(for taskIdentifier: Int) -> Context? {
+        while let context = contexts[taskIdentifier], !context.afterResumeRecorded {
+            condition.wait()
+        }
+        return contexts[taskIdentifier]
+    }
+
+    private func event(
+        _ kind: AppleTaskLifecycleEventKind,
+        task: URLSessionTask,
+        context: Context,
+        transactionCount: Int? = nil,
+        errorDomain: String? = nil,
+        errorCode: Int? = nil
+    ) -> AppleTaskLifecycleEvent {
+        AppleTaskLifecycleEvent(
+            kind: kind,
+            elapsedMilliseconds: max(0, Int((Date().timeIntervalSince(context.startedAt) * 1_000).rounded())),
+            taskIdentifier: task.taskIdentifier,
+            state: AppleTaskLifecycleState.capture(task.state),
+            transactionCount: transactionCount,
+            errorDomain: errorDomain,
+            errorCode: errorCode
+        )
+    }
+
+    private static func requestSnapshot(task: URLSessionTask, bodyByteCount: Int) -> AppleTaskRequestSnapshot {
+        let original = task.originalRequest
+        let current = task.currentRequest
+        return AppleTaskRequestSnapshot(
+            originalRequestPresent: original != nil,
+            currentRequestPresent: current != nil,
+            originalPath: safePath(original),
+            currentPath: safePath(current),
+            originalMethod: safeMethod(original?.httpMethod),
+            currentMethod: safeMethod(current?.httpMethod),
+            bodyByteCount: bodyByteCount,
+            earliestBeginDatePresent: task.earliestBeginDate != nil,
+            priority: task.priority,
+            countOfBytesExpectedToSend: task.countOfBytesExpectedToSend,
+            countOfBytesSent: task.countOfBytesSent,
+            countOfBytesExpectedToReceive: task.countOfBytesExpectedToReceive,
+            countOfBytesReceived: task.countOfBytesReceived
+        )
+    }
+
+    private static func safePath(_ request: URLRequest?) -> String? {
+        guard let path = request?.url?.path else { return nil }
+        return path == "/wifi-secure-call/v3/auth/apple" ? path : "other"
+    }
+
+    private static func safeMethod(_ value: String?) -> String? {
+        guard let value, value.range(of: #"^[A-Z]{1,10}$"#, options: .regularExpression) != nil else { return nil }
+        return value
+    }
+
+    private static func errorParts(_ error: AccountAPIError?) -> (String?, Int?) {
+        guard let error, case .transport(let domain, let code) = error else { return (nil, nil) }
+        return (domain, code)
+    }
+
+    private static func transactionSnapshot(_ transaction: URLSessionTaskTransactionMetrics, relativeTo startedAt: Date) -> AppleTransportTransactionSnapshot {
+        AppleTransportTransactionSnapshot(
+            fetchStartMilliseconds: milliseconds(transaction.fetchStartDate, relativeTo: startedAt),
+            domainLookup: .capture(start: transaction.domainLookupStartDate, end: transaction.domainLookupEndDate, relativeTo: startedAt),
+            connect: .capture(start: transaction.connectStartDate, end: transaction.connectEndDate, relativeTo: startedAt),
+            secureConnection: .capture(start: transaction.secureConnectionStartDate, end: transaction.secureConnectionEndDate, relativeTo: startedAt),
+            request: .capture(start: transaction.requestStartDate, end: transaction.requestEndDate, relativeTo: startedAt),
+            response: .capture(start: transaction.responseStartDate, end: transaction.responseEndDate, relativeTo: startedAt),
+            networkProtocolName: safeProtocol(transaction.networkProtocolName),
+            isProxyConnection: transaction.isProxyConnection,
+            isReusedConnection: transaction.isReusedConnection,
+            resourceFetchType: safeFetchType(transaction.resourceFetchType)
+        )
+    }
+
+    private static func milliseconds(_ date: Date?, relativeTo origin: Date) -> Int? {
+        date.map { max(0, Int(($0.timeIntervalSince(origin) * 1_000).rounded())) }
+    }
+
+    private static func safeProtocol(_ value: String?) -> String? {
+        guard let value, value.count <= 24,
+              value.range(of: #"^[A-Za-z0-9._/-]+$"#, options: .regularExpression) != nil else { return nil }
+        return value
+    }
+
+    private static func safeFetchType(_ value: URLSessionTaskMetrics.ResourceFetchType) -> String {
+        switch value {
+        case .networkLoad: return "networkLoad"
+        case .serverPush: return "serverPush"
+        case .localCache: return "localCache"
+        case .unknown: return "unknown"
+        @unknown default: return "unknown"
+        }
+    }
+}
+
 actor AccountAPIClient {
     private let baseURL: URL
     private let v3BaseURL: URL
     private let session: URLSession
+    private let appleTaskDelegate: AppleTaskLifecycleDelegate?
     private let tokenStore: SecureTokenStore
     private let deviceID: UUID
     private let beforeRefresh: (@Sendable (UUID, String) async -> Void)?
@@ -122,6 +419,7 @@ actor AccountAPIClient {
         config: AppConfig,
         tokenStore: SecureTokenStore,
         session: URLSession? = nil,
+        appleTaskDelegate: AppleTaskLifecycleDelegate? = nil,
         deviceID: UUID = InstallationIdentity.shared.id,
         beforeRefresh: (@Sendable (UUID, String) async -> Void)? = nil
     ) {
@@ -131,9 +429,17 @@ actor AccountAPIClient {
         self.tokenStore = tokenStore
         self.deviceID = deviceID
         self.beforeRefresh = beforeRefresh
-        if let session { self.session = session }
-        else {
-            self.session = URLSession(configuration: AccountTransportPolicy.configuration())
+        if let session {
+            self.session = session
+            self.appleTaskDelegate = appleTaskDelegate
+        } else {
+            let delegate = AppleTaskLifecycleDelegate()
+            self.appleTaskDelegate = delegate
+            self.session = URLSession(
+                configuration: AccountTransportPolicy.configuration(),
+                delegate: delegate,
+                delegateQueue: nil
+            )
         }
     }
 
@@ -307,19 +613,37 @@ actor AccountAPIClient {
         value.httpBody = try JSONEncoder.account.encode(body)
         value.setValue("application/json", forHTTPHeaderField: "Content-Type")
 
-        let pathTracker = AppleNWPathTracker()
-        let pathStart = pathTracker.start()
         let startedAt = Date()
+        let pathTracker = AppleNWPathTracker()
+        pathTracker.start(startedAt: startedAt)
+
+        if let appleTaskDelegate {
+            let result = await appleTaskDelegate.perform(value, session: session, startedAt: startedAt)
+            let path = pathTracker.finish()
+            let report = appleDiagnosticReport(result: result, path: path, startedAt: startedAt)
+            if let error = result.error {
+                throw AppleSignInDiagnosticFailure(underlying: error, report: report)
+            }
+            return try decodeAppleSignIn(data: result.data, response: result.response, report: report)
+        }
+
+        // Injected test sessions without our retained delegate keep their existing behavior.
         let data: Data
         let response: URLResponse
         do {
             (data, response) = try await session.data(for: value)
         } catch {
             let underlying = AccountAPIError.wrappingTransport(error)
-            let report = pathTracker.finish(pathStart: pathStart, startedAt: startedAt, error: underlying)
+            let path = pathTracker.finish()
+            let report = appleDiagnosticReport(result: nil, path: path, startedAt: startedAt, error: underlying)
             throw AppleSignInDiagnosticFailure(underlying: underlying, report: report)
         }
-        let report = pathTracker.finish(pathStart: pathStart, startedAt: startedAt, error: nil)
+        let path = pathTracker.finish()
+        let report = appleDiagnosticReport(result: nil, path: path, startedAt: startedAt)
+        return try decodeAppleSignIn(data: data, response: response, report: report)
+    }
+
+    private func decodeAppleSignIn(data: Data, response: URLResponse?, report: AppleTransportDiagnosticReport) throws -> AppleSignInDiagnosticResult {
         guard let http = response as? HTTPURLResponse else {
             throw AppleSignInDiagnosticFailure(underlying: .invalidResponse, report: report)
         }
@@ -333,6 +657,33 @@ actor AccountAPIClient {
             throw AppleSignInDiagnosticFailure(underlying: .decoding, report: report)
         }
         return AppleSignInDiagnosticResult(response: decoded, report: report)
+    }
+
+    private func appleDiagnosticReport(
+        result: AppleTaskExecutionResult?,
+        path: ApplePathObservation,
+        startedAt: Date,
+        error: AccountAPIError? = nil
+    ) -> AppleTransportDiagnosticReport {
+        let effectiveError = result?.error ?? error
+        let errorComponents: (String?, Int?)
+        if let effectiveError, case .transport(let domain, let code) = effectiveError {
+            errorComponents = (domain, code)
+        } else {
+            errorComponents = (nil, nil)
+        }
+        return AppleTransportDiagnosticReport(
+            pathStart: path.pathStart,
+            pathEnd: path.pathEnd,
+            transactions: result?.transactions ?? [],
+            redirectCount: result?.redirectCount ?? 0,
+            totalMilliseconds: max(0, Int((Date().timeIntervalSince(startedAt) * 1_000).rounded())),
+            errorDomain: errorComponents.0,
+            errorCode: errorComponents.1,
+            pathFirstCallbackMilliseconds: path.firstCallbackMilliseconds,
+            pathFirstCallback: path.firstCallback,
+            taskLifecycle: result?.lifecycle
+        )
     }
 
     private func request<T: Decodable, B: Encodable>(_ path: String, method: String = "POST", body: B?, bearer: String? = nil, root: URL? = nil) async throws -> T {

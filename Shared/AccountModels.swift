@@ -174,6 +174,126 @@ struct AppleTransportTransactionSnapshot: Equatable, Sendable {
     }
 }
 
+enum AppleTaskLifecycleState: String, Equatable, Sendable {
+    case running, suspended, canceling, completed
+
+    static func capture(_ state: URLSessionTask.State) -> Self {
+        switch state {
+        case .running: return .running
+        case .suspended: return .suspended
+        case .canceling: return .canceling
+        case .completed: return .completed
+        @unknown default: return .completed
+        }
+    }
+}
+
+enum AppleTaskLifecycleEventKind: String, Equatable, Sendable {
+    case taskCreated = "task_created"
+    case beforeResume = "before_resume"
+    case afterResume = "after_resume"
+    case waitingForConnectivity = "waiting_for_connectivity"
+    case metricsCollected = "metrics_collected"
+    case responseReceived = "response_received"
+    case dataReceived = "data_received"
+    case taskCompleted = "task_completed"
+    case sessionInvalidated = "session_invalidated"
+}
+
+struct AppleTaskLifecycleEvent: Equatable, Sendable {
+    let kind: AppleTaskLifecycleEventKind
+    let elapsedMilliseconds: Int
+    let taskIdentifier: Int
+    let state: AppleTaskLifecycleState
+    let transactionCount: Int?
+    let errorDomain: String?
+    let errorCode: Int?
+
+    var safeDescription: String {
+        var values = [
+            kind.rawValue,
+            "ms=\(elapsedMilliseconds)",
+            "taskID=\(taskIdentifier)",
+            "state=\(state.rawValue)",
+        ]
+        if let transactionCount { values.append("transactions=\(transactionCount)") }
+        if let errorDomain { values.append("error=\(errorDomain)/\(errorCode ?? 0)") }
+        return values.joined(separator: ",")
+    }
+}
+
+struct AppleTaskRequestSnapshot: Equatable, Sendable {
+    let originalRequestPresent: Bool
+    let currentRequestPresent: Bool
+    let originalPath: String?
+    let currentPath: String?
+    let originalMethod: String?
+    let currentMethod: String?
+    let bodyByteCount: Int
+    let earliestBeginDatePresent: Bool
+    let priority: Float
+    let countOfBytesExpectedToSend: Int64
+    let countOfBytesSent: Int64
+    let countOfBytesExpectedToReceive: Int64
+    let countOfBytesReceived: Int64
+
+    var safeDescription: String {
+        [
+            "original=\(originalRequestPresent),path=\(originalPath ?? "missing"),method=\(originalMethod ?? "missing")",
+            "current=\(currentRequestPresent),path=\(currentPath ?? "missing"),method=\(currentMethod ?? "missing")",
+            "bodyBytes=\(bodyByteCount)",
+            "earliestBeginDate=\(earliestBeginDatePresent)",
+            "priority=\(String(format: "%.2f", priority))",
+            "expectedSend=\(countOfBytesExpectedToSend)",
+            "sent=\(countOfBytesSent)",
+            "expectedReceive=\(countOfBytesExpectedToReceive)",
+            "received=\(countOfBytesReceived)",
+        ].joined(separator: "\n")
+    }
+}
+
+struct AppleTaskLifecycleSnapshot: Equatable, Sendable {
+    let taskIdentifier: Int
+    let resumeCount: Int
+    let events: [AppleTaskLifecycleEvent]
+    let request: AppleTaskRequestSnapshot
+
+    private func first(_ kind: AppleTaskLifecycleEventKind) -> AppleTaskLifecycleEvent? {
+        events.first { $0.kind == kind }
+    }
+
+    private func compact(_ event: AppleTaskLifecycleEvent?) -> String {
+        guard let event else { return "missing" }
+        return "\(event.elapsedMilliseconds)ms,state=\(event.state.rawValue)"
+    }
+
+    var safeDescription: String {
+        let waiting = first(.waitingForConnectivity).map { "\($0.elapsedMilliseconds)ms,state=\($0.state.rawValue)" } ?? "none"
+        let metrics = first(.metricsCollected).map { "\($0.elapsedMilliseconds)ms,transactions=\($0.transactionCount ?? 0)" } ?? "missing"
+        let completed = first(.taskCompleted)
+        let error = completed?.errorDomain.map { "\($0)/\(completed?.errorCode ?? 0)" } ?? "none"
+        var lines = [
+            "TaskLifecycle:",
+            "taskID=\(taskIdentifier)",
+            "created=\(compact(first(.taskCreated)))",
+            "beforeResume=\(compact(first(.beforeResume)))",
+            "afterResume=\(compact(first(.afterResume)))",
+            "waiting=\(waiting)",
+            "metrics=\(metrics)",
+            "completed=\(compact(completed))",
+            "resumeCount=\(resumeCount)",
+            "error=\(error)",
+            "Request:",
+            request.safeDescription,
+        ]
+        let remaining = events.filter { ![.taskCreated, .beforeResume, .afterResume, .waitingForConnectivity, .metricsCollected, .taskCompleted].contains($0.kind) }
+        if !remaining.isEmpty {
+            lines.append("events=\(remaining.map(\.safeDescription).joined(separator: ";"))")
+        }
+        return lines.joined(separator: "\n")
+    }
+}
+
 struct AppleTransportDiagnosticReport: Equatable, Sendable {
     let pathStart: AppleTransportPathSnapshot
     let pathEnd: AppleTransportPathSnapshot
@@ -182,8 +302,49 @@ struct AppleTransportDiagnosticReport: Equatable, Sendable {
     let totalMilliseconds: Int
     let errorDomain: String?
     let errorCode: Int?
+    let pathFirstCallbackMilliseconds: Int?
+    let pathFirstCallback: AppleTransportPathSnapshot?
+    let taskLifecycle: AppleTaskLifecycleSnapshot?
+
+    init(
+        pathStart: AppleTransportPathSnapshot,
+        pathEnd: AppleTransportPathSnapshot,
+        transactions: [AppleTransportTransactionSnapshot],
+        redirectCount: Int,
+        totalMilliseconds: Int,
+        errorDomain: String?,
+        errorCode: Int?,
+        pathFirstCallbackMilliseconds: Int? = nil,
+        pathFirstCallback: AppleTransportPathSnapshot? = nil,
+        taskLifecycle: AppleTaskLifecycleSnapshot? = nil
+    ) {
+        self.pathStart = pathStart
+        self.pathEnd = pathEnd
+        self.transactions = transactions
+        self.redirectCount = redirectCount
+        self.totalMilliseconds = totalMilliseconds
+        self.errorDomain = errorDomain
+        self.errorCode = errorCode
+        self.pathFirstCallbackMilliseconds = pathFirstCallbackMilliseconds
+        self.pathFirstCallback = pathFirstCallback
+        self.taskLifecycle = taskLifecycle
+    }
 
     var safeDescription: String {
+        if let taskLifecycle {
+            var lines = [
+                taskLifecycle.safeDescription,
+                "Path:",
+                "firstCallback=\(pathFirstCallbackMilliseconds.map { "\($0)ms" } ?? "missing")\(pathFirstCallback.map { ",\($0.safeDescription)" } ?? "")",
+                "end=\(pathEnd.safeDescription)",
+                "totalMs=\(totalMilliseconds)",
+                "redirects=\(redirectCount)",
+                "Transactions:",
+                "count=\(transactions.count)",
+            ]
+            lines.append(contentsOf: transactions.enumerated().map { "transaction[\($0.offset)]=\($0.element.safeDescription)" })
+            return lines.joined(separator: "\n")
+        }
         var lines = [
             "pathStart=\(pathStart.safeDescription)",
             "pathEnd=\(pathEnd.safeDescription)",

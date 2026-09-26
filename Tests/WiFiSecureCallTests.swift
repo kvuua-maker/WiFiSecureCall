@@ -3096,6 +3096,13 @@ private final class LockedRequests: @unchecked Sendable {
     func append(_ request: URLRequest) { lock.withLock { storage.append(request) } }
 }
 
+private final class LockedDataTask: @unchecked Sendable {
+    private let lock = NSLock()
+    private var storage: URLSessionDataTask?
+    var value: URLSessionDataTask? { lock.withLock { storage } }
+    func set(_ value: URLSessionDataTask) { lock.withLock { storage = value } }
+}
+
 private final class AccountURLProtocol: URLProtocol {
     static var handler: ((URLRequest) throws -> (Int, Encodable))?
     override class func canInit(with request: URLRequest) -> Bool { true }
@@ -3217,7 +3224,7 @@ final class AppleNonceContractTests: XCTestCase {
             user: UserProfile(userID: userID, username: "user-test", displayName: nil, email: nil, verifiedPhones: [], publicIdentity: "wsc:user:user-test")
         )
         let phoneResponse = PhoneStartResponse(verificationID: UUID(), expiresAt: .distantFuture, resendAfter: .distantFuture)
-        let session = testSession { request in
+        let (session, delegate) = diagnosticTestTransport { request in
             captured.append(request)
             if request.url?.path == "/wifi-secure-call/v3/auth/apple" {
                 appleRequestCount.increment()
@@ -3229,17 +3236,18 @@ final class AppleNonceContractTests: XCTestCase {
             config: AppConfig(apiBaseURL: URL(string: "https://example.invalid/wifi-secure-call/v1")!, mediaURL: URL(string: "wss://example.invalid/media")!, role: .B, bearerToken: String(repeating: "b", count: 64)),
             tokenStore: InMemorySecureTokenStore(),
             session: session,
+            appleTaskDelegate: delegate,
             deviceID: deviceID
         )
 
         _ = try await client.startPhone("+00000000000")
         let rawNonce = "raw-nonce"
         let result = try await client.signInWithAppleDiagnosed(
-            identityToken: "jwt",
-            authorizationCode: "code",
+            identityToken: "identity-token-secret",
+            authorizationCode: "authorization-code-secret",
             nonce: rawNonce,
-            displayName: "",
-            email: "",
+            displayName: "Private Name",
+            email: "email@example.invalid",
             requestID: requestID
         )
 
@@ -3254,9 +3262,123 @@ final class AppleNonceContractTests: XCTestCase {
         let body = try JSONDecoder.account.decode(AppleSignInRequest.self, from: try XCTUnwrap(request.httpBody))
         XCTAssertEqual(body.requestID, requestID)
         XCTAssertEqual(body.nonce, rawNonce)
+
+        let lifecycle = try XCTUnwrap(result.report.taskLifecycle)
+        XCTAssertEqual(lifecycle.resumeCount, 1)
+        XCTAssertEqual(lifecycle.events.first?.kind, .taskCreated)
+        XCTAssertEqual(lifecycle.events.first?.state, .suspended)
+        XCTAssertEqual(lifecycle.events.dropFirst().first?.kind, .beforeResume)
+        XCTAssertEqual(lifecycle.events.dropFirst().first?.state, .suspended)
+        XCTAssertEqual(lifecycle.events.first(where: { $0.kind == .afterResume })?.state, .running)
+        let metricsEvent = try XCTUnwrap(lifecycle.events.first(where: { $0.kind == .metricsCollected }))
+        XCTAssertEqual(metricsEvent.transactionCount, result.report.transactions.count)
+        XCTAssertEqual(lifecycle.events.last?.kind, .taskCompleted)
+        XCTAssertEqual(lifecycle.events.filter { $0.kind == .taskCompleted }.count, 1)
+        XCTAssertTrue(lifecycle.request.originalRequestPresent)
+        XCTAssertTrue(lifecycle.request.currentRequestPresent)
+        XCTAssertEqual(lifecycle.request.originalPath, "/wifi-secure-call/v3/auth/apple")
+        XCTAssertEqual(lifecycle.request.currentPath, "/wifi-secure-call/v3/auth/apple")
+        XCTAssertEqual(lifecycle.request.originalMethod, "POST")
+        XCTAssertEqual(lifecycle.request.currentMethod, "POST")
+        XCTAssertEqual(lifecycle.request.bodyByteCount, request.httpBody?.count)
+        XCTAssertEqual(delegate.activeTaskCount, 0)
         XCTAssertEqual(result.report.pathStart.status, .unknown)
         XCTAssertTrue(result.report.pathStart.interfaces.isEmpty)
-        XCTAssertEqual(result.report.transactions.count, 0)
+        let copied = result.report.safeDescription
+        for secret in ["identity-token-secret", "authorization-code-secret", rawNonce, "Private Name", "email@example.invalid", "example.invalid", "Content-Type", "access", "refresh"] {
+            XCTAssertFalse(copied.contains(secret))
+        }
+    }
+
+    func testWaitingAndSessionInvalidationCallbacksAreCapturedForSameTask() async throws {
+        let createdTask = LockedDataTask()
+        let entered = DispatchSemaphore(value: 0)
+        let release = DispatchSemaphore(value: 0)
+        let (session, delegate) = diagnosticTestTransport(taskCreatedObserver: { createdTask.set($0) }) { _ in
+            entered.signal()
+            _ = release.wait(timeout: .now() + 5)
+            return (200, ["ok": true])
+        }
+        var request = URLRequest(url: URL(string: "https://example.invalid/wifi-secure-call/v3/auth/apple")!)
+        request.httpMethod = "POST"
+        request.httpBody = Data("{}".utf8)
+
+        let operation = Task.detached {
+            await delegate.perform(request, session: session, startedAt: Date())
+        }
+        XCTAssertEqual(entered.wait(timeout: .now() + 5), .success)
+        let task = try XCTUnwrap(createdTask.value)
+        delegate.urlSession(session, taskIsWaitingForConnectivity: task)
+        delegate.urlSession(session, didBecomeInvalidWithError: URLError(.cancelled))
+        release.signal()
+        let result = await operation.value
+
+        XCTAssertEqual(result.lifecycle.events.filter { $0.kind == .waitingForConnectivity }.count, 1)
+        XCTAssertEqual(result.lifecycle.events.filter { $0.kind == .sessionInvalidated }.count, 1)
+        XCTAssertEqual(result.lifecycle.events.filter { $0.kind == .taskCompleted }.count, 1)
+        XCTAssertEqual(result.lifecycle.resumeCount, 1)
+        XCTAssertEqual(delegate.activeTaskCount, 0)
+    }
+
+    func testTerminalTransportErrorIsCapturedSafelyAndContinuationCompletesOnce() async throws {
+        let (session, delegate) = diagnosticTestTransport { _ -> (Int, Encodable) in
+            throw URLError(.timedOut)
+        }
+        let client = AccountAPIClient(
+            config: AppConfig(apiBaseURL: URL(string: "https://example.invalid/wifi-secure-call/v1")!, mediaURL: URL(string: "wss://example.invalid/media")!, role: .B, bearerToken: String(repeating: "b", count: 64)),
+            tokenStore: InMemorySecureTokenStore(),
+            session: session,
+            appleTaskDelegate: delegate,
+            deviceID: UUID()
+        )
+
+        do {
+            _ = try await client.signInWithAppleDiagnosed(
+                identityToken: "identity-token-secret",
+                authorizationCode: "authorization-code-secret",
+                nonce: "nonce-secret",
+                displayName: "",
+                email: "email@example.invalid"
+            )
+            XCTFail("transport failure was not thrown")
+        } catch let failure as AppleSignInDiagnosticFailure {
+            guard case .transport(let domain, let code) = failure.underlying else {
+                return XCTFail("unexpected account error")
+            }
+            XCTAssertEqual(domain, NSURLErrorDomain)
+            XCTAssertEqual(code, URLError.timedOut.rawValue)
+            let lifecycle = try XCTUnwrap(failure.report.taskLifecycle)
+            XCTAssertEqual(lifecycle.events.filter { $0.kind == .taskCompleted }.count, 1)
+            XCTAssertEqual(lifecycle.events.last?.kind, .taskCompleted)
+            XCTAssertEqual(lifecycle.events.last?.errorDomain, NSURLErrorDomain)
+            XCTAssertEqual(lifecycle.events.last?.errorCode, URLError.timedOut.rawValue)
+            XCTAssertEqual(lifecycle.resumeCount, 1)
+            let copied = failure.report.safeDescription
+            for secret in ["identity-token-secret", "authorization-code-secret", "nonce-secret", "email@example.invalid"] {
+                XCTAssertFalse(copied.contains(secret))
+            }
+        }
+        XCTAssertEqual(delegate.activeTaskCount, 0)
+    }
+
+    func testConcurrentTaskContextsCannotOverwriteEachOther() async {
+        let (session, delegate) = diagnosticTestTransport { _ in (200, ["ok": true]) }
+        @Sendable func request(_ marker: String) -> URLRequest {
+            var value = URLRequest(url: URL(string: "https://example.invalid/wifi-secure-call/v3/auth/apple")!)
+            value.httpMethod = "POST"
+            value.httpBody = Data(marker.utf8)
+            return value
+        }
+
+        async let first = delegate.perform(request("one"), session: session, startedAt: Date())
+        async let second = delegate.perform(request("second"), session: session, startedAt: Date())
+        let results = await [first, second]
+
+        XCTAssertNotEqual(results[0].lifecycle.taskIdentifier, results[1].lifecycle.taskIdentifier)
+        XCTAssertEqual(Set(results.map { $0.lifecycle.request.bodyByteCount }), Set([3, 6]))
+        XCTAssertTrue(results.allSatisfy { $0.lifecycle.resumeCount == 1 })
+        XCTAssertTrue(results.allSatisfy { $0.lifecycle.events.filter { $0.kind == .taskCompleted }.count == 1 })
+        XCTAssertEqual(delegate.activeTaskCount, 0)
     }
 
     func testAppleSignInRequestSendsRawNonceToV3Server() async throws {
@@ -3438,6 +3560,18 @@ final class AppleNonceContractTests: XCTestCase {
             errorDomain: errorDomain,
             errorCode: errorCode
         )
+    }
+
+    private func diagnosticTestTransport(
+        taskCreatedObserver: AppleTaskLifecycleDelegate.TaskCreatedObserver? = nil,
+        handler: @escaping (URLRequest) throws -> (Int, Encodable)
+    ) -> (URLSession, AppleTaskLifecycleDelegate) {
+        AccountURLProtocol.handler = handler
+        let configuration = AccountTransportPolicy.configuration()
+        configuration.protocolClasses = [AccountURLProtocol.self]
+        let delegate = AppleTaskLifecycleDelegate(taskCreatedObserver: taskCreatedObserver)
+        let session = URLSession(configuration: configuration, delegate: delegate, delegateQueue: nil)
+        return (session, delegate)
     }
 
     private func testSession(handler: @escaping (URLRequest) throws -> (Int, Encodable)) -> URLSession {
