@@ -4,6 +4,55 @@ import LiveCommunicationKit
 import SwiftUI
 import WatchConnectivity
 
+#if compiler(>=6.4)
+@available(iOS 27.0, *)
+@MainActor
+private struct IOSSystemCellularPlanStatusClient: CarrierCellularPlanStatusChecking {
+    func authorizationStatus(for phoneNumber: String) async -> CarrierCellularPlanAuthorizationResult {
+        do {
+            return Self.mapAuthorization(try await CTCellularPlanStatus.authorizationStatus(forPhoneNumber: phoneNumber))
+        } catch {
+            return .errorSafe
+        }
+    }
+
+    func requestAuthorization(for phoneNumber: String) async -> CarrierCellularPlanAuthorizationResult {
+        do {
+            return Self.mapAuthorization(try await CTCellularPlanStatus.requestAuthorization(forPhoneNumber: phoneNumber))
+        } catch {
+            return .errorSafe
+        }
+    }
+
+    func statusHint(for phoneNumber: String) async -> CarrierCellularPlanAvailabilityResult {
+        do {
+            let (availability, confidence) = try await CTCellularPlanStatus.hint(forPhoneNumber: phoneNumber)
+            switch (availability, confidence) {
+            case (.available, .low): return .availableLowConfidence
+            case (.available, .high): return .availableHighConfidence
+            case (.unavailable, .low): return .unavailableLowConfidence
+            case (.unavailable, .high): return .unavailableHighConfidence
+            @unknown default: return .unknown
+            }
+        } catch {
+            return .errorSafe
+        }
+    }
+
+    private static func mapAuthorization(
+        _ value: CTCellularPlanStatus.Authorization
+    ) -> CarrierCellularPlanAuthorizationResult {
+        switch value {
+        case .notAuthorized: return .notAuthorized
+        case .authorized: return .authorized
+        case .restricted: return .restricted
+        case .notSupported: return .notSupported
+        @unknown default: return .unknown
+        }
+    }
+}
+#endif
+
 @MainActor
 final class IOSCarrierCallingDiagnosticProbe: ObservableObject {
     @Published private(set) var record = CarrierCallingDiagnosticRecord.baseline(platform: .iOS)
@@ -12,8 +61,12 @@ final class IOSCarrierCallingDiagnosticProbe: ObservableObject {
     private let cellularData = CTCellularData()
 
     func refresh(network: CarrierCallingNetworkSnapshot) {
+        let savedPlanAuthorization = record.cellularPlanAuthorization
+        let savedPlanStatus = record.cellularPlanStatus
         var next = CarrierCallingDiagnosticRecord.baseline(platform: .iOS)
         next.network = network
+        next.cellularPlanAuthorization = savedPlanAuthorization
+        next.cellularPlanStatus = savedPlanStatus
 
         if #available(iOS 26.0, *) {
             let services = TelephonyConversationManager.sharedInstance.cellularServices
@@ -50,6 +103,42 @@ final class IOSCarrierCallingDiagnosticProbe: ObservableObject {
             next.watchConnectivityState = "unsupported"
         }
         record = next
+    }
+
+    func checkCellularPlanStatus(
+        e164: String,
+        client override: (any CarrierCellularPlanStatusChecking)? = nil
+    ) async {
+        guard CarrierCallingE164.isPlausible(e164) else {
+            record.cellularPlanAuthorization = "INVALID_E164"
+            record.cellularPlanStatus = "NOT_CHECKED"
+            return
+        }
+
+        guard let client = override ?? systemCellularPlanStatusClient() else {
+            record.cellularPlanAuthorization = PublicCarrierCallingState.unknownPublicAPINotExposed.rawValue
+            record.cellularPlanStatus = PublicCarrierCallingState.unknownPublicAPINotExposed.rawValue
+            return
+        }
+
+        record.cellularPlanAuthorization = "CHECKING"
+        record.cellularPlanStatus = "NOT_CHECKED"
+        let result = await CarrierCellularPlanCheckWorkflow.check(
+            phoneNumber: e164,
+            client: client,
+            authorizationRequired: { [weak self] in
+                self?.record.cellularPlanAuthorization = "AUTHORIZATION_REQUIRED"
+            }
+        )
+        record.cellularPlanAuthorization = result.authorization
+        record.cellularPlanStatus = result.availability
+    }
+
+    private func systemCellularPlanStatusClient() -> (any CarrierCellularPlanStatusChecking)? {
+        #if compiler(>=6.4)
+        if #available(iOS 27.0, *) { return IOSSystemCellularPlanStatusClient() }
+        #endif
+        return nil
     }
 
     private static func cellularDataText(_ value: CTCellularDataRestrictedState) -> String {
@@ -101,12 +190,17 @@ struct CarrierCallingDiagnosticView: View {
     @Environment(\.dismiss) private var dismiss
     @StateObject private var network = CarrierCallingNetworkProbe()
     @StateObject private var probe = IOSCarrierCallingDiagnosticProbe()
+    @ObservedObject private var observations = CarrierCallingObservationStore.shared
+    @State private var e164Input = ""
+    @State private var planCheckInProgress = false
 
     var body: some View {
         NavigationView {
             List {
                 networkSection
                 cellularSection
+                planStatusSection
+                observationSection
                 publicStateSection
                 companionSection
                 entitlementSection
@@ -122,15 +216,18 @@ struct CarrierCallingDiagnosticView: View {
             refresh()
         }
         .onChange(of: network.snapshot) { value in probe.refresh(network: value) }
-        .onDisappear { network.stop() }
+        .onDisappear {
+            e164Input.removeAll(keepingCapacity: false)
+            network.stop()
+        }
     }
 
     private var networkSection: some View {
         Section("IPHONE NETWORK") {
             line("Status", probe.record.network.status)
             line("Interfaces", list(probe.record.network.interfaces))
-            line("Expensive", yesNo(probe.record.network.isExpensive))
-            line("Constrained", yesNo(probe.record.network.isConstrained))
+            line("Expensive", optionalYesNo(probe.record.network.isExpensive))
+            line("Constrained", optionalYesNo(probe.record.network.isConstrained))
         }
     }
 
@@ -145,12 +242,53 @@ struct CarrierCallingDiagnosticView: View {
                 }
             }
             line("Selected service", probe.record.selectedCellularService)
-            line("Cellular plan status", probe.record.cellularPlanStatus)
             line("Cellular data", probe.record.cellularDataAccess)
             line("Providers", list(probe.record.serviceProviderLabels))
             line("Radio technology", list(probe.record.radioAccessTechnologies))
             line("System cellular call", probe.record.systemCellularCallCapability)
         }
+    }
+
+    private var planStatusSection: some View {
+        Section("CELLULAR PLAN STATUS") {
+            TextField("E.164 (+country code and number)", text: $e164Input)
+                .keyboardType(.phonePad)
+                .autocorrectionDisabled()
+            Button("Check cellular plan status") {
+                let transientNumber = e164Input
+                planCheckInProgress = true
+                Task {
+                    await probe.checkCellularPlanStatus(e164: transientNumber)
+                    planCheckInProgress = false
+                }
+            }
+            .disabled(planCheckInProgress)
+            line("Authorization", probe.record.cellularPlanAuthorization)
+            line("Availability hint", probe.record.cellularPlanStatus)
+        }
+    }
+
+    private var observationSection: some View {
+        Section("BEFORE / AFTER") {
+            Button("Capture BEFORE") {
+                refresh()
+                observations.captureBefore(CarrierCallingObservationSnapshot(record: probe.record), for: .iOS)
+            }
+            Button("Capture AFTER") {
+                refresh()
+                observations.captureAfter(CarrierCallingObservationSnapshot(record: probe.record), for: .iOS)
+            }
+            line("BEFORE", observations.beforeSnapshot(for: .iOS)?.conciseDescription ?? "NOT_CAPTURED")
+            line("AFTER", observations.afterSnapshot(for: .iOS)?.conciseDescription ?? "NOT_CAPTURED")
+            line("CHANGED FIELDS", changedFieldsText)
+        }
+    }
+
+    private var changedFieldsText: String {
+        guard observations.beforeSnapshot(for: .iOS) != nil,
+              observations.afterSnapshot(for: .iOS) != nil else { return "NOT_READY" }
+        let fields = observations.changedFields(for: .iOS)
+        return fields.isEmpty ? "none" : fields.joined(separator: ", ")
     }
 
     private var publicStateSection: some View {
@@ -174,16 +312,16 @@ struct CarrierCallingDiagnosticView: View {
     }
 
     private var entitlementSection: some View {
-        Section("SIGNED CELLULAR ENTITLEMENTS") {
-            line("CommCenter fine-grained", probe.record.signedCellularEntitlements)
+        Section("CELLULAR ENTITLEMENT EVIDENCE") {
+            line("Build44 offline verified", probe.record.build44OfflineCommCenterFineGrained)
+            stateLine("Current running build", probe.record.currentBuildCommCenterFineGrained)
             line("Provisioning path", probe.record.publicProvisioningPathResult)
         }
     }
 
     private func refresh() { probe.refresh(network: network.snapshot) }
     private func list(_ values: [String]) -> String { values.isEmpty ? "none" : values.joined(separator: ", ") }
-    private func yesNo(_ value: Bool) -> String { value ? "YES" : "NO" }
-    private func optionalYesNo(_ value: Bool?) -> String { value.map(yesNo) ?? "UNKNOWN" }
+    private func optionalYesNo(_ value: Bool?) -> String { value.map { $0 ? "YES" : "NO" } ?? "UNKNOWN" }
     private func stateLine(_ title: String, _ state: PublicCarrierCallingState) -> some View { line(title, state.rawValue) }
     private func line(_ title: String, _ value: String) -> some View {
         VStack(alignment: .leading, spacing: 2) {

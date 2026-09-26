@@ -5,7 +5,7 @@ Authoritative interface inspection: Xcode 27.0 (27A266a), iOS SDK 27.0, watchOS 
 ## Public callable APIs
 
 - iOS 26+: `TelephonyConversationManager.startCellularConversation(_:)` with `StartCellularConversationAction`. This requests an iPhone system cellular conversation; it does not provision Wi-Fi Calling or companion calling.
-- SDK 27 `CTCellularPlanStatus` authorization/status/hint methods accept an explicit E.164 number supplied by the app and require user authorization. They do not discover the active line. The probe intentionally does not request, retain, or serialize a number.
+- iOS 27 `CTCellularPlanStatus.authorizationStatus(forPhoneNumber:)`, `requestAuthorization(forPhoneNumber:)`, and `hint(forPhoneNumber:)` accept an explicit E.164 number supplied by the person. The public authorization cases are `notAuthorized`, `authorized`, `restricted`, and `notSupported`; the hint returns `available`/`unavailable` plus `low`/`high` confidence. `unavailable` is not treated as proof of no matching line. The API does not discover the active line; the probe keeps the number only in transient view/request memory, clears the input when the view closes, and never persists or serializes it.
 - watchOS: `WKApplication.openSystemURL(_:)` can request a `tel:` handoff. The probe reports availability but never calls it.
 - `NWPathMonitor` and `WCSession` provide network-path and app-to-app companion reachability observations.
 
@@ -33,9 +33,13 @@ The inspected SDK 27 public interfaces do not expose a third-party API for:
 
 NetworkExtension documentation mentions IMS/Wi-Fi Calling traffic only to describe VPN exclusion behavior; it is not a state or provisioning API. CallKit coordinates call UI/lifecycle and does not expose these carrier states.
 
+## Observation limits
+
+The in-memory BEFORE/AFTER snapshots compare only public network, cellular-service, radio, provider, TelephonyConversationManager, WCSession, and existing safe Watch handoff observations. A change or lack of change is not evidence of IMS, Thumper, VoWiFi, or iCloud-device Calling state; those remain `UNKNOWN_PUBLIC_API_NOT_EXPOSED`.
+
 ## Signing evidence
 
-The byte-verified signed Build44 iPhone and Watch entitlements contain no cellular/telephony entitlement and no `com.apple.CommCenter.fine-grained` entitlement. The probe does not add any entitlement or capability.
+Offline inspection of the byte-verified signed Build44 iPhone and Watch bundles found no cellular/telephony entitlement and no `com.apple.CommCenter.fine-grained` entitlement. That historical result is labeled `BUILD44_OFFLINE_VERIFIED_COMM_CENTER_FINE_GRAINED_ABSENT`. There is no suitable public App-Store-safe API for measuring that entitlement in the currently running build, so runtime UI reports `UNKNOWN_PUBLIC_API_NOT_EXPOSED`. The probe adds no entitlement or capability.
 
 ## Result
 
