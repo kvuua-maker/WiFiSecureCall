@@ -23,6 +23,9 @@ jobs:
             test "$(sed -n '2p' "$OUT/versions.txt")" = "Build version 27A266a"
             test "$IOS_SDK" = "27.0"
             test "$WATCH_SDK" = "27.0"
+            HEADER="$(xcrun --sdk iphoneos --show-sdk-path)/System/Library/Frameworks/CoreTelephony.framework/Headers/CTCellularPlanStatus.h"
+            sed -n '1,120p' "$HEADER"
+            circleci-agent step halt
       - run:
           name: iOS and watchOS public-API compile validation
           command: |
