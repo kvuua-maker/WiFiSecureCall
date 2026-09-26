@@ -30,6 +30,34 @@ actor AccountRefreshCoordinator {
     }
 }
 
+enum AccountTransportPolicy {
+    static let requestTimeout: TimeInterval = 10
+    static let resourceTimeout: TimeInterval = 10
+    static let waitsForConnectivity = false
+
+    static func configuration() -> URLSessionConfiguration {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.timeoutIntervalForRequest = requestTimeout
+        configuration.timeoutIntervalForResource = resourceTimeout
+        configuration.waitsForConnectivity = waitsForConnectivity
+        return configuration
+    }
+}
+
+enum AppleAuthTransportPolicy {
+    static let requestTimeout: TimeInterval = 15
+    static let resourceTimeout: TimeInterval = 20
+    static let waitsForConnectivity = true
+
+    static func configuration() -> URLSessionConfiguration {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.timeoutIntervalForRequest = requestTimeout
+        configuration.timeoutIntervalForResource = resourceTimeout
+        configuration.waitsForConnectivity = waitsForConnectivity
+        return configuration
+    }
+}
+
 private struct AppleDiagnosticRawResult: @unchecked Sendable {
     let data: Data
     let response: URLResponse?
@@ -142,14 +170,11 @@ private final class AppleNWPathTracker: @unchecked Sendable {
 }
 
 private enum AppleDiagnosticTransport {
-    static func perform(_ request: URLRequest) async -> (AppleDiagnosticRawResult, AppleTransportDiagnosticReport) {
+    static func perform(_ request: URLRequest, configuration override: URLSessionConfiguration? = nil) async -> (AppleDiagnosticRawResult, AppleTransportDiagnosticReport) {
         let pathTracker = AppleNWPathTracker()
         let pathStart = pathTracker.start()
         let startedAt = Date()
-        let configuration = URLSessionConfiguration.ephemeral
-        configuration.timeoutIntervalForRequest = 10
-        configuration.timeoutIntervalForResource = 10
-        configuration.waitsForConnectivity = false
+        let configuration = override ?? AppleAuthTransportPolicy.configuration()
         let delegate = AppleDiagnosticSessionDelegate()
         let session = URLSession(configuration: configuration, delegate: delegate, delegateQueue: nil)
         let result = await delegate.perform(request, session: session)
@@ -221,13 +246,15 @@ actor AccountAPIClient {
     private let tokenStore: SecureTokenStore
     private let deviceID: UUID
     private let beforeRefresh: (@Sendable (UUID, String) async -> Void)?
+    private let appleDiagnosticConfiguration: URLSessionConfiguration?
 
     init(
         config: AppConfig,
         tokenStore: SecureTokenStore,
         session: URLSession? = nil,
         deviceID: UUID = InstallationIdentity.shared.id,
-        beforeRefresh: (@Sendable (UUID, String) async -> Void)? = nil
+        beforeRefresh: (@Sendable (UUID, String) async -> Void)? = nil,
+        appleDiagnosticConfiguration: URLSessionConfiguration? = nil
     ) {
         let root = config.apiBaseURL.deletingLastPathComponent()
         self.baseURL = root.appendingPathComponent("v2", isDirectory: true)
@@ -235,13 +262,10 @@ actor AccountAPIClient {
         self.tokenStore = tokenStore
         self.deviceID = deviceID
         self.beforeRefresh = beforeRefresh
+        self.appleDiagnosticConfiguration = appleDiagnosticConfiguration
         if let session { self.session = session }
         else {
-            let configuration = URLSessionConfiguration.ephemeral
-            configuration.timeoutIntervalForRequest = 10
-            configuration.timeoutIntervalForResource = 10
-            configuration.waitsForConnectivity = false
-            self.session = URLSession(configuration: configuration)
+            self.session = URLSession(configuration: AccountTransportPolicy.configuration())
         }
     }
 
@@ -411,10 +435,10 @@ actor AccountAPIClient {
     private func diagnosticAppleSignIn(_ body: AppleSignInRequest) async throws -> AppleSignInDiagnosticResult {
         var value = URLRequest(url: v3BaseURL.appendingPathComponent("auth/apple"))
         value.httpMethod = "POST"
-        value.timeoutInterval = 10
+        value.timeoutInterval = AppleAuthTransportPolicy.requestTimeout
         value.httpBody = try JSONEncoder.account.encode(body)
         value.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        let (result, report) = await AppleDiagnosticTransport.perform(value)
+        let (result, report) = await AppleDiagnosticTransport.perform(value, configuration: appleDiagnosticConfiguration)
         if let error = result.error {
             throw AppleSignInDiagnosticFailure(underlying: AccountAPIError.wrappingTransport(error), report: report)
         }
@@ -436,7 +460,7 @@ actor AccountAPIClient {
     private func request<T: Decodable, B: Encodable>(_ path: String, method: String = "POST", body: B?, bearer: String? = nil, root: URL? = nil) async throws -> T {
         var value = URLRequest(url: (root ?? baseURL).appendingPathComponent(path))
         value.httpMethod = method
-        value.timeoutInterval = 10
+        value.timeoutInterval = AccountTransportPolicy.requestTimeout
         if let body { value.httpBody = try JSONEncoder.account.encode(body) }
         value.setValue("application/json", forHTTPHeaderField: "Content-Type")
         if let bearer { value.setValue("Bearer \(bearer)", forHTTPHeaderField: "Authorization") }

@@ -3197,6 +3197,62 @@ final class AppleNonceContractTests: XCTestCase {
         )
     }
 
+    func testNormalAndAppleTransportPoliciesRemainIsolated() {
+        let normal = AccountTransportPolicy.configuration()
+        XCTAssertFalse(normal.waitsForConnectivity)
+        XCTAssertEqual(normal.timeoutIntervalForRequest, 10)
+        XCTAssertEqual(normal.timeoutIntervalForResource, 10)
+
+        let apple = AppleAuthTransportPolicy.configuration()
+        XCTAssertTrue(apple.waitsForConnectivity)
+        XCTAssertEqual(apple.timeoutIntervalForRequest, 15)
+        XCTAssertEqual(apple.timeoutIntervalForResource, 20)
+        XCTAssertEqual(AppleAuthTransportPolicy.requestTimeout, 15)
+    }
+
+    func testDiagnosedAppleSignInUsesOneRequestWithStableRequestID() async throws {
+        let captured = LockedRequests()
+        let counter = LockedCounter()
+        let accountID = UUID(), userID = UUID(), deviceID = UUID(), requestID = UUID()
+        let response = AccountSessionResponse(
+            account: AccountSummary(accountID: accountID, userID: userID, phoneNumber: nil, displayLabel: "@user-test"),
+            deviceID: deviceID,
+            accessToken: "access", accessExpiresAt: .distantFuture,
+            refreshToken: "refresh", refreshExpiresAt: .distantFuture,
+            user: UserProfile(userID: userID, username: "user-test", displayName: nil, email: nil, verifiedPhones: [], publicIdentity: "wsc:user:user-test")
+        )
+        AccountURLProtocol.handler = { request in
+            counter.increment()
+            captured.append(request)
+            return (200, response)
+        }
+        let appleConfiguration = URLSessionConfiguration.ephemeral
+        appleConfiguration.protocolClasses = [AccountURLProtocol.self]
+        let client = AccountAPIClient(
+            config: AppConfig(apiBaseURL: URL(string: "https://example.invalid/wifi-secure-call/v1")!, mediaURL: URL(string: "wss://example.invalid/media")!, role: .B, bearerToken: String(repeating: "b", count: 64)),
+            tokenStore: InMemorySecureTokenStore(),
+            deviceID: deviceID,
+            appleDiagnosticConfiguration: appleConfiguration
+        )
+        let rawNonce = "raw-nonce"
+        _ = try await client.signInWithAppleDiagnosed(
+            identityToken: "jwt",
+            authorizationCode: "code",
+            nonce: rawNonce,
+            displayName: "",
+            email: "",
+            requestID: requestID
+        )
+        XCTAssertEqual(counter.value, 1)
+        XCTAssertEqual(captured.values.count, 1)
+        let request = try XCTUnwrap(captured.values.first)
+        XCTAssertEqual(request.url?.path, "/wifi-secure-call/v3/auth/apple")
+        XCTAssertEqual(request.timeoutInterval, 15)
+        let body = try JSONDecoder.account.decode(AppleSignInRequest.self, from: try XCTUnwrap(request.httpBody))
+        XCTAssertEqual(body.requestID, requestID)
+        XCTAssertEqual(body.nonce, rawNonce)
+    }
+
     func testAppleSignInRequestSendsRawNonceToV3Server() async throws {
         let captured = LockedRequests()
         let accountID = UUID(), userID = UUID(), deviceID = UUID()
