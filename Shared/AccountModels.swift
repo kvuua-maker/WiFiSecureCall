@@ -49,7 +49,14 @@ enum AppleVerificationDiagnostic: String, Codable, Sendable {
     case otherTransport = "APPLE_VERIFY_OTHER_TRANSPORT"
 
     static func classify(_ error: Error) -> Self {
-        guard let apiError = error as? AccountAPIError else { return .serverRequest }
+        let apiError: AccountAPIError
+        if let diagnosticError = error as? AppleSignInDiagnosticFailure {
+            apiError = diagnosticError.underlying
+        } else if let accountError = error as? AccountAPIError {
+            apiError = accountError
+        } else {
+            return .serverRequest
+        }
         switch apiError {
         case .status(_, let response):
             if let response, let diagnostic = Self(rawValue: response.error) { return diagnostic }
@@ -64,10 +71,15 @@ enum AppleVerificationDiagnostic: String, Codable, Sendable {
     }
 
     static func safeTransportDetail(_ error: Error) -> String? {
-        guard let apiError = error as? AccountAPIError,
+        let apiError = (error as? AppleSignInDiagnosticFailure)?.underlying ?? (error as? AccountAPIError)
+        guard let apiError,
               case .transport(let domain, let code) = apiError,
               transportDiagnostic(domain: domain, code: code) == .otherTransport else { return nil }
         return "\(domain) \(code)"
+    }
+
+    static func transportReport(_ error: Error) -> AppleTransportDiagnosticReport? {
+        (error as? AppleSignInDiagnosticFailure)?.report
     }
 
     private static func transportDiagnostic(domain: String, code: Int) -> Self {
@@ -94,6 +106,105 @@ enum AppleVerificationDiagnostic: String, Codable, Sendable {
             return .otherTransport
         }
     }
+}
+
+struct AppleTransportPathSnapshot: Equatable, Sendable {
+    enum Status: String, Sendable { case satisfied, unsatisfied, requiresConnection, unknown }
+    enum InterfaceKind: String, Comparable, Sendable {
+        case wifi, cellular, wiredEthernet, other
+        static func < (lhs: Self, rhs: Self) -> Bool { lhs.rawValue < rhs.rawValue }
+    }
+
+    let status: Status
+    let interfaces: [InterfaceKind]
+    let isExpensive: Bool
+    let isConstrained: Bool
+
+    var safeDescription: String {
+        let interfaceText = interfaces.isEmpty ? "none" : interfaces.sorted().map(\.rawValue).joined(separator: "+")
+        return "status=\(status.rawValue),interfaces=\(interfaceText),expensive=\(isExpensive),constrained=\(isConstrained)"
+    }
+}
+
+struct AppleTransportPhaseSnapshot: Equatable, Sendable {
+    let startMilliseconds: Int?
+    let durationMilliseconds: Int?
+
+    static func capture(start: Date?, end: Date?, relativeTo origin: Date) -> Self {
+        let startMilliseconds = start.map { max(0, Int(($0.timeIntervalSince(origin) * 1_000).rounded())) }
+        let durationMilliseconds: Int?
+        if let start, let end {
+            durationMilliseconds = max(0, Int((end.timeIntervalSince(start) * 1_000).rounded()))
+        } else {
+            durationMilliseconds = nil
+        }
+        return Self(startMilliseconds: startMilliseconds, durationMilliseconds: durationMilliseconds)
+    }
+
+    var safeDescription: String {
+        "start=\(startMilliseconds.map(String.init) ?? "missing"),duration=\(durationMilliseconds.map(String.init) ?? "missing")"
+    }
+}
+
+struct AppleTransportTransactionSnapshot: Equatable, Sendable {
+    let fetchStartMilliseconds: Int?
+    let domainLookup: AppleTransportPhaseSnapshot
+    let connect: AppleTransportPhaseSnapshot
+    let secureConnection: AppleTransportPhaseSnapshot
+    let request: AppleTransportPhaseSnapshot
+    let response: AppleTransportPhaseSnapshot
+    let networkProtocolName: String?
+    let isProxyConnection: Bool
+    let isReusedConnection: Bool
+    let resourceFetchType: String
+
+    var safeDescription: String {
+        [
+            "fetchStart=\(fetchStartMilliseconds.map(String.init) ?? "missing")",
+            "dns={\(domainLookup.safeDescription)}",
+            "connect={\(connect.safeDescription)}",
+            "tls={\(secureConnection.safeDescription)}",
+            "request={\(request.safeDescription)}",
+            "response={\(response.safeDescription)}",
+            "protocol=\(networkProtocolName ?? "missing")",
+            "proxy=\(isProxyConnection)",
+            "reused=\(isReusedConnection)",
+            "fetchType=\(resourceFetchType)",
+        ].joined(separator: ",")
+    }
+}
+
+struct AppleTransportDiagnosticReport: Equatable, Sendable {
+    let pathStart: AppleTransportPathSnapshot
+    let pathEnd: AppleTransportPathSnapshot
+    let transactions: [AppleTransportTransactionSnapshot]
+    let redirectCount: Int
+    let totalMilliseconds: Int
+    let errorDomain: String?
+    let errorCode: Int?
+
+    var safeDescription: String {
+        var lines = [
+            "pathStart=\(pathStart.safeDescription)",
+            "pathEnd=\(pathEnd.safeDescription)",
+            "transactions=\(transactions.count)",
+            "redirects=\(redirectCount)",
+            "totalMs=\(totalMilliseconds)",
+            "error=\(errorDomain.map { "\($0)/\(errorCode ?? 0)" } ?? "none")",
+        ]
+        lines.append(contentsOf: transactions.enumerated().map { "transaction[\($0.offset)]=\($0.element.safeDescription)" })
+        return lines.joined(separator: "\n")
+    }
+}
+
+struct AppleSignInDiagnosticResult: Sendable {
+    let response: AccountSessionResponse
+    let report: AppleTransportDiagnosticReport
+}
+
+struct AppleSignInDiagnosticFailure: Error, Sendable {
+    let underlying: AccountAPIError
+    let report: AppleTransportDiagnosticReport
 }
 
 enum E164Phone {
@@ -263,7 +374,7 @@ struct WatchLinkStatusResponse: Codable, Sendable {
 }
 
 struct AccountAPIErrorResponse: Codable, Error, Sendable { let error: String; let retryAt: Date? }
-enum AccountAPIError: Error {
+enum AccountAPIError: Error, Sendable {
     case invalidConfiguration
     case invalidResponse
     case status(Int, AccountAPIErrorResponse?)

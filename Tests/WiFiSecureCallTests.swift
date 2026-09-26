@@ -3278,6 +3278,106 @@ final class AppleNonceContractTests: XCTestCase {
         }
     }
 
+    func testAppleTransportReportRepresentsZeroTransactionsExplicitly() {
+        let report = diagnosticReport()
+        XCTAssertEqual(report.transactions.count, 0)
+        XCTAssertTrue(report.safeDescription.contains("transactions=0"))
+    }
+
+    func testAppleTransportReportRepresentsMissingResponseStart() {
+        let missing = AppleTransportPhaseSnapshot(startMilliseconds: nil, durationMilliseconds: nil)
+        let transaction = AppleTransportTransactionSnapshot(
+            fetchStartMilliseconds: 0,
+            domainLookup: missing,
+            connect: missing,
+            secureConnection: missing,
+            request: AppleTransportPhaseSnapshot(startMilliseconds: 10, durationMilliseconds: 2),
+            response: missing,
+            networkProtocolName: "h2",
+            isProxyConnection: false,
+            isReusedConnection: false,
+            resourceFetchType: "networkLoad"
+        )
+        let report = diagnosticReport(transactions: [transaction])
+        XCTAssertEqual(report.transactions.count, 1)
+        XCTAssertTrue(report.safeDescription.contains("response={start=missing,duration=missing}"))
+    }
+
+    func testAppleTransportTimingRequiresBothEndpointsForDuration() {
+        let origin = Date(timeIntervalSince1970: 1_000)
+        let start = origin.addingTimeInterval(0.1)
+        let complete = AppleTransportPhaseSnapshot.capture(start: start, end: origin.addingTimeInterval(0.35), relativeTo: origin)
+        XCTAssertEqual(complete.startMilliseconds, 100)
+        XCTAssertEqual(complete.durationMilliseconds, 250)
+        let incomplete = AppleTransportPhaseSnapshot.capture(start: start, end: nil, relativeTo: origin)
+        XCTAssertEqual(incomplete.startMilliseconds, 100)
+        XCTAssertNil(incomplete.durationMilliseconds)
+        let noStart = AppleTransportPhaseSnapshot.capture(start: nil, end: origin.addingTimeInterval(0.35), relativeTo: origin)
+        XCTAssertNil(noStart.startMilliseconds)
+        XCTAssertNil(noStart.durationMilliseconds)
+    }
+
+    func testAppleNWPathSafeRepresentationContainsOnlyAllowedState() {
+        let path = AppleTransportPathSnapshot(status: .satisfied, interfaces: [.wifi, .cellular], isExpensive: true, isConstrained: false)
+        XCTAssertEqual(path.safeDescription, "status=satisfied,interfaces=cellular+wifi,expensive=true,constrained=false")
+        for forbidden in ["ssid", "bssid", "address", "gateway", "dns", "location", "vpn"] {
+            XCTAssertFalse(path.safeDescription.lowercased().contains(forbidden))
+        }
+    }
+
+    func testAppleTransportReportCannotContainCredentialMaterial() {
+        let report = diagnosticReport(errorDomain: NSURLErrorDomain, errorCode: URLError.timedOut.rawValue)
+        let text = report.safeDescription
+        for secret in ["identity-token-secret", "authorization-code-secret", "nonce-secret", "email@example.invalid", "bearer-secret", "+380000000000"] {
+            XCTAssertFalse(text.contains(secret))
+        }
+    }
+
+    func testAppleTimeoutDiagnosticRetainsSafeDomainAndCode() {
+        let report = diagnosticReport(errorDomain: NSURLErrorDomain, errorCode: URLError.timedOut.rawValue)
+        let failure = AppleSignInDiagnosticFailure(
+            underlying: .transport(domain: NSURLErrorDomain, code: URLError.timedOut.rawValue),
+            report: report
+        )
+        XCTAssertEqual(failure.report.errorDomain, NSURLErrorDomain)
+        XCTAssertEqual(failure.report.errorCode, -1001)
+        XCTAssertEqual(AppleVerificationDiagnostic.classify(failure), .timeout)
+        XCTAssertEqual(AppleVerificationDiagnostic.transportReport(failure), report)
+    }
+
+    func testNonAppleAccountRequestKeepsExistingSessionPath() async throws {
+        let captured = LockedRequests()
+        let response = PhoneStartResponse(verificationID: UUID(), expiresAt: .distantFuture, resendAfter: .distantFuture)
+        let session = testSession { request in
+            captured.append(request)
+            return (200, response)
+        }
+        let client = AccountAPIClient(
+            config: AppConfig(apiBaseURL: URL(string: "https://example.invalid/wifi-secure-call/v1")!, mediaURL: URL(string: "wss://example.invalid/media")!, role: .B, bearerToken: String(repeating: "b", count: 64)),
+            tokenStore: InMemorySecureTokenStore(), session: session, deviceID: UUID()
+        )
+        _ = try await client.startPhone("+00000000000")
+        let request = try XCTUnwrap(captured.values.first)
+        XCTAssertEqual(request.url?.path, "/wifi-secure-call/v2/auth/phone/start")
+        XCTAssertEqual(request.timeoutInterval, 10)
+    }
+
+    private func diagnosticReport(
+        transactions: [AppleTransportTransactionSnapshot] = [],
+        errorDomain: String? = nil,
+        errorCode: Int? = nil
+    ) -> AppleTransportDiagnosticReport {
+        AppleTransportDiagnosticReport(
+            pathStart: AppleTransportPathSnapshot(status: .satisfied, interfaces: [.wifi], isExpensive: false, isConstrained: false),
+            pathEnd: AppleTransportPathSnapshot(status: .satisfied, interfaces: [.wifi], isExpensive: false, isConstrained: false),
+            transactions: transactions,
+            redirectCount: max(0, transactions.count - 1),
+            totalMilliseconds: 10_000,
+            errorDomain: errorDomain,
+            errorCode: errorCode
+        )
+    }
+
     private func testSession(handler: @escaping (URLRequest) throws -> (Int, Encodable)) -> URLSession {
         AccountURLProtocol.handler = handler
         let configuration = URLSessionConfiguration.ephemeral

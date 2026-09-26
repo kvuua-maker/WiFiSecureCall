@@ -1,5 +1,6 @@
 import AuthenticationServices
 import SwiftUI
+import UIKit
 
 struct AccountView: View {
     @ObservedObject var store: AccountSessionStore
@@ -11,6 +12,7 @@ struct AccountView: View {
     @State private var appleState = ""
     @State private var appleDiagnostic: AppleVerificationDiagnostic?
     @State private var appleTransportDetail: String?
+    @State private var appleTransportReport: AppleTransportDiagnosticReport?
 
     init(store: AccountSessionStore) {
         self.store = store
@@ -76,6 +78,13 @@ struct AccountView: View {
                             .textSelection(.enabled)
                     }
                 }
+                if let appleTransportReport {
+                    Text(appleTransportReport.safeDescription)
+                        .font(.caption.monospaced())
+                        .foregroundStyle(.secondary)
+                        .textSelection(.enabled)
+                    Button("Copy diagnostic") { UIPasteboard.general.string = safeAppleDiagnosticText }
+                }
             }
             .navigationTitle("Account")
             .sheet(isPresented: $showRegistration) { NavigationView { PhoneRegistrationView(store: store, client: client) } }
@@ -85,6 +94,7 @@ struct AccountView: View {
     private func configureAppleRequest(_ request: ASAuthorizationAppleIDRequest) {
         appleDiagnostic = nil
         appleTransportDetail = nil
+        appleTransportReport = nil
         do {
             let rawNonce = try AppleSignInNonceContract.makeRawNonce()
             let state = try AppleSignInNonceContract.makeRawNonce()
@@ -128,17 +138,27 @@ struct AccountView: View {
 
     @MainActor private func finishAppleSignIn(identityToken: String, authorizationCode: String, nonce: String, displayName: String, email: String) async {
         do {
-            let response = try await client.signInWithApple(identityToken: identityToken, authorizationCode: authorizationCode, nonce: nonce, displayName: displayName, email: email)
-            try store.add(response)
-            await AccountPushRegistrationCoordinator.shared.registerKnownTokens(for: response.account.accountID)
+            let result = try await client.signInWithAppleDiagnosed(identityToken: identityToken, authorizationCode: authorizationCode, nonce: nonce, displayName: displayName, email: email)
+            try store.add(result.response)
+            await AccountPushRegistrationCoordinator.shared.registerKnownTokens(for: result.response.account.accountID)
             appleDiagnostic = nil
             appleTransportDetail = nil
+            appleTransportReport = result.report
             message = "Apple account ready"
         } catch {
             appleDiagnostic = AppleVerificationDiagnostic.classify(error)
             appleTransportDetail = AppleVerificationDiagnostic.safeTransportDetail(error)
+            appleTransportReport = AppleVerificationDiagnostic.transportReport(error)
             message = "Apple sign-in could not be verified"
         }
+    }
+
+    private var safeAppleDiagnosticText: String {
+        var lines: [String] = []
+        if let appleDiagnostic { lines.append("Diagnostic: \(appleDiagnostic.rawValue)") }
+        if let appleTransportDetail { lines.append("Transport: \(appleTransportDetail)") }
+        if let appleTransportReport { lines.append(appleTransportReport.safeDescription) }
+        return lines.joined(separator: "\n")
     }
 
     @MainActor private func claimWatch(accountID: UUID) async {
