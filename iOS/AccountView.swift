@@ -107,6 +107,7 @@ struct AccountView: View {
         do {
             let response = try await client.signInWithApple(identityToken: identityToken, authorizationCode: authorizationCode, nonce: nonce, displayName: displayName, email: email)
             try store.add(response)
+            await AccountPushRegistrationCoordinator.shared.registerKnownTokens(for: response.account.accountID)
             message = "Apple account ready"
         } catch { message = "Apple sign-in could not be verified" }
     }
