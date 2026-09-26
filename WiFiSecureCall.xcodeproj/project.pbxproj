@@ -167,8 +167,8 @@
 /* End PBXGroup section */
 
 /* Begin PBXNativeTarget section */
-		T10000000000000000000001 = {isa = PBXNativeTarget; buildConfigurationList = L10000000000000000000001; buildPhases = (S10000000000000000000001,H10000000000000000000001,R10000000000000000000001,C10000000000000000000001); buildRules = (); dependencies = (D20000000000000000000002,); name = WiFiSecureCall; productName = WiFiSecureCall; productReference = F10000000000000000000050; productType = "com.apple.product-type.application"; };
-		T10000000000000000000002 = {isa = PBXNativeTarget; buildConfigurationList = L10000000000000000000002; buildPhases = (S10000000000000000000002,H10000000000000000000002,R10000000000000000000002); buildRules = (); dependencies = (); name = WiFiSecureCallWatch; productName = WiFiSecureCallWatch; productReference = F10000000000000000000051; productType = "com.apple.product-type.application"; };
+		T10000000000000000000001 = {isa = PBXNativeTarget; buildConfigurationList = L10000000000000000000001; buildPhases = (E10000000000000000000001,S10000000000000000000001,H10000000000000000000001,R10000000000000000000001,C10000000000000000000001); buildRules = (); dependencies = (D20000000000000000000002,); name = WiFiSecureCall; productName = WiFiSecureCall; productReference = F10000000000000000000050; productType = "com.apple.product-type.application"; };
+		T10000000000000000000002 = {isa = PBXNativeTarget; buildConfigurationList = L10000000000000000000002; buildPhases = (E10000000000000000000002,S10000000000000000000002,H10000000000000000000002,R10000000000000000000002); buildRules = (); dependencies = (); name = WiFiSecureCallWatch; productName = WiFiSecureCallWatch; productReference = F10000000000000000000051; productType = "com.apple.product-type.application"; };
 		T10000000000000000000003 = {isa = PBXNativeTarget; buildConfigurationList = L10000000000000000000003; buildPhases = (S10000000000000000000003,H10000000000000000000003,R10000000000000000000003); buildRules = (); dependencies = (); name = WiFiSecureCallTests; productName = WiFiSecureCallTests; productReference = F10000000000000000000052; productType = "com.apple.product-type.bundle.unit-test"; };
 /* End PBXNativeTarget section */
 
@@ -181,6 +181,39 @@
 		R10000000000000000000002 = {isa = PBXResourcesBuildPhase; buildActionMask = 2147483647; files = (B10000000000000000000302,B10000000000000000000304); runOnlyForDeploymentPostprocessing = 0; };
 		R10000000000000000000003 = {isa = PBXResourcesBuildPhase; buildActionMask = 2147483647; files = (); runOnlyForDeploymentPostprocessing = 0; };
 /* End PBXResourcesBuildPhase section */
+
+/* Begin PBXShellScriptBuildPhase section */
+		E10000000000000000000001 = {
+			isa = PBXShellScriptBuildPhase;
+			alwaysOutOfDate = 1;
+			buildActionMask = 2147483647;
+			files = ();
+			inputFileListPaths = ();
+			inputPaths = ("$(SRCROOT)/$(INFOPLIST_FILE)", );
+			name = "Verify Release Configuration";
+			outputFileListPaths = ();
+			outputPaths = ();
+			runOnlyForDeploymentPostprocessing = 0;
+			shellPath = /bin/sh;
+			shellScript = "set -eu\nif [ \"${CONFIGURATION}\" != \"Release\" ]; then exit 0; fi\ncase \"${PRODUCT_BUNDLE_IDENTIFIER}\" in\n  com.vkapps.wifisecurecall.watchkitapp) token=\"${WATCH_BEARER_TOKEN-}\"; expected_role=A; label=WATCH ;;\n  com.vkapps.wifisecurecall) token=\"${IOS_BEARER_TOKEN-}\"; expected_role=B; label=IOS ;;\n  *) exit 0 ;;\nesac\npresent=NO\nif [ -n \"$token\" ]; then present=YES; fi\nlength=${#token}\nwhitespace=NO\ncase \"$token\" in *[[:space:]]*) whitespace=YES ;; esac\necho \"$label TOKEN_PRESENT=$present\"\necho \"$label TOKEN_LENGTH=$length\"\necho \"$label TOKEN_WHITESPACE=$whitespace\"\n[ \"${API_BASE_URL-}\" = \"https://178.105.32.46/wifi-secure-call/v1\" ] || { echo CONFIG_INVALID_API_URL >&2; exit 1; }\n[ \"${MEDIA_BASE_URL-}\" = \"wss://178.105.32.46/wifi-secure-call/media\" ] || { echo CONFIG_INVALID_MEDIA_URL >&2; exit 1; }\n/usr/libexec/PlistBuddy -c \"Print :DEVICE_ROLE\" \"${SCRIPT_INPUT_FILE_0}\" | grep -qx \"$expected_role\" || { echo CONFIG_INVALID_DEVICE_ROLE >&2; exit 1; }\n[ \"$present\" = YES ] || { echo CONFIG_MISSING_BEARER_TOKEN >&2; exit 1; }\n[ \"$length\" -ge 32 ] || { echo CONFIG_INVALID_BEARER_TOKEN >&2; exit 1; }\n[ \"$whitespace\" = NO ] || { echo CONFIG_INVALID_BEARER_TOKEN >&2; exit 1; }\n";
+			showEnvVarsInLog = 0;
+		};
+		E10000000000000000000002 = {
+			isa = PBXShellScriptBuildPhase;
+			alwaysOutOfDate = 1;
+			buildActionMask = 2147483647;
+			files = ();
+			inputFileListPaths = ();
+			inputPaths = ("$(SRCROOT)/$(INFOPLIST_FILE)", );
+			name = "Verify Release Configuration";
+			outputFileListPaths = ();
+			outputPaths = ();
+			runOnlyForDeploymentPostprocessing = 0;
+			shellPath = /bin/sh;
+			shellScript = "set -eu\nif [ \"${CONFIGURATION}\" != \"Release\" ]; then exit 0; fi\ncase \"${PRODUCT_BUNDLE_IDENTIFIER}\" in\n  com.vkapps.wifisecurecall.watchkitapp) token=\"${WATCH_BEARER_TOKEN-}\"; expected_role=A; label=WATCH ;;\n  com.vkapps.wifisecurecall) token=\"${IOS_BEARER_TOKEN-}\"; expected_role=B; label=IOS ;;\n  *) exit 0 ;;\nesac\npresent=NO\nif [ -n \"$token\" ]; then present=YES; fi\nlength=${#token}\nwhitespace=NO\ncase \"$token\" in *[[:space:]]*) whitespace=YES ;; esac\necho \"$label TOKEN_PRESENT=$present\"\necho \"$label TOKEN_LENGTH=$length\"\necho \"$label TOKEN_WHITESPACE=$whitespace\"\n[ \"${API_BASE_URL-}\" = \"https://178.105.32.46/wifi-secure-call/v1\" ] || { echo CONFIG_INVALID_API_URL >&2; exit 1; }\n[ \"${MEDIA_BASE_URL-}\" = \"wss://178.105.32.46/wifi-secure-call/media\" ] || { echo CONFIG_INVALID_MEDIA_URL >&2; exit 1; }\n/usr/libexec/PlistBuddy -c \"Print :DEVICE_ROLE\" \"${SCRIPT_INPUT_FILE_0}\" | grep -qx \"$expected_role\" || { echo CONFIG_INVALID_DEVICE_ROLE >&2; exit 1; }\n[ \"$present\" = YES ] || { echo CONFIG_MISSING_BEARER_TOKEN >&2; exit 1; }\n[ \"$length\" -ge 32 ] || { echo CONFIG_INVALID_BEARER_TOKEN >&2; exit 1; }\n[ \"$whitespace\" = NO ] || { echo CONFIG_INVALID_BEARER_TOKEN >&2; exit 1; }\n";
+			showEnvVarsInLog = 0;
+		};
+/* End PBXShellScriptBuildPhase section */
 
 /* Begin PBXSourcesBuildPhase section */
 		S10000000000000000000001 = {isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = (B10000000000000000000001,B10000000000000000000002,B10000000000000000000003,B10000000000000000000004,B10000000000000000000005,B10000000000000000000006,B10000000000000000000007,B10000000000000000000008,B10000000000000000000009,B1000000000000000000000A,B1000000000000000000000B,B1000000000000000000000C,B1000000000000000000000D,B1000000000000000000000E,B1000000000000000000000F,B10000000000000000000010,B1000000000000000000001A,B1000000000000000000001B,B1000000000000000000001C,B1000000000000000000001F,B10000000000000000000011,B10000000000000000000012,B10000000000000000000013,B10000000000000000000014,B10000000000000000000018,B10000000000000000000019,B1000000000000000000001D,B1000000000000000000001E); runOnlyForDeploymentPostprocessing = 0; };

@@ -1,34 +1,95 @@
 import Foundation
 
+enum AppConfigError: String, Error, Equatable, Sendable, LocalizedError {
+    case missingAPIURL = "CONFIG_MISSING_API_URL"
+    case invalidAPIURL = "CONFIG_INVALID_API_URL"
+    case missingMediaURL = "CONFIG_MISSING_MEDIA_URL"
+    case invalidMediaURL = "CONFIG_INVALID_MEDIA_URL"
+    case missingDeviceRole = "CONFIG_MISSING_DEVICE_ROLE"
+    case invalidDeviceRole = "CONFIG_INVALID_DEVICE_ROLE"
+    case missingBearerToken = "CONFIG_MISSING_BEARER_TOKEN"
+    case invalidBearerToken = "CONFIG_INVALID_BEARER_TOKEN"
+
+    var errorDescription: String? { rawValue }
+}
+
 struct AppConfig: Sendable {
     let apiBaseURL: URL
     let mediaURL: URL
     let role: DeviceRole
     let bearerToken: String
+    let configurationError: AppConfigError?
+
+    init(
+        apiBaseURL: URL,
+        mediaURL: URL,
+        role: DeviceRole,
+        bearerToken: String,
+        configurationError: AppConfigError? = nil
+    ) {
+        self.apiBaseURL = apiBaseURL
+        self.mediaURL = mediaURL
+        self.role = role
+        self.bearerToken = bearerToken
+        self.configurationError = configurationError
+    }
 
     var isProductionSafe: Bool {
-        apiBaseURL.scheme == "https" && mediaURL.scheme == "wss" &&
+        configurationError == nil &&
+        apiBaseURL.scheme == "https" && apiBaseURL.host != nil &&
+        mediaURL.scheme == "wss" && mediaURL.host != nil &&
         bearerToken.count >= 32 && !bearerToken.contains(where: { $0.isWhitespace })
     }
 
     static func load(bundle: Bundle = .main) -> AppConfig {
-        func value(_ key: String) -> String? {
-            guard let value = bundle.object(forInfoDictionaryKey: key) as? String,
-                  !value.isEmpty, !value.contains("$(") else { return nil }
-            return value
+        resolve(values: [
+            "API_BASE_URL": bundle.object(forInfoDictionaryKey: "API_BASE_URL") as? String ?? "",
+            "MEDIA_BASE_URL": bundle.object(forInfoDictionaryKey: "MEDIA_BASE_URL") as? String ?? "",
+            "DEVICE_ROLE": bundle.object(forInfoDictionaryKey: "DEVICE_ROLE") as? String ?? "",
+            "BEARER_TOKEN": bundle.object(forInfoDictionaryKey: "BEARER_TOKEN") as? String ?? "",
+        ])
+    }
+
+    static func resolve(values: [String: String]) -> AppConfig {
+        guard let apiValue = requiredValue("API_BASE_URL", in: values) else {
+            return failed(.missingAPIURL)
         }
-        if let apiValue = value("API_BASE_URL"), let mediaValue = value("MEDIA_BASE_URL"),
-           let api = URL(string: apiValue), let media = URL(string: mediaValue),
-           let roleValue = value("DEVICE_ROLE"), let role = DeviceRole(rawValue: roleValue),
-           let token = value("BEARER_TOKEN") {
-            let config = AppConfig(apiBaseURL: api, mediaURL: media, role: role, bearerToken: token)
-            if config.isProductionSafe { return config }
+        guard let api = URL(string: apiValue), api.scheme == "https", api.host != nil else {
+            return failed(.invalidAPIURL)
         }
-        return AppConfig(
-            apiBaseURL: URL(string: "https://invalid.invalid/v1")!,
-            mediaURL: URL(string: "wss://invalid.invalid/media")!,
+        guard let mediaValue = requiredValue("MEDIA_BASE_URL", in: values) else {
+            return failed(.missingMediaURL)
+        }
+        guard let media = URL(string: mediaValue), media.scheme == "wss", media.host != nil else {
+            return failed(.invalidMediaURL)
+        }
+        guard let roleValue = requiredValue("DEVICE_ROLE", in: values) else {
+            return failed(.missingDeviceRole)
+        }
+        guard let role = DeviceRole(rawValue: roleValue) else {
+            return failed(.invalidDeviceRole)
+        }
+        guard let token = requiredValue("BEARER_TOKEN", in: values) else {
+            return failed(.missingBearerToken)
+        }
+        guard token.count >= 32, !token.contains(where: { $0.isWhitespace }) else {
+            return failed(.invalidBearerToken)
+        }
+        return AppConfig(apiBaseURL: api, mediaURL: media, role: role, bearerToken: token)
+    }
+
+    private static func requiredValue(_ key: String, in values: [String: String]) -> String? {
+        guard let value = values[key], !value.isEmpty, !value.contains("$(") else { return nil }
+        return value
+    }
+
+    private static func failed(_ error: AppConfigError) -> AppConfig {
+        AppConfig(
+            apiBaseURL: URL(string: "wifisecurecall-config-error://blocked/api")!,
+            mediaURL: URL(string: "wifisecurecall-config-error://blocked/media")!,
             role: .B,
-            bearerToken: "invalid"
+            bearerToken: "",
+            configurationError: error
         )
     }
 }

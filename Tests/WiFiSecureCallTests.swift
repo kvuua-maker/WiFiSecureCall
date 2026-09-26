@@ -3411,6 +3411,147 @@ final class AppleNonceContractTests: XCTestCase {
         }
     }
 
+    func testResolvedProductionConfigReturnsProductionURLsForPhoneAndWatch() {
+        let expectedAPI = "https://178.105.32.46/wifi-secure-call/v1"
+        let expectedMedia = "wss://178.105.32.46/wifi-secure-call/media"
+        for role in [DeviceRole.B, .A] {
+            let config = AppConfig.resolve(values: [
+                "API_BASE_URL": expectedAPI,
+                "MEDIA_BASE_URL": expectedMedia,
+                "DEVICE_ROLE": role.rawValue,
+                "BEARER_TOKEN": String(repeating: role == .A ? "a" : "b", count: 64),
+            ])
+            XCTAssertNil(config.configurationError)
+            XCTAssertTrue(config.isProductionSafe)
+            XCTAssertEqual(config.apiBaseURL.absoluteString, expectedAPI)
+            XCTAssertEqual(config.mediaURL.absoluteString, expectedMedia)
+            XCTAssertEqual(config.role, role)
+            let root = config.apiBaseURL.deletingLastPathComponent()
+            let apple = root
+                .appendingPathComponent("v3", isDirectory: true)
+                .appendingPathComponent("auth/apple")
+            XCTAssertEqual(apple.absoluteString, "https://178.105.32.46/wifi-secure-call/v3/auth/apple")
+        }
+    }
+
+    func testMissingBearerFailsClosedWithExplicitErrorAndNoInvalidInvalid() {
+        let common = [
+            "API_BASE_URL": "https://178.105.32.46/wifi-secure-call/v1",
+            "MEDIA_BASE_URL": "wss://178.105.32.46/wifi-secure-call/media",
+            "DEVICE_ROLE": "B",
+        ]
+        for token in [nil, ""] as [String?] {
+            var values = common
+            if let token { values["BEARER_TOKEN"] = token }
+            let config = AppConfig.resolve(values: values)
+            XCTAssertEqual(config.configurationError, .missingBearerToken)
+            XCTAssertEqual(config.configurationError?.localizedDescription, "CONFIG_MISSING_BEARER_TOKEN")
+            XCTAssertFalse(config.isProductionSafe)
+            XCTAssertFalse(config.apiBaseURL.absoluteString.contains("invalid.invalid"))
+            XCTAssertEqual(config.apiBaseURL.scheme, "wifisecurecall-config-error")
+        }
+    }
+
+    func testInvalidBearerVariantsAreRejectedWithoutLeakingValues() {
+        let candidates = ["short-private-value", String(repeating: "x", count: 31), String(repeating: "x", count: 32) + " "]
+        for candidate in candidates {
+            let config = AppConfig.resolve(values: [
+                "API_BASE_URL": "https://178.105.32.46/wifi-secure-call/v1",
+                "MEDIA_BASE_URL": "wss://178.105.32.46/wifi-secure-call/media",
+                "DEVICE_ROLE": "A",
+                "BEARER_TOKEN": candidate,
+            ])
+            XCTAssertEqual(config.configurationError, .invalidBearerToken)
+            XCTAssertEqual(config.configurationError?.localizedDescription, "CONFIG_INVALID_BEARER_TOKEN")
+            XCTAssertFalse(String(reflecting: config.configurationError).contains(candidate))
+            XCTAssertFalse(config.isProductionSafe)
+        }
+    }
+
+    func testMalformedURLsAreRejectedExplicitly() {
+        let token = String(repeating: "x", count: 64)
+        let invalidAPI = AppConfig.resolve(values: [
+            "API_BASE_URL": "not a production URL",
+            "MEDIA_BASE_URL": "wss://178.105.32.46/wifi-secure-call/media",
+            "DEVICE_ROLE": "B",
+            "BEARER_TOKEN": token,
+        ])
+        XCTAssertEqual(invalidAPI.configurationError, .invalidAPIURL)
+        let invalidMedia = AppConfig.resolve(values: [
+            "API_BASE_URL": "https://178.105.32.46/wifi-secure-call/v1",
+            "MEDIA_BASE_URL": "https://178.105.32.46/wifi-secure-call/media",
+            "DEVICE_ROLE": "B",
+            "BEARER_TOKEN": token,
+        ])
+        XCTAssertEqual(invalidMedia.configurationError, .invalidMediaURL)
+        XCTAssertFalse(invalidAPI.apiBaseURL.absoluteString.contains("invalid.invalid"))
+        XCTAssertFalse(invalidMedia.apiBaseURL.absoluteString.contains("invalid.invalid"))
+    }
+
+    func testReleaseInfoPlistsUseIndependentProtectedTokenMappings() throws {
+        let repository = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        func plist(_ relativePath: String) throws -> [String: Any] {
+            let data = try Data(contentsOf: repository.appendingPathComponent(relativePath))
+            return try XCTUnwrap(PropertyListSerialization.propertyList(from: data, format: nil) as? [String: Any])
+        }
+        let phone = try plist("iOS/Info.plist")
+        let watch = try plist("Watch/Info.plist")
+        XCTAssertEqual(phone["BEARER_TOKEN"] as? String, "$(IOS_BEARER_TOKEN)")
+        XCTAssertEqual(watch["BEARER_TOKEN"] as? String, "$(WATCH_BEARER_TOKEN)")
+        XCTAssertEqual(phone["DEVICE_ROLE"] as? String, "B")
+        XCTAssertEqual(watch["DEVICE_ROLE"] as? String, "A")
+        let base = try String(contentsOf: repository.appendingPathComponent("Config/Base.xcconfig"), encoding: .utf8)
+        XCTAssertTrue(base.contains("#include? \"Secrets.xcconfig\""))
+        XCTAssertFalse(base.contains("IOS_BEARER_TOKEN ="))
+        XCTAssertFalse(base.contains("WATCH_BEARER_TOKEN ="))
+    }
+
+    func testInvalidConfigurationPreventsAccountNetworkRequest() async throws {
+        let requests = LockedRequests()
+        let config = AppConfig.resolve(values: [
+            "API_BASE_URL": "https://178.105.32.46/wifi-secure-call/v1",
+            "MEDIA_BASE_URL": "wss://178.105.32.46/wifi-secure-call/media",
+            "DEVICE_ROLE": "B",
+            "BEARER_TOKEN": "",
+        ])
+        let client = AccountAPIClient(
+            config: config,
+            tokenStore: InMemorySecureTokenStore(),
+            session: testSession { request in
+                requests.append(request)
+                return (500, AccountAPIErrorResponse(error: "unexpected", retryAt: nil))
+            },
+            deviceID: UUID()
+        )
+        do {
+            _ = try await client.startPhone("+00000000000")
+            XCTFail("invalid configuration attempted a request")
+        } catch let error as AppConfigError {
+            XCTAssertEqual(error, .missingBearerToken)
+            XCTAssertEqual(error.localizedDescription, "CONFIG_MISSING_BEARER_TOKEN")
+        } catch {
+            XCTFail("unexpected error: \(type(of: error))")
+        }
+        XCTAssertTrue(requests.values.isEmpty)
+    }
+
+    func testReleasePreflightCoversBothTargetsWithoutPrintingTokenValues() throws {
+        let repository = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let project = try String(contentsOf: repository.appendingPathComponent("WiFiSecureCall.xcodeproj/project.pbxproj"), encoding: .utf8)
+        XCTAssertEqual(project.components(separatedBy: "name = \"Verify Release Configuration\"").count - 1, 2)
+        XCTAssertTrue(project.contains("IOS_BEARER_TOKEN-"))
+        XCTAssertTrue(project.contains("WATCH_BEARER_TOKEN-"))
+        XCTAssertTrue(project.contains("TOKEN_PRESENT=$present"))
+        XCTAssertTrue(project.contains("TOKEN_LENGTH=$length"))
+        XCTAssertTrue(project.contains("TOKEN_WHITESPACE=$whitespace"))
+        XCTAssertTrue(project.contains("showEnvVarsInLog = 0"))
+        XCTAssertFalse(project.contains(#"echo \"$token\""#))
+    }
+
     func testNormalPersistentTransportPolicyRemainsUnchanged() {
         let configuration = AccountTransportPolicy.configuration()
         XCTAssertEqual(AccountTransportPolicy.requestTimeout, 10)

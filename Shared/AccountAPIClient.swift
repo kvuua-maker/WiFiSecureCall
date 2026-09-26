@@ -50,6 +50,7 @@ actor AccountAPIClient {
     private let tokenStore: SecureTokenStore
     private let deviceID: UUID
     private let devicePlatform: String
+    private let configurationError: AppConfigError?
     private let beforeRefresh: (@Sendable (UUID, String) async -> Void)?
 
     init(
@@ -66,6 +67,7 @@ actor AccountAPIClient {
         self.tokenStore = tokenStore
         self.deviceID = deviceID
         self.devicePlatform = platform ?? Self.currentPlatform
+        self.configurationError = config.configurationError
         self.beforeRefresh = beforeRefresh
         self.session = session ?? URLSession(configuration: AccountTransportPolicy.configuration())
     }
@@ -248,6 +250,7 @@ actor AccountAPIClient {
     }
 
     private func request<T: Decodable, B: Encodable>(_ path: String, method: String = "POST", body: B?, bearer: String? = nil, root: URL? = nil) async throws -> T {
+        if let configurationError { throw configurationError }
         var value = URLRequest(url: (root ?? baseURL).appendingPathComponent(path))
         value.httpMethod = method
         value.timeoutInterval = AccountTransportPolicy.requestTimeout
