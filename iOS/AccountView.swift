@@ -10,6 +10,7 @@ struct AccountView: View {
     @State private var appleNonce = ""
     @State private var appleState = ""
     @State private var appleDiagnostic: AppleVerificationDiagnostic?
+    @State private var appleTransportDetail: String?
 
     init(store: AccountSessionStore) {
         self.store = store
@@ -68,6 +69,12 @@ struct AccountView: View {
                         .font(.caption.monospaced())
                         .foregroundStyle(.secondary)
                         .textSelection(.enabled)
+                    if let appleTransportDetail {
+                        Text("Transport: \(appleTransportDetail)")
+                            .font(.caption.monospaced())
+                            .foregroundStyle(.secondary)
+                            .textSelection(.enabled)
+                    }
                 }
             }
             .navigationTitle("Account")
@@ -77,6 +84,7 @@ struct AccountView: View {
 
     private func configureAppleRequest(_ request: ASAuthorizationAppleIDRequest) {
         appleDiagnostic = nil
+        appleTransportDetail = nil
         do {
             let rawNonce = try AppleSignInNonceContract.makeRawNonce()
             let state = try AppleSignInNonceContract.makeRawNonce()
@@ -124,9 +132,11 @@ struct AccountView: View {
             try store.add(response)
             await AccountPushRegistrationCoordinator.shared.registerKnownTokens(for: response.account.accountID)
             appleDiagnostic = nil
+            appleTransportDetail = nil
             message = "Apple account ready"
         } catch {
             appleDiagnostic = AppleVerificationDiagnostic.classify(error)
+            appleTransportDetail = AppleVerificationDiagnostic.safeTransportDetail(error)
             message = "Apple sign-in could not be verified"
         }
     }

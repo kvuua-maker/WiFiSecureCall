@@ -3232,7 +3232,50 @@ final class AppleNonceContractTests: XCTestCase {
         }
         XCTAssertEqual(AppleVerificationDiagnostic.classify(AccountAPIError.status(404, nil)), .serverResponse)
         XCTAssertEqual(AppleVerificationDiagnostic.classify(AccountAPIError.decoding), .serverResponse)
-        XCTAssertEqual(AppleVerificationDiagnostic.classify(URLError(.notConnectedToInternet)), .serverRequest)
+    }
+
+    func testTransportDiagnosticMappings() {
+        let mappings: [(URLError.Code, AppleVerificationDiagnostic)] = [
+            (.cannotFindHost, .dns),
+            (.dnsLookupFailed, .dns),
+            (.secureConnectionFailed, .tls),
+            (.serverCertificateUntrusted, .tls),
+            (.timedOut, .timeout),
+            (.cannotConnectToHost, .connection),
+            (.networkConnectionLost, .networkLost),
+            (.notConnectedToInternet, .offline),
+            (.cancelled, .cancelled),
+            (.badURL, .otherTransport),
+        ]
+        for (code, expected) in mappings {
+            let error = AccountAPIError.transport(domain: NSURLErrorDomain, code: code.rawValue)
+            XCTAssertEqual(AppleVerificationDiagnostic.classify(error), expected)
+        }
+        let other = AccountAPIError.transport(domain: "Safe.Transport", code: 42)
+        XCTAssertEqual(AppleVerificationDiagnostic.classify(other), .otherTransport)
+        XCTAssertEqual(AppleVerificationDiagnostic.safeTransportDetail(other), "Safe.Transport 42")
+        XCTAssertNil(AppleVerificationDiagnostic.safeTransportDetail(AccountAPIError.transport(domain: NSURLErrorDomain, code: URLError.Code.timedOut.rawValue)))
+    }
+
+    func testURLSessionFailureBecomesSafeTransportError() async {
+        let session = testSession { _ -> (Int, Encodable) in throw URLError(.networkConnectionLost) }
+        let client = AccountAPIClient(
+            config: AppConfig(apiBaseURL: URL(string: "https://example.invalid/wifi-secure-call/v1")!, mediaURL: URL(string: "wss://example.invalid/media")!, role: .B, bearerToken: String(repeating: "b", count: 64)),
+            tokenStore: InMemorySecureTokenStore(), session: session, deviceID: UUID()
+        )
+        do {
+            _ = try await client.signInWithApple(identityToken: "jwt", authorizationCode: "code", nonce: "nonce", displayName: "", email: "")
+            XCTFail("transport failure was not thrown")
+        } catch let error as AccountAPIError {
+            guard case .transport(let domain, let code) = error else {
+                return XCTFail("unexpected account error: \(error)")
+            }
+            XCTAssertEqual(domain, NSURLErrorDomain)
+            XCTAssertEqual(code, URLError.networkConnectionLost.rawValue)
+            XCTAssertEqual(AppleVerificationDiagnostic.classify(error), .networkLost)
+        } catch {
+            XCTFail("unwrapped transport error: \(type(of: error))")
+        }
     }
 
     private func testSession(handler: @escaping (URLRequest) throws -> (Int, Encodable)) -> URLSession {

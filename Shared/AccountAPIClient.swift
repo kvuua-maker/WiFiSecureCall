@@ -226,7 +226,13 @@ actor AccountAPIClient {
         if let body { value.httpBody = try JSONEncoder.account.encode(body) }
         value.setValue("application/json", forHTTPHeaderField: "Content-Type")
         if let bearer { value.setValue("Bearer \(bearer)", forHTTPHeaderField: "Authorization") }
-        let (data, response) = try await session.data(for: value)
+        let data: Data
+        let response: URLResponse
+        do {
+            (data, response) = try await session.data(for: value)
+        } catch {
+            throw AccountAPIError.wrappingTransport(error)
+        }
         guard let http = response as? HTTPURLResponse else { throw AccountAPIError.invalidResponse }
         guard 200..<300 ~= http.statusCode else { throw AccountAPIError.status(http.statusCode, try? JSONDecoder.account.decode(AccountAPIErrorResponse.self, from: data)) }
         if T.self == EmptyAccountResponse.self, data.isEmpty { return EmptyAccountResponse() as! T }

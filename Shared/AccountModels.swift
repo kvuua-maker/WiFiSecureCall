@@ -39,6 +39,14 @@ enum AppleVerificationDiagnostic: String, Codable, Sendable {
     case nonce = "APPLE_VERIFY_NONCE"
     case serverRequest = "APPLE_VERIFY_SERVER_REQUEST"
     case serverResponse = "APPLE_VERIFY_SERVER_RESPONSE"
+    case dns = "APPLE_VERIFY_DNS"
+    case tls = "APPLE_VERIFY_TLS"
+    case timeout = "APPLE_VERIFY_TIMEOUT"
+    case connection = "APPLE_VERIFY_CONNECTION"
+    case networkLost = "APPLE_VERIFY_NETWORK_LOST"
+    case offline = "APPLE_VERIFY_OFFLINE"
+    case cancelled = "APPLE_VERIFY_CANCELLED"
+    case otherTransport = "APPLE_VERIFY_OTHER_TRANSPORT"
 
     static func classify(_ error: Error) -> Self {
         guard let apiError = error as? AccountAPIError else { return .serverRequest }
@@ -50,6 +58,40 @@ enum AppleVerificationDiagnostic: String, Codable, Sendable {
             return .serverResponse
         case .invalidConfiguration, .missingSession:
             return .serverRequest
+        case .transport(let domain, let code):
+            return transportDiagnostic(domain: domain, code: code)
+        }
+    }
+
+    static func safeTransportDetail(_ error: Error) -> String? {
+        guard let apiError = error as? AccountAPIError,
+              case .transport(let domain, let code) = apiError,
+              transportDiagnostic(domain: domain, code: code) == .otherTransport else { return nil }
+        return "\(domain) \(code)"
+    }
+
+    private static func transportDiagnostic(domain: String, code: Int) -> Self {
+        guard domain == NSURLErrorDomain else { return .otherTransport }
+        switch URLError.Code(rawValue: code) {
+        case .cannotFindHost, .dnsLookupFailed:
+            return .dns
+        case .secureConnectionFailed, .serverCertificateHasBadDate, .serverCertificateUntrusted,
+             .serverCertificateHasUnknownRoot, .serverCertificateNotYetValid,
+             .clientCertificateRejected, .clientCertificateRequired,
+             .appTransportSecurityRequiresSecureConnection:
+            return .tls
+        case .timedOut:
+            return .timeout
+        case .cannotConnectToHost, .cannotLoadFromNetwork, .resourceUnavailable:
+            return .connection
+        case .networkConnectionLost:
+            return .networkLost
+        case .notConnectedToInternet, .internationalRoamingOff, .dataNotAllowed:
+            return .offline
+        case .cancelled:
+            return .cancelled
+        default:
+            return .otherTransport
         }
     }
 }
@@ -221,4 +263,19 @@ struct WatchLinkStatusResponse: Codable, Sendable {
 }
 
 struct AccountAPIErrorResponse: Codable, Error, Sendable { let error: String; let retryAt: Date? }
-enum AccountAPIError: Error { case invalidConfiguration, invalidResponse, status(Int, AccountAPIErrorResponse?), missingSession, decoding }
+enum AccountAPIError: Error {
+    case invalidConfiguration
+    case invalidResponse
+    case status(Int, AccountAPIErrorResponse?)
+    case missingSession
+    case decoding
+    case transport(domain: String, code: Int)
+
+    static func wrappingTransport(_ error: Error) -> Self {
+        let value = error as NSError
+        let safeDomain = value.domain.range(of: #"^[A-Za-z0-9._-]{1,80}$"#, options: .regularExpression) == nil
+            ? "TransportError"
+            : value.domain
+        return .transport(domain: safeDomain, code: value.code)
+    }
+}
