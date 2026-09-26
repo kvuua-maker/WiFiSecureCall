@@ -3171,3 +3171,74 @@ final class AppleIdentityFoundationTests: XCTestCase {
         XCTAssertNil(response.phoneNumber)
     }
 }
+
+
+@MainActor
+final class AppleNonceContractTests: XCTestCase {
+    func testRawNonceUsesSecureRandomURLSafeValues() throws {
+        let values = try (0..<16).map { _ in try AppleSignInNonceContract.makeRawNonce() }
+        XCTAssertEqual(Set(values).count, values.count)
+        for value in values {
+            XCTAssertGreaterThanOrEqual(value.count, 43)
+            XCTAssertNotNil(value.range(of: #"^[A-Za-z0-9_-]+$"#, options: .regularExpression))
+        }
+    }
+
+    func testExactNativeAndServerNonceRepresentations() {
+        let raw = "raw-nonce"
+        XCTAssertEqual(
+            AppleSignInNonceContract.requestNonce(forRawNonce: raw),
+            "2c5d107938053a2275f022c153c9a71f65ee07754b8bca543ee97a0c3cc66990"
+        )
+        XCTAssertEqual(AppleSignInNonceContract.serverNonce(forRawNonce: raw), raw)
+        XCTAssertNotEqual(
+            AppleSignInNonceContract.serverNonce(forRawNonce: raw),
+            AppleSignInNonceContract.requestNonce(forRawNonce: raw)
+        )
+    }
+
+    func testAppleSignInRequestSendsRawNonceToV3Server() async throws {
+        let captured = LockedRequests()
+        let accountID = UUID(), userID = UUID(), deviceID = UUID()
+        let response = AccountSessionResponse(
+            account: AccountSummary(accountID: accountID, userID: userID, phoneNumber: nil, displayLabel: "@user-test"),
+            deviceID: deviceID,
+            accessToken: "access", accessExpiresAt: .distantFuture,
+            refreshToken: "refresh", refreshExpiresAt: .distantFuture,
+            user: UserProfile(userID: userID, username: "user-test", displayName: nil, email: nil, verifiedPhones: [], publicIdentity: "wsc:user:user-test")
+        )
+        let session = testSession { request in
+            captured.append(request)
+            return (200, response)
+        }
+        let client = AccountAPIClient(
+            config: AppConfig(apiBaseURL: URL(string: "https://example.invalid/wifi-secure-call/v1")!, mediaURL: URL(string: "wss://example.invalid/media")!, role: .B, bearerToken: String(repeating: "b", count: 64)),
+            tokenStore: InMemorySecureTokenStore(), session: session, deviceID: deviceID
+        )
+        let raw = "raw-nonce"
+        _ = try await client.signInWithApple(identityToken: "jwt", authorizationCode: "code", nonce: AppleSignInNonceContract.serverNonce(forRawNonce: raw), displayName: "", email: "")
+        let request = try XCTUnwrap(captured.values.first)
+        XCTAssertEqual(request.url?.path, "/wifi-secure-call/v3/auth/apple")
+        let body = try JSONDecoder.account.decode(AppleSignInRequest.self, from: try XCTUnwrap(request.httpBody))
+        XCTAssertEqual(body.nonce, raw)
+        XCTAssertNotEqual(body.nonce, AppleSignInNonceContract.requestNonce(forRawNonce: raw))
+    }
+
+    func testSafeAppleVerificationDiagnosticClassification() {
+        let codes: [AppleVerificationDiagnostic] = [.jwtFormat, .header, .keyFetch, .signature, .issuer, .audience, .expired, .nonce]
+        for code in codes {
+            let error = AccountAPIError.status(401, AccountAPIErrorResponse(error: code.rawValue, retryAt: nil))
+            XCTAssertEqual(AppleVerificationDiagnostic.classify(error), code)
+        }
+        XCTAssertEqual(AppleVerificationDiagnostic.classify(AccountAPIError.status(404, nil)), .serverResponse)
+        XCTAssertEqual(AppleVerificationDiagnostic.classify(AccountAPIError.decoding), .serverResponse)
+        XCTAssertEqual(AppleVerificationDiagnostic.classify(URLError(.notConnectedToInternet)), .serverRequest)
+    }
+
+    private func testSession(handler: @escaping (URLRequest) throws -> (Int, Encodable)) -> URLSession {
+        AccountURLProtocol.handler = handler
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [AccountURLProtocol.self]
+        return URLSession(configuration: configuration)
+    }
+}

@@ -1,4 +1,58 @@
+import CryptoKit
 import Foundation
+import Security
+
+
+
+enum AppleSignInNonceContract {
+    enum GenerationError: Error { case entropyUnavailable }
+
+    static func makeRawNonce(byteCount: Int = 32) throws -> String {
+        precondition(byteCount > 0)
+        var bytes = [UInt8](repeating: 0, count: byteCount)
+        guard SecRandomCopyBytes(kSecRandomDefault, bytes.count, &bytes) == errSecSuccess else {
+            throw GenerationError.entropyUnavailable
+        }
+        return Data(bytes).base64EncodedString()
+            .replacingOccurrences(of: "+", with: "-")
+            .replacingOccurrences(of: "/", with: "_")
+            .replacingOccurrences(of: "=", with: "")
+    }
+
+    // One transformation only: Apple receives lowercase hex SHA-256(rawNonce).
+    static func requestNonce(forRawNonce rawNonce: String) -> String {
+        SHA256.hash(data: Data(rawNonce.utf8)).map { String(format: "%02x", $0) }.joined()
+    }
+
+    // Our server receives the original value and hashes it once for comparison.
+    static func serverNonce(forRawNonce rawNonce: String) -> String { rawNonce }
+}
+
+enum AppleVerificationDiagnostic: String, Codable, Sendable {
+    case jwtFormat = "APPLE_VERIFY_JWT_FORMAT"
+    case header = "APPLE_VERIFY_HEADER"
+    case keyFetch = "APPLE_VERIFY_KEY_FETCH"
+    case signature = "APPLE_VERIFY_SIGNATURE"
+    case issuer = "APPLE_VERIFY_ISSUER"
+    case audience = "APPLE_VERIFY_AUDIENCE"
+    case expired = "APPLE_VERIFY_EXPIRED"
+    case nonce = "APPLE_VERIFY_NONCE"
+    case serverRequest = "APPLE_VERIFY_SERVER_REQUEST"
+    case serverResponse = "APPLE_VERIFY_SERVER_RESPONSE"
+
+    static func classify(_ error: Error) -> Self {
+        guard let apiError = error as? AccountAPIError else { return .serverRequest }
+        switch apiError {
+        case .status(_, let response):
+            if let response, let diagnostic = Self(rawValue: response.error) { return diagnostic }
+            return .serverResponse
+        case .invalidResponse, .decoding:
+            return .serverResponse
+        case .invalidConfiguration, .missingSession:
+            return .serverRequest
+        }
+    }
+}
 
 enum E164Phone {
     static func canonicalized(_ value: String) -> String {

@@ -1,6 +1,4 @@
 import AuthenticationServices
-import CryptoKit
-import Security
 import SwiftUI
 
 struct AccountView: View {
@@ -11,6 +9,7 @@ struct AccountView: View {
     @State private var message = ""
     @State private var appleNonce = ""
     @State private var appleState = ""
+    @State private var appleDiagnostic: AppleVerificationDiagnostic?
 
     init(store: AccountSessionStore) {
         self.store = store
@@ -64,6 +63,12 @@ struct AccountView: View {
                     }
                 }
                 if !message.isEmpty { Text(message).foregroundStyle(.secondary) }
+                if let appleDiagnostic {
+                    Text("Diagnostic: \(appleDiagnostic.rawValue)")
+                        .font(.caption.monospaced())
+                        .foregroundStyle(.secondary)
+                        .textSelection(.enabled)
+                }
             }
             .navigationTitle("Account")
             .sheet(isPresented: $showRegistration) { NavigationView { PhoneRegistrationView(store: store, client: client) } }
@@ -71,19 +76,28 @@ struct AccountView: View {
     }
 
     private func configureAppleRequest(_ request: ASAuthorizationAppleIDRequest) {
-        let nonce = Self.randomSecret()
-        let state = Self.randomSecret()
-        appleNonce = nonce
-        appleState = state
-        request.requestedScopes = [.fullName, .email]
-        request.nonce = Self.sha256(nonce)
-        request.state = state
+        appleDiagnostic = nil
+        do {
+            let rawNonce = try AppleSignInNonceContract.makeRawNonce()
+            let state = try AppleSignInNonceContract.makeRawNonce()
+            appleNonce = rawNonce
+            appleState = state
+            request.requestedScopes = [.fullName, .email]
+            request.nonce = AppleSignInNonceContract.requestNonce(forRawNonce: rawNonce)
+            request.state = state
+        } catch {
+            appleNonce = ""
+            appleState = ""
+            appleDiagnostic = .serverRequest
+            message = "Apple sign-in could not be started"
+        }
     }
 
     private func handleAppleResult(_ result: Result<ASAuthorization, Error>) {
         switch result {
         case .failure:
             message = "Apple sign-in was not completed"
+            appleDiagnostic = .serverRequest
         case .success(let authorization):
             guard let credential = authorization.credential as? ASAuthorizationAppleIDCredential,
                   credential.state == appleState,
@@ -93,11 +107,12 @@ struct AccountView: View {
                   let authorizationCode = String(data: codeData, encoding: .utf8),
                   !appleNonce.isEmpty else {
                 message = "Apple credential is incomplete"
+                appleDiagnostic = .jwtFormat
                 return
             }
             let displayName = credential.fullName.map { PersonNameComponentsFormatter().string(from: $0) } ?? ""
             let email = credential.email ?? ""
-            let nonce = appleNonce
+            let nonce = AppleSignInNonceContract.serverNonce(forRawNonce: appleNonce)
             appleNonce = ""; appleState = ""
             Task { await finishAppleSignIn(identityToken: identityToken, authorizationCode: authorizationCode, nonce: nonce, displayName: displayName, email: email) }
         }
@@ -108,16 +123,13 @@ struct AccountView: View {
             let response = try await client.signInWithApple(identityToken: identityToken, authorizationCode: authorizationCode, nonce: nonce, displayName: displayName, email: email)
             try store.add(response)
             await AccountPushRegistrationCoordinator.shared.registerKnownTokens(for: response.account.accountID)
+            appleDiagnostic = nil
             message = "Apple account ready"
-        } catch { message = "Apple sign-in could not be verified" }
+        } catch {
+            appleDiagnostic = AppleVerificationDiagnostic.classify(error)
+            message = "Apple sign-in could not be verified"
+        }
     }
-
-    private static func randomSecret() -> String {
-        var bytes = [UInt8](repeating: 0, count: 32)
-        guard SecRandomCopyBytes(kSecRandomDefault, bytes.count, &bytes) == errSecSuccess else { return UUID().uuidString }
-        return Data(bytes).base64EncodedString().replacingOccurrences(of: "+", with: "-").replacingOccurrences(of: "/", with: "_").replacingOccurrences(of: "=", with: "")
-    }
-    private static func sha256(_ value: String) -> String { SHA256.hash(data: Data(value.utf8)).map { String(format: "%02x", $0) }.joined() }
 
     @MainActor private func claimWatch(accountID: UUID) async {
         do { try await client.claimWatch(code: watchCode, accountID: accountID); watchCode = ""; message = "Watch linked" }
