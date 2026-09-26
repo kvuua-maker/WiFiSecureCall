@@ -44,81 +44,6 @@ enum AccountTransportPolicy {
     }
 }
 
-enum AppleAuthTransportPolicy {
-    static let requestTimeout: TimeInterval = 15
-    static let resourceTimeout: TimeInterval = 20
-    static let waitsForConnectivity = true
-
-    static func configuration() -> URLSessionConfiguration {
-        let configuration = URLSessionConfiguration.ephemeral
-        configuration.timeoutIntervalForRequest = requestTimeout
-        configuration.timeoutIntervalForResource = resourceTimeout
-        configuration.waitsForConnectivity = waitsForConnectivity
-        return configuration
-    }
-}
-
-private struct AppleDiagnosticRawResult: @unchecked Sendable {
-    let data: Data
-    let response: URLResponse?
-    let error: NSError?
-    let metrics: URLSessionTaskMetrics?
-    let redirectCount: Int
-}
-
-private final class AppleDiagnosticSessionDelegate: NSObject, URLSessionDataDelegate, @unchecked Sendable {
-    private let lock = NSLock()
-    private var data = Data()
-    private var response: URLResponse?
-    private var metrics: URLSessionTaskMetrics?
-    private var redirectCount = 0
-    private var continuation: CheckedContinuation<AppleDiagnosticRawResult, Never>?
-
-    func perform(_ request: URLRequest, session: URLSession) async -> AppleDiagnosticRawResult {
-        await withCheckedContinuation { continuation in
-            lock.lock()
-            self.continuation = continuation
-            lock.unlock()
-            session.dataTask(with: request).resume()
-        }
-    }
-
-    func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive response: URLResponse, completionHandler: @escaping (URLSession.ResponseDisposition) -> Void) {
-        lock.lock()
-        self.response = response
-        lock.unlock()
-        completionHandler(.allow)
-    }
-
-    func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
-        lock.lock()
-        self.data.append(data)
-        lock.unlock()
-    }
-
-    func urlSession(_ session: URLSession, task: URLSessionTask, willPerformHTTPRedirection response: HTTPURLResponse, newRequest request: URLRequest, completionHandler: @escaping (URLRequest?) -> Void) {
-        lock.lock()
-        redirectCount += 1
-        lock.unlock()
-        completionHandler(request)
-    }
-
-    func urlSession(_ session: URLSession, task: URLSessionTask, didFinishCollecting metrics: URLSessionTaskMetrics) {
-        lock.lock()
-        self.metrics = metrics
-        lock.unlock()
-    }
-
-    func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
-        lock.lock()
-        let result = AppleDiagnosticRawResult(data: data, response: response, error: error as NSError?, metrics: metrics, redirectCount: redirectCount)
-        let continuation = self.continuation
-        self.continuation = nil
-        lock.unlock()
-        continuation?.resume(returning: result)
-    }
-}
-
 private final class AppleNWPathTracker: @unchecked Sendable {
     private let monitor = NWPathMonitor()
     private let queue = DispatchQueue(label: "com.vkapps.wifisecurecall.apple-transport-path")
@@ -134,20 +59,36 @@ private final class AppleNWPathTracker: @unchecked Sendable {
             self.lock.unlock()
         }
         monitor.start(queue: queue)
-        let value = Self.snapshot(monitor.currentPath)
-        lock.lock()
-        latest = value
-        lock.unlock()
-        return value
+        return AppleTransportPathSnapshot(status: .unknown, interfaces: [], isExpensive: false, isConstrained: false)
     }
 
-    func current() -> AppleTransportPathSnapshot {
+    func finish(pathStart: AppleTransportPathSnapshot, startedAt: Date, error: AccountAPIError?) -> AppleTransportDiagnosticReport {
+        let pathEnd = current()
+        cancel()
+        let errorComponents: (String?, Int?)
+        if let error, case .transport(let domain, let code) = error {
+            errorComponents = (domain, code)
+        } else {
+            errorComponents = (nil, nil)
+        }
+        return AppleTransportDiagnosticReport(
+            pathStart: pathStart,
+            pathEnd: pathEnd,
+            transactions: [],
+            redirectCount: 0,
+            totalMilliseconds: max(0, Int((Date().timeIntervalSince(startedAt) * 1_000).rounded())),
+            errorDomain: errorComponents.0,
+            errorCode: errorComponents.1
+        )
+    }
+
+    private func current() -> AppleTransportPathSnapshot {
         lock.lock()
         defer { lock.unlock() }
         return latest
     }
 
-    func cancel() {
+    private func cancel() {
         monitor.pathUpdateHandler = nil
         monitor.cancel()
     }
@@ -169,76 +110,6 @@ private final class AppleNWPathTracker: @unchecked Sendable {
     }
 }
 
-private enum AppleDiagnosticTransport {
-    static func perform(_ request: URLRequest, configuration override: URLSessionConfiguration? = nil) async -> (AppleDiagnosticRawResult, AppleTransportDiagnosticReport) {
-        let pathTracker = AppleNWPathTracker()
-        let pathStart = pathTracker.start()
-        let startedAt = Date()
-        let configuration = override ?? AppleAuthTransportPolicy.configuration()
-        let delegate = AppleDiagnosticSessionDelegate()
-        let session = URLSession(configuration: configuration, delegate: delegate, delegateQueue: nil)
-        let result = await delegate.perform(request, session: session)
-        let completedAt = Date()
-        let pathEnd = pathTracker.current()
-        pathTracker.cancel()
-        session.finishTasksAndInvalidate()
-        return (result, report(result: result, pathStart: pathStart, pathEnd: pathEnd, startedAt: startedAt, completedAt: completedAt))
-    }
-
-    private static func report(result: AppleDiagnosticRawResult, pathStart: AppleTransportPathSnapshot, pathEnd: AppleTransportPathSnapshot, startedAt: Date, completedAt: Date) -> AppleTransportDiagnosticReport {
-        let transactions = result.metrics?.transactionMetrics.map { transaction in
-            AppleTransportTransactionSnapshot(
-                fetchStartMilliseconds: milliseconds(transaction.fetchStartDate, relativeTo: startedAt),
-                domainLookup: .capture(start: transaction.domainLookupStartDate, end: transaction.domainLookupEndDate, relativeTo: startedAt),
-                connect: .capture(start: transaction.connectStartDate, end: transaction.connectEndDate, relativeTo: startedAt),
-                secureConnection: .capture(start: transaction.secureConnectionStartDate, end: transaction.secureConnectionEndDate, relativeTo: startedAt),
-                request: .capture(start: transaction.requestStartDate, end: transaction.requestEndDate, relativeTo: startedAt),
-                response: .capture(start: transaction.responseStartDate, end: transaction.responseEndDate, relativeTo: startedAt),
-                networkProtocolName: safeProtocol(transaction.networkProtocolName),
-                isProxyConnection: transaction.isProxyConnection,
-                isReusedConnection: transaction.isReusedConnection,
-                resourceFetchType: safeFetchType(transaction.resourceFetchType)
-            )
-        } ?? []
-        let safeError: AccountAPIError? = result.error.map { AccountAPIError.wrappingTransport($0) }
-        let errorComponents: (String?, Int?)
-        if let safeError, case .transport(let domain, let code) = safeError {
-            errorComponents = (domain, code)
-        } else {
-            errorComponents = (nil, nil)
-        }
-        return AppleTransportDiagnosticReport(
-            pathStart: pathStart,
-            pathEnd: pathEnd,
-            transactions: transactions,
-            redirectCount: result.redirectCount,
-            totalMilliseconds: max(0, Int((completedAt.timeIntervalSince(startedAt) * 1_000).rounded())),
-            errorDomain: errorComponents.0,
-            errorCode: errorComponents.1
-        )
-    }
-
-    private static func milliseconds(_ date: Date?, relativeTo origin: Date) -> Int? {
-        date.map { max(0, Int(($0.timeIntervalSince(origin) * 1_000).rounded())) }
-    }
-
-    private static func safeProtocol(_ value: String?) -> String? {
-        guard let value, value.count <= 24,
-              value.range(of: #"^[A-Za-z0-9._/-]+$"#, options: .regularExpression) != nil else { return nil }
-        return value
-    }
-
-    private static func safeFetchType(_ value: URLSessionTaskMetrics.ResourceFetchType) -> String {
-        switch value {
-        case .networkLoad: return "networkLoad"
-        case .serverPush: return "serverPush"
-        case .localCache: return "localCache"
-        case .unknown: return "unknown"
-        @unknown default: return "unknown"
-        }
-    }
-}
-
 actor AccountAPIClient {
     private let baseURL: URL
     private let v3BaseURL: URL
@@ -246,15 +117,13 @@ actor AccountAPIClient {
     private let tokenStore: SecureTokenStore
     private let deviceID: UUID
     private let beforeRefresh: (@Sendable (UUID, String) async -> Void)?
-    private let appleDiagnosticConfiguration: URLSessionConfiguration?
 
     init(
         config: AppConfig,
         tokenStore: SecureTokenStore,
         session: URLSession? = nil,
         deviceID: UUID = InstallationIdentity.shared.id,
-        beforeRefresh: (@Sendable (UUID, String) async -> Void)? = nil,
-        appleDiagnosticConfiguration: URLSessionConfiguration? = nil
+        beforeRefresh: (@Sendable (UUID, String) async -> Void)? = nil
     ) {
         let root = config.apiBaseURL.deletingLastPathComponent()
         self.baseURL = root.appendingPathComponent("v2", isDirectory: true)
@@ -262,7 +131,6 @@ actor AccountAPIClient {
         self.tokenStore = tokenStore
         self.deviceID = deviceID
         self.beforeRefresh = beforeRefresh
-        self.appleDiagnosticConfiguration = appleDiagnosticConfiguration
         if let session { self.session = session }
         else {
             self.session = URLSession(configuration: AccountTransportPolicy.configuration())
@@ -435,26 +303,36 @@ actor AccountAPIClient {
     private func diagnosticAppleSignIn(_ body: AppleSignInRequest) async throws -> AppleSignInDiagnosticResult {
         var value = URLRequest(url: v3BaseURL.appendingPathComponent("auth/apple"))
         value.httpMethod = "POST"
-        value.timeoutInterval = AppleAuthTransportPolicy.requestTimeout
+        value.timeoutInterval = AccountTransportPolicy.requestTimeout
         value.httpBody = try JSONEncoder.account.encode(body)
         value.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        let (result, report) = await AppleDiagnosticTransport.perform(value, configuration: appleDiagnosticConfiguration)
-        if let error = result.error {
-            throw AppleSignInDiagnosticFailure(underlying: AccountAPIError.wrappingTransport(error), report: report)
+
+        let pathTracker = AppleNWPathTracker()
+        let pathStart = pathTracker.start()
+        let startedAt = Date()
+        let data: Data
+        let response: URLResponse
+        do {
+            (data, response) = try await session.data(for: value)
+        } catch {
+            let underlying = AccountAPIError.wrappingTransport(error)
+            let report = pathTracker.finish(pathStart: pathStart, startedAt: startedAt, error: underlying)
+            throw AppleSignInDiagnosticFailure(underlying: underlying, report: report)
         }
-        guard let http = result.response as? HTTPURLResponse else {
+        let report = pathTracker.finish(pathStart: pathStart, startedAt: startedAt, error: nil)
+        guard let http = response as? HTTPURLResponse else {
             throw AppleSignInDiagnosticFailure(underlying: .invalidResponse, report: report)
         }
         guard 200..<300 ~= http.statusCode else {
             throw AppleSignInDiagnosticFailure(
-                underlying: .status(http.statusCode, try? JSONDecoder.account.decode(AccountAPIErrorResponse.self, from: result.data)),
+                underlying: .status(http.statusCode, try? JSONDecoder.account.decode(AccountAPIErrorResponse.self, from: data)),
                 report: report
             )
         }
-        guard let response = try? JSONDecoder.account.decode(AccountSessionResponse.self, from: result.data) else {
+        guard let decoded = try? JSONDecoder.account.decode(AccountSessionResponse.self, from: data) else {
             throw AppleSignInDiagnosticFailure(underlying: .decoding, report: report)
         }
-        return AppleSignInDiagnosticResult(response: response, report: report)
+        return AppleSignInDiagnosticResult(response: decoded, report: report)
     }
 
     private func request<T: Decodable, B: Encodable>(_ path: String, method: String = "POST", body: B?, bearer: String? = nil, root: URL? = nil) async throws -> T {

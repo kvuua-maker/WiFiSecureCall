@@ -3197,45 +3197,44 @@ final class AppleNonceContractTests: XCTestCase {
         )
     }
 
-    func testNormalAndAppleTransportPoliciesRemainIsolated() {
-        let normal = AccountTransportPolicy.configuration()
-        XCTAssertFalse(normal.waitsForConnectivity)
-        XCTAssertEqual(normal.timeoutIntervalForRequest, 10)
-        XCTAssertEqual(normal.timeoutIntervalForResource, 10)
-
-        let apple = AppleAuthTransportPolicy.configuration()
-        XCTAssertTrue(apple.waitsForConnectivity)
-        XCTAssertEqual(apple.timeoutIntervalForRequest, 15)
-        XCTAssertEqual(apple.timeoutIntervalForResource, 20)
-        XCTAssertEqual(AppleAuthTransportPolicy.requestTimeout, 15)
+    func testPersistentAccountTransportPolicyRemainsUnchanged() {
+        let configuration = AccountTransportPolicy.configuration()
+        XCTAssertFalse(configuration.waitsForConnectivity)
+        XCTAssertEqual(configuration.timeoutIntervalForRequest, 10)
+        XCTAssertEqual(configuration.timeoutIntervalForResource, 10)
+        XCTAssertEqual(AccountTransportPolicy.requestTimeout, 10)
     }
 
-    func testDiagnosedAppleSignInUsesOneRequestWithStableRequestID() async throws {
+    func testDiagnosedAppleSignInUsesSamePersistentSessionExactlyOnce() async throws {
         let captured = LockedRequests()
-        let counter = LockedCounter()
+        let appleRequestCount = LockedCounter()
         let accountID = UUID(), userID = UUID(), deviceID = UUID(), requestID = UUID()
-        let response = AccountSessionResponse(
+        let appleResponse = AccountSessionResponse(
             account: AccountSummary(accountID: accountID, userID: userID, phoneNumber: nil, displayLabel: "@user-test"),
             deviceID: deviceID,
             accessToken: "access", accessExpiresAt: .distantFuture,
             refreshToken: "refresh", refreshExpiresAt: .distantFuture,
             user: UserProfile(userID: userID, username: "user-test", displayName: nil, email: nil, verifiedPhones: [], publicIdentity: "wsc:user:user-test")
         )
-        AccountURLProtocol.handler = { request in
-            counter.increment()
+        let phoneResponse = PhoneStartResponse(verificationID: UUID(), expiresAt: .distantFuture, resendAfter: .distantFuture)
+        let session = testSession { request in
             captured.append(request)
-            return (200, response)
+            if request.url?.path == "/wifi-secure-call/v3/auth/apple" {
+                appleRequestCount.increment()
+                return (200, appleResponse)
+            }
+            return (200, phoneResponse)
         }
-        let appleConfiguration = URLSessionConfiguration.ephemeral
-        appleConfiguration.protocolClasses = [AccountURLProtocol.self]
         let client = AccountAPIClient(
             config: AppConfig(apiBaseURL: URL(string: "https://example.invalid/wifi-secure-call/v1")!, mediaURL: URL(string: "wss://example.invalid/media")!, role: .B, bearerToken: String(repeating: "b", count: 64)),
             tokenStore: InMemorySecureTokenStore(),
-            deviceID: deviceID,
-            appleDiagnosticConfiguration: appleConfiguration
+            session: session,
+            deviceID: deviceID
         )
+
+        _ = try await client.startPhone("+00000000000")
         let rawNonce = "raw-nonce"
-        _ = try await client.signInWithAppleDiagnosed(
+        let result = try await client.signInWithAppleDiagnosed(
             identityToken: "jwt",
             authorizationCode: "code",
             nonce: rawNonce,
@@ -3243,14 +3242,21 @@ final class AppleNonceContractTests: XCTestCase {
             email: "",
             requestID: requestID
         )
-        XCTAssertEqual(counter.value, 1)
-        XCTAssertEqual(captured.values.count, 1)
-        let request = try XCTUnwrap(captured.values.first)
-        XCTAssertEqual(request.url?.path, "/wifi-secure-call/v3/auth/apple")
-        XCTAssertEqual(request.timeoutInterval, 15)
+
+        XCTAssertEqual(captured.values.map(\.url?.path), [
+            "/wifi-secure-call/v2/auth/phone/start",
+            "/wifi-secure-call/v3/auth/apple",
+        ])
+        XCTAssertEqual(appleRequestCount.value, 1)
+        let request = try XCTUnwrap(captured.values.last)
+        XCTAssertEqual(request.httpMethod, "POST")
+        XCTAssertEqual(request.timeoutInterval, 10)
         let body = try JSONDecoder.account.decode(AppleSignInRequest.self, from: try XCTUnwrap(request.httpBody))
         XCTAssertEqual(body.requestID, requestID)
         XCTAssertEqual(body.nonce, rawNonce)
+        XCTAssertEqual(result.report.pathStart.status, .unknown)
+        XCTAssertTrue(result.report.pathStart.interfaces.isEmpty)
+        XCTAssertEqual(result.report.transactions.count, 0)
     }
 
     func testAppleSignInRequestSendsRawNonceToV3Server() async throws {
