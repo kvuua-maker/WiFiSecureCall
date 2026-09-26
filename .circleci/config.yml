@@ -1,0 +1,132 @@
+version: 2.1
+
+jobs:
+  sdk27-carrier-calling-inspection:
+    macos:
+      xcode: 27.0.0
+    resource_class: m4pro.medium
+    steps:
+      - checkout
+      - run:
+          name: Inspect public SDK 27 carrier calling surface
+          command: |
+            set -euo pipefail
+            OUT=/tmp/sdk27-carrier-calling
+            mkdir -p "$OUT"
+
+            {
+              echo "XCODE_BEGIN"
+              xcodebuild -version
+              echo "XCODE_END"
+              echo "IOS_SDK=$(xcrun --sdk iphoneos --show-sdk-version)"
+              echo "WATCHOS_SDK=$(xcrun --sdk watchos --show-sdk-version)"
+            } > "$OUT/versions.txt"
+
+            IOS_SDK="$(xcrun --sdk iphoneos --show-sdk-path)"
+            WATCH_SDK="$(xcrun --sdk watchos --show-sdk-path)"
+            export IOS_SDK WATCH_SDK OUT
+
+            python3 - <<'PY'
+            import os
+            import pathlib
+            import re
+
+            out = pathlib.Path(os.environ["OUT"])
+            roots = {
+                "iphoneos": pathlib.Path(os.environ["IOS_SDK"]),
+                "watchos": pathlib.Path(os.environ["WATCH_SDK"]),
+            }
+            frameworks = [
+                "CoreTelephony",
+                "LiveCommunicationKit",
+                "CallKit",
+                "Network",
+                "NetworkExtension",
+                "WatchConnectivity",
+                "AVFAudio",
+            ]
+            terms = re.compile(
+                r"Wi[ -]?Fi.?Calling|VoWiFi|iCloud.?Calling|Thumper|IMS|"
+                r"TelephonyConversation|CellularService|CellularPlan|"
+                r"subscriber|carrier|radioAccess|active.?line|service.?state|"
+                r"companion|other.?device|conversation|telephony|dial|"
+                r"join|transfer|handoff|routing|provision|entitlement",
+                re.IGNORECASE,
+            )
+            decl = re.compile(
+                r"(^|\s)(open|public)\s+(final\s+)?(class|struct|enum|protocol|actor|func|var|let|typealias)|"
+                r"^\s*(API_AVAILABLE|NS_CLASS_AVAILABLE|@interface|@protocol|typedef|FOUNDATION_EXPORT)",
+                re.MULTILINE,
+            )
+            suffixes = {".h", ".swiftinterface", ".modulemap"}
+
+            with (out / "public-interface-report.txt").open("w", encoding="utf-8") as report:
+                for platform, sdk in roots.items():
+                    report.write(f"=== PLATFORM {platform} SDK={sdk.name} ===\n")
+                    for framework in frameworks:
+                        root = sdk / "System/Library/Frameworks" / f"{framework}.framework"
+                        report.write(f"\n===== {framework} present={root.is_dir()} =====\n")
+                        if not root.is_dir():
+                            continue
+                        files = sorted(
+                            p for p in root.rglob("*")
+                            if p.is_file() and p.suffix in suffixes
+                        )
+                        report.write("PUBLIC_FILES=" + ",".join(str(p.relative_to(root)) for p in files) + "\n")
+                        for path in files:
+                            try:
+                                lines = path.read_text(errors="ignore").splitlines()
+                            except OSError:
+                                continue
+                            matches = [i for i, line in enumerate(lines) if terms.search(line)]
+                            if not matches:
+                                continue
+                            report.write(f"--- {path.relative_to(root)} ---\n")
+                            emitted = set()
+                            for index in matches:
+                                for line_index in range(max(0, index - 2), min(len(lines), index + 3)):
+                                    if line_index in emitted:
+                                        continue
+                                    emitted.add(line_index)
+                                    report.write(f"{line_index + 1}: {lines[line_index]}\n")
+
+                        if framework in {"CoreTelephony", "LiveCommunicationKit"}:
+                            report.write(f"--- {framework} PUBLIC DECLARATIONS ---\n")
+                            for path in files:
+                                try:
+                                    lines = path.read_text(errors="ignore").splitlines()
+                                except OSError:
+                                    continue
+                                for number, line in enumerate(lines, 1):
+                                    if decl.search(line):
+                                        report.write(f"{path.relative_to(root)}:{number}: {line}\n")
+
+            entitlement_term = re.compile(
+                r"com\.apple\.CommCenter\.fine-grained|Wi[ -]?Fi.?Calling|VoWiFi|"
+                r"Thumper|IMS.*entitlement|entitlement.*IMS",
+                re.IGNORECASE,
+            )
+            with (out / "public-entitlement-search.txt").open("w", encoding="utf-8") as report:
+                for platform, sdk in roots.items():
+                    report.write(f"=== {platform} ===\n")
+                    for path in sorted(sdk.rglob("*")):
+                        if not path.is_file() or path.suffix not in suffixes:
+                            continue
+                        try:
+                            for number, line in enumerate(path.read_text(errors="ignore").splitlines(), 1):
+                                if entitlement_term.search(line):
+                                    report.write(f"{path.relative_to(sdk)}:{number}: {line}\n")
+                        except OSError:
+                            pass
+            PY
+
+            cat "$OUT/versions.txt"
+            shasum -a 256 "$OUT"/*.txt > "$OUT/SHA256SUMS"
+      - store_artifacts:
+          path: /tmp/sdk27-carrier-calling
+          destination: sdk27-carrier-calling
+
+workflows:
+  sdk27-carrier-calling-inspection:
+    jobs:
+      - sdk27-carrier-calling-inspection
