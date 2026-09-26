@@ -1,81 +1,56 @@
 version: 2.1
 
 jobs:
-  sdk27-carrier-calling-inspection:
+  sdk27-carrier-probe-validation:
     macos:
       xcode: 27.0.0
     resource_class: m4pro.medium
     steps:
       - checkout
       - run:
-          name: Record SDK versions
+          name: Verify authoritative SDK 27 environment
           command: |
             set -euo pipefail
-            OUT=/tmp/sdk27-carrier-calling
+            OUT=/tmp/carrier-probe-validation
             mkdir -p "$OUT"
-            xcodebuild -version > "$OUT/versions.txt"
-            echo "IOS_SDK=$(xcrun --sdk iphoneos --show-sdk-version)" >> "$OUT/versions.txt"
-            echo "WATCHOS_SDK=$(xcrun --sdk watchos --show-sdk-version)" >> "$OUT/versions.txt"
-            cat "$OUT/versions.txt"
+            xcodebuild -version | tee "$OUT/versions.txt"
+            IOS_SDK="$(xcrun --sdk iphoneos --show-sdk-version)"
+            WATCH_SDK="$(xcrun --sdk watchos --show-sdk-version)"
+            echo "IOS_SDK=$IOS_SDK" | tee -a "$OUT/versions.txt"
+            echo "WATCHOS_SDK=$WATCH_SDK" | tee -a "$OUT/versions.txt"
+            xcodebuild -version | grep -qx "Xcode 27.0"
+            xcodebuild -version | grep -qx "Build version 27A266a"
+            test "$IOS_SDK" = "27.0"
+            test "$WATCH_SDK" = "27.0"
       - run:
-          name: Scan public framework interfaces
+          name: iOS and watchOS public-API compile validation
           command: |
             set -euo pipefail
-            OUT=/tmp/sdk27-carrier-calling/public-interface-report.txt
-            : > "$OUT"
-            TERMS="Wi[ -]?Fi.?Calling|VoWiFi|iCloud.?Calling|Thumper|IMS|TelephonyConversation|CellularService|CellularPlan|subscriber|carrier|radioAccess|active.?line|service.?state|companion|other.?device|conversation|telephony|dial|join|transfer|handoff|routing|provision|entitlement"
-            for PLATFORM in iphoneos watchos; do
-              SDK="$(xcrun --sdk "$PLATFORM" --show-sdk-path)"
-              echo "=== $PLATFORM SDK=$(xcrun --sdk "$PLATFORM" --show-sdk-version) ===" >> "$OUT"
-              for FW in CoreTelephony LiveCommunicationKit CallKit Network NetworkExtension WatchConnectivity AVFAudio; do
-                ROOT="$SDK/System/Library/Frameworks/$FW.framework"
-                if [ -d "$ROOT" ]; then
-                  echo "===== $FW PRESENT =====" >> "$OUT"
-                  find "$ROOT" -type f 2>/dev/null | sort | while read -r FILE; do
-                    grep -HnEi "$TERMS" "$FILE" 2>/dev/null || true
-                  done >> "$OUT"
-                else
-                  echo "===== $FW ABSENT =====" >> "$OUT"
-                fi
-              done
-            done
-      - run:
-          name: Enumerate public telephony declarations
-          command: |
-            set -euo pipefail
-            OUT=/tmp/sdk27-carrier-calling/public-telephony-declarations.txt
-            : > "$OUT"
-            for PLATFORM in iphoneos watchos; do
-              SDK="$(xcrun --sdk "$PLATFORM" --show-sdk-path)"
-              echo "=== $PLATFORM ===" >> "$OUT"
-              for FW in CoreTelephony LiveCommunicationKit; do
-                ROOT="$SDK/System/Library/Frameworks/$FW.framework"
-                [ -d "$ROOT" ] || continue
-                find "$ROOT" -type f 2>/dev/null | sort | while read -r FILE; do
-                  grep -HnE "(^|[[:space:]])(open|public)[[:space:]]+(final[[:space:]]+)?(class|struct|enum|protocol|actor|func|var|let|typealias)|^[[:space:]]*(API_AVAILABLE|NS_CLASS_AVAILABLE|@interface|@protocol|typedef|FOUNDATION_EXPORT)" "$FILE" 2>/dev/null || true
-                done >> "$OUT"
-              done
-            done
-      - run:
-          name: Search public entitlement surface
-          command: |
-            set -euo pipefail
-            OUT=/tmp/sdk27-carrier-calling/public-entitlement-search.txt
-            : > "$OUT"
-            TERMS="com\.apple\.CommCenter\.fine-grained|Wi[ -]?Fi.?Calling|VoWiFi|Thumper|IMS.*entitlement|entitlement.*IMS"
-            for PLATFORM in iphoneos watchos; do
-              SDK="$(xcrun --sdk "$PLATFORM" --show-sdk-path)"
-              echo "=== $PLATFORM ===" >> "$OUT"
-              find "$SDK/System/Library/Frameworks" -type f \( -name "*.h" -o -name "*.swiftinterface" -o -name "*.modulemap" \) 2>/dev/null | sort | while read -r FILE; do
-                grep -HnEi "$TERMS" "$FILE" 2>/dev/null || true
-              done >> "$OUT"
-            done
-            shasum -a 256 /tmp/sdk27-carrier-calling/*.txt > /tmp/sdk27-carrier-calling/SHA256SUMS
+            OUT=/tmp/carrier-probe-validation
+            BUILD_LOG="$OUT/ios-watch-build.log"
+            xcodebuild \
+              -project WiFiSecureCall.xcodeproj \
+              -scheme WiFiSecureCall \
+              -configuration Debug \
+              -sdk iphoneos \
+              -destination 'generic/platform=iOS' \
+              -derivedDataPath /tmp/carrier-probe-derived-data \
+              CODE_SIGNING_ALLOWED=NO \
+              build | tee "$BUILD_LOG"
+            grep -q "CarrierCallingDiagnosticView.swift.*target 'WiFiSecureCall'" "$BUILD_LOG"
+            grep -q "WatchCarrierCallingDiagnosticView.swift.*target 'WiFiSecureCallWatch'" "$BUILD_LOG"
+            grep -q "target arm64-apple-ios15.0" "$BUILD_LOG"
+            grep -q "target arm64.*-apple-watchos9.2" "$BUILD_LOG"
+            grep -q "\*\* BUILD SUCCEEDED \*\*" "$BUILD_LOG"
+            printf 'IOS_TYPE_CHECK=PASS\nWATCHOS_TYPE_CHECK=PASS\nWATCHOS_10_6_2_COMPATIBLE=PASS\n' > "$OUT/result.txt"
       - store_artifacts:
-          path: /tmp/sdk27-carrier-calling
-          destination: sdk27-carrier-calling
+          path: /tmp/carrier-probe-validation/versions.txt
+          destination: carrier-probe-validation/versions.txt
+      - store_artifacts:
+          path: /tmp/carrier-probe-validation/result.txt
+          destination: carrier-probe-validation/result.txt
 
 workflows:
-  sdk27-carrier-calling-inspection:
+  sdk27-carrier-probe-validation:
     jobs:
-      - sdk27-carrier-calling-inspection
+      - sdk27-carrier-probe-validation

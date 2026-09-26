@@ -7,6 +7,7 @@ struct IOSRootView: View {
     @State private var showAccountPicker = false
     @State private var showCallUser = false
     @State private var showDialDiagnostics = false
+    @State private var showCarrierCallingProbe = false
 
     var body: some View {
         VStack(spacing: 24) {
@@ -29,6 +30,7 @@ struct IOSRootView: View {
         }
         .sheet(isPresented: $showCallUser) { CallUserView(store: accountStore) }
         .sheet(isPresented: $showDialDiagnostics) { SystemDialDiagnosticsView() }
+        .sheet(isPresented: $showCarrierCallingProbe) { CarrierCallingDiagnosticView() }
     }
 
     private var status: String {
@@ -53,6 +55,7 @@ struct IOSRootView: View {
                 Button("Call user") { if accountStore.callableAccounts.isEmpty { showAccount = true } else { showCallUser = true } }
                 Button(accountStore.activeAccount?.displayLabel ?? "Account") { showAccount = true }.font(.footnote)
                 Button("Dial diagnostics") { showDialDiagnostics = true }.font(.footnote)
+                Button("Carrier calling probe") { showCarrierCallingProbe = true }.font(.footnote)
             }
         case .outgoingRinging:
             Button("Cancel", role: .destructive) { Task { await session.cancel() } }
