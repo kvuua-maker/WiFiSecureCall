@@ -4149,16 +4149,34 @@ final class RemoteCellularControlTests: XCTestCase {
         XCTAssertFalse(notificationSource[voIPDelegate.lowerBound...].contains("remote_cellular_control"))
     }
 
-    func testRemoteProbeAddsNoEntitlementOrBackgroundMode() throws {
+    func testIOSRemoteNotificationBackgroundModeIsEnabledWithoutUnrelatedCapabilityChanges() throws {
         let root = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent()
         for file in ["iOS/WiFiSecureCall.entitlements", "Watch/WiFiSecureCallWatch.entitlements"] {
             let source = try String(contentsOf: root.appendingPathComponent(file), encoding: .utf8)
             XCTAssertFalse(source.contains("com.apple.CommCenter.fine-grained"))
         }
-        let plistData = try Data(contentsOf: root.appendingPathComponent("iOS/Info.plist"))
-        let plist = try XCTUnwrap(PropertyListSerialization.propertyList(from: plistData, format: nil) as? [String: Any])
-        let modes = Set(plist["UIBackgroundModes"] as? [String] ?? [])
-        XCTAssertEqual(modes, ["audio", "remote-notification", "voip"])
+        let iOSPlistData = try Data(contentsOf: root.appendingPathComponent("iOS/Info.plist"))
+        let iOSPlist = try XCTUnwrap(PropertyListSerialization.propertyList(from: iOSPlistData, format: nil) as? [String: Any])
+        let iOSModes = iOSPlist["UIBackgroundModes"] as? [String]
+        XCTAssertEqual(iOSModes, ["audio", "remote-notification", "voip"])
+        XCTAssertEqual(iOSModes?.filter { $0 == "remote-notification" }.count, 1)
+        XCTAssertFalse(iOSModes?.contains("fetch") == true)
+        XCTAssertFalse(iOSModes?.contains("processing") == true)
+
+        let watchPlistData = try Data(contentsOf: root.appendingPathComponent("Watch/Info.plist"))
+        let watchPlist = try XCTUnwrap(PropertyListSerialization.propertyList(from: watchPlistData, format: nil) as? [String: Any])
+        XCTAssertEqual(watchPlist["UIBackgroundModes"] as? [String], ["audio", "remote-notification", "voip"])
+
+        let project = try String(
+            contentsOf: root.appendingPathComponent("WiFiSecureCall.xcodeproj/project.pbxproj"),
+            encoding: .utf8
+        )
+        XCTAssertTrue(project.contains(
+            "T10000000000000000000001 = {CreatedOnToolsVersion = 26.6; SystemCapabilities = {com.apple.BackgroundModes = {enabled = 1; }; }; };"
+        ))
+        XCTAssertTrue(project.contains(
+            "T10000000000000000000002 = {CreatedOnToolsVersion = 26.6; };"
+        ))
     }
 
     func testBackgroundFetchCompletionIsExactlyOnceAndDeadlineIsSubThirtySeconds() {

@@ -45,7 +45,18 @@ jobs:
             grep -q "target arm64-apple-ios15.0" "$BUILD_LOG"
             grep -q "target arm64.*-apple-watchos9.2" "$BUILD_LOG"
             grep -q "\*\* BUILD SUCCEEDED \*\*" "$BUILD_LOG"
-            printf 'IOS_TYPE_CHECK=PASS\nWATCHOS_TYPE_CHECK=PASS\nWATCHOS_10_6_2_COMPATIBLE=PASS\n' > "$OUT/result.txt"
+            IOS_INFO=/tmp/carrier-probe-derived-data/Build/Products/Debug-iphoneos/WiFiSecureCall.app/Info.plist
+            test -f "$IOS_INFO"
+            python3 - "$IOS_INFO" <<'PY'
+            import plistlib
+            import sys
+
+            with open(sys.argv[1], "rb") as source:
+                modes = plistlib.load(source).get("UIBackgroundModes", [])
+            assert modes.count("remote-notification") == 1
+            assert set(modes) == {"audio", "remote-notification", "voip"}
+            PY
+            printf 'IOS_TYPE_CHECK=PASS\nWATCHOS_TYPE_CHECK=PASS\nWATCHOS_10_6_2_COMPATIBLE=PASS\nIOS_REMOTE_NOTIFICATION_BACKGROUND_MODE=PASS\n' > "$OUT/result.txt"
       - store_artifacts:
           path: /tmp/carrier-probe-validation/versions.txt
           destination: carrier-probe-validation/versions.txt
