@@ -10,6 +10,10 @@ enum WatchSystemDialerNumber {
         return number + String(character)
     }
 
+    static func deletingLast(from number: String) -> String {
+        String(number.dropLast())
+    }
+
     static func isValid(_ number: String) -> Bool {
         guard number.count <= maximumCharacterCount else { return false }
         let digits = number.first == "+" ? number.dropFirst() : number[...]

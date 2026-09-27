@@ -493,7 +493,7 @@ struct RemoteCellularControlDiagnostic: Codable, Equatable, Sendable {
     let receiptContext: RemoteCellularReceiptContext
     let applicationStateAtReceipt: RemoteCellularApplicationState
     let sameOwnerAuthorized: Bool
-    let userActionRequired: Bool
+    let appConfirmationRequired: Bool
     let startClaimObtained: Bool
     let systemStartAttempted: Bool
     let publicStartReturnedSuccess: Bool?
@@ -507,7 +507,7 @@ struct RemoteCellularControlDiagnostic: Codable, Equatable, Sendable {
         receiptContext: RemoteCellularReceiptContext,
         applicationStateAtReceipt: RemoteCellularApplicationState = .unknown,
         sameOwnerAuthorized: Bool,
-        userActionRequired: Bool,
+        appConfirmationRequired: Bool,
         startClaimObtained: Bool = false,
         systemStartAttempted: Bool,
         publicStartReturnedSuccess: Bool? = nil,
@@ -520,7 +520,7 @@ struct RemoteCellularControlDiagnostic: Codable, Equatable, Sendable {
         self.receiptContext = receiptContext
         self.applicationStateAtReceipt = applicationStateAtReceipt
         self.sameOwnerAuthorized = sameOwnerAuthorized
-        self.userActionRequired = userActionRequired
+        self.appConfirmationRequired = appConfirmationRequired
         self.startClaimObtained = startClaimObtained
         self.systemStartAttempted = systemStartAttempted
         self.publicStartReturnedSuccess = publicStartReturnedSuccess

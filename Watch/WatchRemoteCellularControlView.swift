@@ -202,16 +202,59 @@ struct WatchRemoteCellularControlView: View {
     @Environment(\.dismiss) private var dismiss
     @StateObject private var probe = WatchRemoteCellularControlProbe()
     @State private var e164 = ""
+    private let columns = Array(repeating: GridItem(.flexible(), spacing: 3), count: 3)
+    private let digits: [Character] = ["1", "2", "3", "4", "5", "6", "7", "8", "9"]
 
     var body: some View {
         List {
-            TextField("+country number", text: $e164)
+            Section("Destination number") {
+                Text(e164.isEmpty ? "+E.164 destination" : e164)
+                    .font(.headline.monospacedDigit())
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.45)
+                    .frame(maxWidth: .infinity)
+
+                HStack {
+                    Button("+") { append("+") }
+                        .buttonStyle(.bordered)
+                    Spacer()
+                    Text("Outgoing SIM: selected on iPhone")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
+
+                LazyVGrid(columns: columns, spacing: 3) {
+                    ForEach(digits, id: \.self) { digit in
+                        Button(String(digit)) { append(digit) }
+                            .buttonStyle(.plain)
+                            .frame(maxWidth: .infinity, minHeight: 24)
+                            .background(RoundedRectangle(cornerRadius: 8).fill(.gray.opacity(0.28)))
+                    }
+
+                    Button {
+                        e164 = WatchSystemDialerNumber.deletingLast(from: e164)
+                    } label: {
+                        Image(systemName: "delete.left")
+                    }
+                    .accessibilityLabel("Delete")
+                    .buttonStyle(.plain)
+                    .frame(maxWidth: .infinity, minHeight: 24)
+                    .background(RoundedRectangle(cornerRadius: 8).fill(.gray.opacity(0.28)))
+
+                    Button("0") { append("0") }
+                        .buttonStyle(.plain)
+                        .frame(maxWidth: .infinity, minHeight: 24)
+                        .background(RoundedRectangle(cornerRadius: 8).fill(.gray.opacity(0.28)))
+
+                    Color.clear.frame(minHeight: 24)
+                }
+            }
             Button("Test cellular start on iPhone") {
                 let transientNumber = e164
                 e164.removeAll(keepingCapacity: false)
                 Task { await probe.submit(transientE164: transientNumber) }
             }
-            .disabled(probe.state == .requesting)
+            .disabled(probe.state == .requesting || e164.isEmpty)
             line("State", probe.state.rawValue)
             line("Request", probe.requestID?.uuidString.lowercased() ?? "none")
             line("APNs", probe.deliveryStatus)
@@ -228,6 +271,10 @@ struct WatchRemoteCellularControlView: View {
             e164.removeAll(keepingCapacity: false)
             probe.stop()
         }
+    }
+
+    private func append(_ value: Character) {
+        e164 = WatchSystemDialerNumber.appending(value, to: e164)
     }
 
     private func line(_ title: String, _ value: String) -> some View {

@@ -21,30 +21,99 @@ final class RemoteCellularExactlyOnceCompletion<Result> {
 
 @MainActor
 protocol CellularConversationStarting: AnyObject {
-    func startCellularConversation(to e164: String) async throws
+    func availableCellularServices() throws -> [RemoteCellularServiceOption]
+    func prepareCellularService(id: UUID) throws -> RemoteCellularPreparedService
+    func startCellularConversation(to e164: String, using service: RemoteCellularPreparedService) async throws
 }
 
 enum RemoteCellularLocalError: String, Error {
     case unsupportedOS = "PUBLIC_CELLULAR_API_UNAVAILABLE"
     case invalidNumber = "INVALID_E164"
     case startNotGranted = "START_NOT_GRANTED"
+    case ownerLineMappingRequired = "OWNER_LINE_MAPPING_REQUIRED"
+    case selectedLineUnavailable = "SELECTED_CELLULAR_SERVICE_UNAVAILABLE"
+    case ambiguousLine = "AMBIGUOUS_CELLULAR_SERVICE_ID"
+}
+
+struct RemoteCellularServiceOption: Identifiable, Equatable, Sendable {
+    let id: UUID
+    let label: String
+}
+
+@MainActor
+struct RemoteCellularPreparedService {
+    let id: UUID
+    let label: String
+    private let operation: @MainActor (String) async throws -> Void
+
+    init(
+        id: UUID,
+        label: String,
+        operation: @escaping @MainActor (String) async throws -> Void
+    ) {
+        self.id = id
+        self.label = label
+        self.operation = operation
+    }
+
+    func start(_ e164: String) async throws {
+        try await operation(e164)
+    }
+}
+
+final class RemoteCellularLineSelectionStore {
+    private let defaults: UserDefaults
+    private let keyPrefix = "WiFiSecureCall.remoteCellular.selectedService.v1."
+
+    init(defaults: UserDefaults = .standard) {
+        self.defaults = defaults
+    }
+
+    func selectedServiceID(for accountID: UUID) -> UUID? {
+        defaults.string(forKey: key(for: accountID)).flatMap(UUID.init(uuidString:))
+    }
+
+    func setSelectedServiceID(_ serviceID: UUID, for accountID: UUID) {
+        defaults.set(serviceID.uuidString.lowercased(), forKey: key(for: accountID))
+    }
+
+    private func key(for accountID: UUID) -> String {
+        keyPrefix + accountID.uuidString.lowercased()
+    }
 }
 
 @MainActor
 final class IOSPublicCellularConversationStarter: CellularConversationStarting {
-    func startCellularConversation(to e164: String) async throws {
-        guard let number = RemoteCellularControlPolicy.normalizedE164(e164) else {
-            throw RemoteCellularLocalError.invalidNumber
-        }
+    func availableCellularServices() throws -> [RemoteCellularServiceOption] {
         guard #available(iOS 26.0, *) else {
             throw RemoteCellularLocalError.unsupportedOS
         }
+        return TelephonyConversationManager.sharedInstance.cellularServices.map {
+            RemoteCellularServiceOption(id: $0.id, label: $0.label)
+        }
+    }
 
-        // This is the exact public, default-service path proven by the earlier
-        // foreground cellular-conversation probe. No carrier is guessed.
-        let handle = Handle(type: .phoneNumber, value: number)
-        let action = StartCellularConversationAction(handle)
-        try await TelephonyConversationManager.sharedInstance.startCellularConversation(action)
+    func prepareCellularService(id: UUID) throws -> RemoteCellularPreparedService {
+        guard #available(iOS 26.0, *) else {
+            throw RemoteCellularLocalError.unsupportedOS
+        }
+        let matches = TelephonyConversationManager.sharedInstance.cellularServices.filter { $0.id == id }
+        guard !matches.isEmpty else { throw RemoteCellularLocalError.selectedLineUnavailable }
+        guard matches.count == 1, let selectedService = matches.first else {
+            throw RemoteCellularLocalError.ambiguousLine
+        }
+        return RemoteCellularPreparedService(id: selectedService.id, label: selectedService.label) { number in
+            let handle = Handle(type: .phoneNumber, value: number)
+            let action = StartCellularConversationAction(handle, cellularService: selectedService)
+            try await TelephonyConversationManager.sharedInstance.startCellularConversation(action)
+        }
+    }
+
+    func startCellularConversation(to e164: String, using service: RemoteCellularPreparedService) async throws {
+        guard let number = RemoteCellularControlPolicy.normalizedE164(e164) else {
+            throw RemoteCellularLocalError.invalidNumber
+        }
+        try await service.start(number)
     }
 }
 
@@ -55,10 +124,16 @@ final class IOSRemoteCellularControlCoordinator: ObservableObject {
     @Published private(set) var diagnostic: RemoteCellularControlDiagnostic?
     @Published private(set) var isStarting = false
     @Published var presentationRequested = false
+    @Published private(set) var availableCellularServices: [RemoteCellularServiceOption] = []
+    @Published private(set) var selectedCellularServiceID: UUID?
+    @Published private(set) var selectedCellularServiceLabel: String?
+    @Published private(set) var cellularLineSelectionState = "OWNER_LINE_MAPPING_REQUIRED"
+    @Published private(set) var explicitCellularServicePassed = false
 
     private let api: any RemoteCellularControlAPI
     private let accountStore: AccountSessionStore
     private let starter: any CellularConversationStarting
+    private let lineSelectionStore: RemoteCellularLineSelectionStore
     private var claimMutationIDs: [UUID: UUID] = [:]
     private var startAttemptMutationIDs: [UUID: UUID] = [:]
     private var completionMutationIDs: [UUID: UUID] = [:]
@@ -69,18 +144,83 @@ final class IOSRemoteCellularControlCoordinator: ObservableObject {
         self.init(
             api: runtime.accountAPI,
             accountStore: runtime.accountStore,
-            starter: IOSPublicCellularConversationStarter()
+            starter: IOSPublicCellularConversationStarter(),
+            lineSelectionStore: RemoteCellularLineSelectionStore()
         )
     }
 
     init(
         api: any RemoteCellularControlAPI,
         accountStore: AccountSessionStore,
-        starter: any CellularConversationStarting
+        starter: any CellularConversationStarting,
+        lineSelectionStore: RemoteCellularLineSelectionStore = RemoteCellularLineSelectionStore()
     ) {
         self.api = api
         self.accountStore = accountStore
         self.starter = starter
+        self.lineSelectionStore = lineSelectionStore
+    }
+
+    func refreshCellularLines() {
+        guard let accountID = accountStore.activeAccountID else {
+            availableCellularServices = []
+            selectedCellularServiceID = nil
+            selectedCellularServiceLabel = nil
+            cellularLineSelectionState = "ACCOUNT_SESSION_REQUIRED"
+            return
+        }
+        do {
+            let services = try starter.availableCellularServices()
+            availableCellularServices = services
+            applyStoredSelection(accountID: accountID, services: services)
+        } catch {
+            availableCellularServices = []
+            selectedCellularServiceID = lineSelectionStore.selectedServiceID(for: accountID)
+            selectedCellularServiceLabel = nil
+            cellularLineSelectionState = Self.safeError(error)
+        }
+    }
+
+    func selectCellularLine(_ serviceID: UUID) {
+        guard let accountID = accountStore.activeAccountID else {
+            cellularLineSelectionState = "ACCOUNT_SESSION_REQUIRED"
+            return
+        }
+        let matches = availableCellularServices.filter { $0.id == serviceID }
+        guard !matches.isEmpty else {
+            cellularLineSelectionState = "SELECTED_CELLULAR_SERVICE_UNAVAILABLE"
+            return
+        }
+        guard matches.count == 1, let selected = matches.first else {
+            cellularLineSelectionState = "AMBIGUOUS_CELLULAR_SERVICE_ID"
+            return
+        }
+        lineSelectionStore.setSelectedServiceID(serviceID, for: accountID)
+        selectedCellularServiceID = serviceID
+        selectedCellularServiceLabel = selected.label
+        cellularLineSelectionState = "EXPLICIT_CELLULAR_SERVICE_SELECTED"
+    }
+
+    private func applyStoredSelection(accountID: UUID, services: [RemoteCellularServiceOption]) {
+        guard let storedID = lineSelectionStore.selectedServiceID(for: accountID) else {
+            selectedCellularServiceID = nil
+            selectedCellularServiceLabel = nil
+            cellularLineSelectionState = services.isEmpty
+                ? "CELLULAR_SERVICE_LIST_EMPTY"
+                : "OWNER_LINE_MAPPING_REQUIRED"
+            return
+        }
+        selectedCellularServiceID = storedID
+        let matches = services.filter { $0.id == storedID }
+        if matches.count == 1, let selected = matches.first {
+            selectedCellularServiceLabel = selected.label
+            cellularLineSelectionState = "EXPLICIT_CELLULAR_SERVICE_SELECTED"
+        } else {
+            selectedCellularServiceLabel = nil
+            cellularLineSelectionState = matches.isEmpty
+                ? "SELECTED_CELLULAR_SERVICE_UNAVAILABLE"
+                : "AMBIGUOUS_CELLULAR_SERVICE_ID"
+        }
     }
 
     func receive(
@@ -88,6 +228,9 @@ final class IOSRemoteCellularControlCoordinator: ObservableObject {
         context: RemoteCellularReceiptContext,
         applicationState: RemoteCellularApplicationState
     ) async {
+        if diagnostic?.requestID != envelope.requestID {
+            explicitCellularServicePassed = false
+        }
         let automaticBackgroundAttempt = context == .background || context == .inactive
         guard accountStore.accounts.contains(where: { $0.accountID == envelope.accountID }) else {
             diagnostic = Self.safeDiagnostic(
@@ -124,7 +267,7 @@ final class IOSRemoteCellularControlCoordinator: ObservableObject {
                 receiptContext: context,
                 applicationStateAtReceipt: applicationState,
                 sameOwnerAuthorized: true,
-                userActionRequired: control.state == .iPhoneActionRequired && !automaticBackgroundAttempt,
+                appConfirmationRequired: control.state == .iPhoneActionRequired && !automaticBackgroundAttempt,
                 startClaimObtained: Self.hasStartClaim(control.state),
                 systemStartAttempted: Self.hasStartAttempt(control.state),
                 publicStartReturnedSuccess: Self.publicStartSuccess(control.state),
@@ -162,15 +305,31 @@ final class IOSRemoteCellularControlCoordinator: ObservableObject {
                 requestID: current.requestID, accountID: current.accountID, expiresAt: current.expiresAt,
                 state: .expired, receiptContext: current.receiptContext,
                 applicationStateAtReceipt: current.applicationStateAtReceipt,
-                sameOwnerAuthorized: true, userActionRequired: false,
+                sameOwnerAuthorized: true, appConfirmationRequired: false,
                 startClaimObtained: false, systemStartAttempted: false,
                 publicStartReturnedSuccess: nil, safeResult: "EXPIRED"
             )
             return
         }
 
+        let preparedService: RemoteCellularPreparedService
+        do {
+            guard let selectedID = lineSelectionStore.selectedServiceID(for: current.accountID) else {
+                throw RemoteCellularLocalError.ownerLineMappingRequired
+            }
+            preparedService = try starter.prepareCellularService(id: selectedID)
+            selectedCellularServiceID = preparedService.id
+            selectedCellularServiceLabel = preparedService.label
+            cellularLineSelectionState = "EXPLICIT_CELLULAR_SERVICE_SELECTED"
+        } catch {
+            explicitCellularServicePassed = false
+            updatePreStartFailure(Self.safeError(error))
+            return
+        }
+
         isStarting = true
         locallyConsumed.insert(current.requestID)
+        explicitCellularServicePassed = false
         defer { isStarting = false }
         let claimID = claimMutationIDs[current.requestID] ?? UUID()
         claimMutationIDs[current.requestID] = claimID
@@ -195,7 +354,7 @@ final class IOSRemoteCellularControlCoordinator: ObservableObject {
                 receiptContext: current.receiptContext,
                 applicationStateAtReceipt: current.applicationStateAtReceipt,
                 sameOwnerAuthorized: true,
-                userActionRequired: false,
+                appConfirmationRequired: false,
                 startClaimObtained: true,
                 systemStartAttempted: false,
                 publicStartReturnedSuccess: nil,
@@ -204,7 +363,8 @@ final class IOSRemoteCellularControlCoordinator: ObservableObject {
 
             let publicStartError: Error?
             do {
-                try await starter.startCellularConversation(to: transientNumber)
+                explicitCellularServicePassed = true
+                try await starter.startCellularConversation(to: transientNumber, using: preparedService)
                 publicStartError = nil
             } catch {
                 publicStartError = error
@@ -226,7 +386,7 @@ final class IOSRemoteCellularControlCoordinator: ObservableObject {
                 receiptContext: current.receiptContext,
                 applicationStateAtReceipt: current.applicationStateAtReceipt,
                 sameOwnerAuthorized: true,
-                userActionRequired: false,
+                appConfirmationRequired: false,
                 startClaimObtained: true,
                 systemStartAttempted: true,
                 publicStartReturnedSuccess: nil,
@@ -247,7 +407,7 @@ final class IOSRemoteCellularControlCoordinator: ObservableObject {
                     requestID: current.requestID, accountID: current.accountID, expiresAt: current.expiresAt,
                     state: .systemStartAccepted, receiptContext: current.receiptContext,
                     applicationStateAtReceipt: current.applicationStateAtReceipt,
-                    sameOwnerAuthorized: true, userActionRequired: false,
+                    sameOwnerAuthorized: true, appConfirmationRequired: false,
                     startClaimObtained: true, systemStartAttempted: true,
                     publicStartReturnedSuccess: true, safeResult: "SYSTEM_START_ACCEPTED"
                 )
@@ -267,7 +427,7 @@ final class IOSRemoteCellularControlCoordinator: ObservableObject {
                     requestID: current.requestID, accountID: current.accountID, expiresAt: current.expiresAt,
                     state: .publicStartError, receiptContext: current.receiptContext,
                     applicationStateAtReceipt: current.applicationStateAtReceipt,
-                    sameOwnerAuthorized: true, userActionRequired: false,
+                    sameOwnerAuthorized: true, appConfirmationRequired: false,
                     startClaimObtained: true, systemStartAttempted: true,
                     publicStartReturnedSuccess: false, safeResult: metadata.classification
                 )
@@ -291,7 +451,7 @@ final class IOSRemoteCellularControlCoordinator: ObservableObject {
             receiptContext: current.receiptContext,
             applicationStateAtReceipt: current.applicationStateAtReceipt,
             sameOwnerAuthorized: current.sameOwnerAuthorized,
-            userActionRequired: false,
+            appConfirmationRequired: false,
             startClaimObtained: false,
             systemStartAttempted: false,
             publicStartReturnedSuccess: nil,
@@ -316,7 +476,7 @@ final class IOSRemoteCellularControlCoordinator: ObservableObject {
             receiptContext: context,
             applicationStateAtReceipt: applicationState,
             sameOwnerAuthorized: authorized,
-            userActionRequired: !attempted,
+            appConfirmationRequired: !attempted,
             startClaimObtained: false,
             systemStartAttempted: attempted,
             publicStartReturnedSuccess: nil,
@@ -403,19 +563,53 @@ struct IOSRemoteCellularControlView: View {
     var body: some View {
         NavigationView {
             List {
+                Section("Outgoing cellular line") {
+                    if coordinator.availableCellularServices.isEmpty {
+                        Text("No public cellular services currently listed")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    } else {
+                        ForEach(coordinator.availableCellularServices) { service in
+                            Button {
+                                coordinator.selectCellularLine(service.id)
+                            } label: {
+                                HStack {
+                                    VStack(alignment: .leading, spacing: 2) {
+                                        Text(service.label.isEmpty ? "Cellular line" : service.label)
+                                        Text(Self.shortID(service.id))
+                                            .font(.caption2.monospaced())
+                                            .foregroundStyle(.secondary)
+                                    }
+                                    Spacer()
+                                    if coordinator.selectedCellularServiceID == service.id {
+                                        Image(systemName: "checkmark.circle.fill")
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    line("Line selection", coordinator.cellularLineSelectionState)
+                    line("Selected line", coordinator.selectedCellularServiceLabel ?? "none")
+                    line(
+                        "Selected service ID",
+                        coordinator.selectedCellularServiceID.map(Self.shortID) ?? "none"
+                    )
+                    Button("Refresh cellular lines") { coordinator.refreshCellularLines() }
+                }
                 if let value = coordinator.diagnostic {
                     line("Request", value.requestID.uuidString.lowercased())
                     line("Same-owner Watch", value.sameOwnerAuthorized ? "YES" : "NO")
-                    line("Server verified fresh", value.expiresAt.map { $0 > Date() } == true ? "YES" : "NO")
+                    line("Request within TTL now", value.expiresAt.map { $0 > Date() } == true ? "YES" : "NO")
                     line("Received", value.receiptContext.rawValue)
                     line("Application state", value.applicationStateAtReceipt.rawValue)
                     line("State", value.state.rawValue)
-                    line("User action required", value.userActionRequired ? "YES" : "NO")
+                    line("App confirmation required", value.appConfirmationRequired ? "YES" : "NO")
                     line("Start claim obtained", value.startClaimObtained ? "YES" : "NO")
+                    line("Explicit cellular service passed", coordinator.explicitCellularServicePassed ? "YES" : "NO")
                     line("System start attempted", value.systemStartAttempted ? "YES" : "NO")
                     line("Public start returned", value.publicStartReturnedSuccess.map { $0 ? "SUCCESS" : "ERROR" } ?? "NOT_RETURNED")
                     line("Result", value.safeResult)
-                    if value.userActionRequired && value.sameOwnerAuthorized {
+                    if value.appConfirmationRequired && value.sameOwnerAuthorized {
                         Button("Start cellular conversation") {
                             Task { await coordinator.startPendingControl() }
                         }
@@ -427,7 +621,12 @@ struct IOSRemoteCellularControlView: View {
             }
             .navigationTitle("Remote cellular probe")
             .toolbar { ToolbarItem(placement: .cancellationAction) { Button("Close") { dismiss() } } }
+            .onAppear { coordinator.refreshCellularLines() }
         }
+    }
+
+    private static func shortID(_ id: UUID) -> String {
+        String(id.uuidString.lowercased().prefix(8))
     }
 
     private func line(_ title: String, _ value: String) -> some View {
