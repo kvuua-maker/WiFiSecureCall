@@ -72,15 +72,37 @@ final class IOSNotificationController: NSObject, UIApplicationDelegate, UNUserNo
             completionHandler(.noData)
             return
         }
+        let applicationState = Self.remoteApplicationState(application.applicationState)
+        let receiptContext = Self.remoteReceiptContext(application.applicationState)
+        let completion = RemoteCellularExactlyOnceCompletion(completionHandler)
+        let deadline = Task { @MainActor in
+            do {
+                try await Task.sleep(nanoseconds: RemoteCellularControlPolicy.backgroundFetchCompletionDeadlineNanoseconds)
+            } catch {
+                return
+            }
+            completion.finish(.failed)
+        }
         Task { @MainActor in
-            await IOSRemoteCellularControlCoordinator.shared.receive(envelope, context: .background)
-            completionHandler(.newData)
+            defer { deadline.cancel() }
+            await IOSRemoteCellularControlCoordinator.shared.receive(
+                envelope,
+                context: receiptContext,
+                applicationState: applicationState
+            )
+            completion.finish(.newData)
         }
     }
 
     nonisolated func userNotificationCenter(_ center: UNUserNotificationCenter, willPresent notification: UNNotification, withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void) {
         if let envelope = RemoteCellularControlPushEnvelope.parse(notification.request.content.userInfo) {
-            Task { @MainActor in await IOSRemoteCellularControlCoordinator.shared.receive(envelope, context: .foreground) }
+            Task { @MainActor in
+                await IOSRemoteCellularControlCoordinator.shared.receive(
+                    envelope,
+                    context: .foreground,
+                    applicationState: .foreground
+                )
+            }
             completionHandler([.banner, .sound])
             return
         }
@@ -91,7 +113,14 @@ final class IOSNotificationController: NSObject, UIApplicationDelegate, UNUserNo
 
     nonisolated func userNotificationCenter(_ center: UNUserNotificationCenter, didReceive response: UNNotificationResponse) async {
         if let envelope = RemoteCellularControlPushEnvelope.parse(response.notification.request.content.userInfo) {
-            await IOSRemoteCellularControlCoordinator.shared.receive(envelope, context: .openedFromNotification)
+            let applicationState = await MainActor.run {
+                Self.remoteApplicationState(UIApplication.shared.applicationState)
+            }
+            await IOSRemoteCellularControlCoordinator.shared.receive(
+                envelope,
+                context: .openedFromNotification,
+                applicationState: applicationState
+            )
             return
         }
         guard let envelope = IncomingNotificationEnvelope.parse(response.notification.request.content.userInfo) else { return }
@@ -112,6 +141,24 @@ final class IOSNotificationController: NSObject, UIApplicationDelegate, UNUserNo
         case let .user(callID, accountID, caller):
             if voip { await NotificationRuntime.shared.handleIncomingUserVoIP(callID: callID, accountID: accountID, caller: caller) }
             else { await NotificationRuntime.shared.handleIncomingUserAlert(callID: callID, accountID: accountID, caller: caller, requestAnswer: requestAnswer) }
+        }
+    }
+
+    private static func remoteReceiptContext(_ state: UIApplication.State) -> RemoteCellularReceiptContext {
+        switch state {
+        case .active: return .foreground
+        case .background: return .background
+        case .inactive: return .inactive
+        @unknown default: return .background
+        }
+    }
+
+    private static func remoteApplicationState(_ state: UIApplication.State) -> RemoteCellularApplicationState {
+        switch state {
+        case .active: return .foreground
+        case .background: return .background
+        case .inactive: return .inactive
+        @unknown default: return .unknown
         }
     }
 }

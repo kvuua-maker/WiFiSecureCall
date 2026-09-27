@@ -9,10 +9,14 @@ final class WatchRemoteCellularControlProbe: ObservableObject {
         case requesting = "REQUESTING"
         case serverAccepted = "SERVER_ACCEPTED"
         case iPhoneDeliveryPending = "IPHONE_DELIVERY_PENDING"
-        case iPhoneReceived = "IPHONE_RECEIVED"
+        case iPhoneBackgroundReceived = "IPHONE_BACKGROUND_RECEIVED"
         case iPhoneActionRequired = "IPHONE_ACTION_REQUIRED"
-        case iPhoneStartRequested = "IPHONE_START_REQUESTED"
-        case systemHandoff = "SYSTEM_HANDOFF"
+        case iPhoneStartAuthorized = "IPHONE_START_AUTHORIZED"
+        case iPhoneBackgroundStartAttempted = "IPHONE_BACKGROUND_START_ATTEMPTED"
+        case iPhoneForegroundStartAttempted = "IPHONE_FOREGROUND_START_ATTEMPTED"
+        case systemStartAccepted = "SYSTEM_START_ACCEPTED"
+        case publicStartError = "PUBLIC_START_ERROR"
+        case backgroundExecutionNotObserved = "BACKGROUND_EXECUTION_NOT_OBSERVED"
         case failedSafe = "FAILED_SAFE"
         case expired = "EXPIRED"
         case cancelled = "CANCELLED"
@@ -21,6 +25,9 @@ final class WatchRemoteCellularControlProbe: ObservableObject {
     @Published private(set) var state: SafeState = .idle
     @Published private(set) var requestID: UUID?
     @Published private(set) var expiresAt: Date?
+    @Published private(set) var deliveryStatus = "NOT_SUBMITTED"
+    @Published private(set) var iPhoneReceived = false
+    @Published private(set) var startAttempted = false
     @Published private(set) var safeResult = "NOT_STARTED"
 
     private let api: any RemoteCellularControlAPI
@@ -41,7 +48,8 @@ final class WatchRemoteCellularControlProbe: ObservableObject {
 
     var canCancel: Bool {
         switch state {
-        case .requesting, .serverAccepted, .iPhoneDeliveryPending, .iPhoneReceived, .iPhoneActionRequired:
+        case .requesting, .serverAccepted, .iPhoneDeliveryPending,
+             .iPhoneBackgroundReceived, .iPhoneActionRequired:
             return requestID != nil
         default:
             return false
@@ -67,6 +75,9 @@ final class WatchRemoteCellularControlProbe: ObservableObject {
         requestID = controlID
         controlAccountID = accountID
         cancelMutationID = UUID()
+        deliveryStatus = "NOT_SUBMITTED"
+        iPhoneReceived = false
+        startAttempted = false
         state = .requesting
         safeResult = "REQUESTING"
         do {
@@ -123,6 +134,9 @@ final class WatchRemoteCellularControlProbe: ObservableObject {
 
     private func apply(_ value: RemoteCellularControlView) {
         expiresAt = value.expiresAt
+        deliveryStatus = (value.deliveryStatus ?? "unknown").uppercased()
+        iPhoneReceived = iPhoneReceived || value.receivedAt != nil
+        startAttempted = startAttempted || value.startAttemptedAt != nil
         switch value.state {
         case .deliveryPending:
             state = .iPhoneDeliveryPending
@@ -130,18 +144,35 @@ final class WatchRemoteCellularControlProbe: ObservableObject {
         case .iPhoneActionRequired:
             state = .iPhoneActionRequired
             safeResult = "IPHONE_ACTION_REQUIRED"
+        case .iPhoneBackgroundReceived:
+            state = .iPhoneBackgroundReceived
+            safeResult = "IPHONE_BACKGROUND_RECEIVED"
         case .iPhoneStartAuthorized:
-            state = .iPhoneStartRequested
+            state = .iPhoneStartAuthorized
             safeResult = "IPHONE_START_AUTHORIZED"
-        case .startRequested:
-            state = .systemHandoff
-            safeResult = "SYSTEM_HANDOFF"
+        case .iPhoneBackgroundStartAttempted:
+            state = .iPhoneBackgroundStartAttempted
+            safeResult = "IPHONE_BACKGROUND_START_ATTEMPTED"
+        case .iPhoneForegroundStartAttempted:
+            state = .iPhoneForegroundStartAttempted
+            safeResult = "IPHONE_FOREGROUND_START_ATTEMPTED"
+        case .systemStartAccepted:
+            state = .systemStartAccepted
+            safeResult = "SYSTEM_START_ACCEPTED"
+        case .publicStartError:
+            state = .publicStartError
+            safeResult = Self.publicError(value)
         case .cancelled:
             state = .cancelled
             safeResult = "CANCELLED_BEFORE_SYSTEM_START"
         case .expired:
-            state = .expired
-            safeResult = "EXPIRED"
+            if value.terminalReason == "background_execution_not_observed" {
+                state = .backgroundExecutionNotObserved
+                safeResult = "BACKGROUND_EXECUTION_NOT_OBSERVED"
+            } else {
+                state = .expired
+                safeResult = "EXPIRED"
+            }
         case .failedSafe:
             state = .failedSafe
             safeResult = "FAILED_SAFE"
@@ -149,7 +180,15 @@ final class WatchRemoteCellularControlProbe: ObservableObject {
     }
 
     private static func isTerminal(_ value: RemoteCellularControlState) -> Bool {
-        value == .startRequested || value == .cancelled || value == .expired || value == .failedSafe
+        value == .systemStartAccepted || value == .publicStartError ||
+            value == .cancelled || value == .expired || value == .failedSafe
+    }
+
+    private static func publicError(_ value: RemoteCellularControlView) -> String {
+        guard value.safeErrorDomain != nil, let code = value.safeErrorCode else {
+            return "PUBLIC_START_ERROR"
+        }
+        return "PUBLIC_START_ERROR_PublicCellularAPI_\(code)"
     }
 
     private static func safeError(_ error: Error) -> String {
@@ -167,7 +206,7 @@ struct WatchRemoteCellularControlView: View {
     var body: some View {
         List {
             TextField("+country number", text: $e164)
-            Button("Request on iPhone") {
+            Button("Test cellular start on iPhone") {
                 let transientNumber = e164
                 e164.removeAll(keepingCapacity: false)
                 Task { await probe.submit(transientE164: transientNumber) }
@@ -175,6 +214,9 @@ struct WatchRemoteCellularControlView: View {
             .disabled(probe.state == .requesting)
             line("State", probe.state.rawValue)
             line("Request", probe.requestID?.uuidString.lowercased() ?? "none")
+            line("APNs", probe.deliveryStatus)
+            line("iPhone received", probe.iPhoneReceived ? "YES" : "NO")
+            line("Start attempted", probe.startAttempted ? "YES" : "NO")
             line("Result", probe.safeResult)
             if probe.canCancel {
                 Button("Cancel pending request", role: .destructive) { Task { await probe.cancel() } }

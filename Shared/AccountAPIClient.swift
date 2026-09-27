@@ -213,8 +213,12 @@ actor AccountAPIClient {
         )
     }
 
-    func receiveRemoteCellularControl(accountID: UUID, requestID: UUID, mutationID: UUID = UUID()) async throws -> RemoteCellularControlView {
-        try await remoteCellularMutation(accountID: accountID, controlID: requestID, action: "receive", mutationID: mutationID)
+    func receiveRemoteCellularControl(accountID: UUID, requestID: UUID, mutationID: UUID = UUID(), context: RemoteCellularReceiptContext) async throws -> RemoteCellularControlView {
+        try await authorizedV3(
+            "cellular-controls/\(requestID.uuidString.lowercased())/receive",
+            accountID: accountID,
+            body: RemoteCellularControlReceiptRequest(requestID: mutationID, receiptContext: context)
+        )
     }
 
     func claimRemoteCellularControlStart(accountID: UUID, requestID: UUID, mutationID: UUID = UUID()) async throws -> RemoteCellularControlStartGrant {
@@ -225,8 +229,28 @@ actor AccountAPIClient {
         )
     }
 
-    func markRemoteCellularControlStartRequested(accountID: UUID, requestID: UUID, mutationID: UUID = UUID()) async throws -> RemoteCellularControlView {
-        try await remoteCellularMutation(accountID: accountID, controlID: requestID, action: "start-requested", mutationID: mutationID)
+    func markRemoteCellularControlStartAttempted(accountID: UUID, requestID: UUID, mutationID: UUID = UUID()) async throws -> RemoteCellularControlView {
+        try await remoteCellularMutation(accountID: accountID, controlID: requestID, action: "start-attempted", mutationID: mutationID)
+    }
+
+    func completeRemoteCellularControlStart(
+        accountID: UUID,
+        requestID: UUID,
+        mutationID: UUID = UUID(),
+        result: RemoteCellularStartResult,
+        errorDomain: String? = nil,
+        errorCode: Int? = nil
+    ) async throws -> RemoteCellularControlView {
+        try await authorizedV3(
+            "cellular-controls/\(requestID.uuidString.lowercased())/start-result",
+            accountID: accountID,
+            body: RemoteCellularControlStartResultRequest(
+                requestID: mutationID,
+                result: result,
+                safeErrorDomain: errorDomain,
+                safeErrorCode: errorCode
+            )
+        )
     }
 
     func cancelRemoteCellularControl(accountID: UUID, requestID: UUID, mutationID: UUID = UUID()) async throws -> RemoteCellularControlView {

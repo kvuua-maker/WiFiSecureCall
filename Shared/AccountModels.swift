@@ -308,8 +308,12 @@ struct CrossUserCallCreateRequest: Codable, Sendable {
 enum RemoteCellularControlState: String, Codable, Equatable, Sendable {
     case deliveryPending = "iphone_delivery_pending"
     case iPhoneActionRequired = "iphone_action_required"
+    case iPhoneBackgroundReceived = "iphone_background_received"
     case iPhoneStartAuthorized = "iphone_start_authorized"
-    case startRequested = "iphone_start_requested"
+    case iPhoneBackgroundStartAttempted = "iphone_background_start_attempted"
+    case iPhoneForegroundStartAttempted = "iphone_foreground_start_attempted"
+    case systemStartAccepted = "system_start_accepted"
+    case publicStartError = "public_start_error"
     case cancelled
     case expired
     case failedSafe = "failed_safe"
@@ -324,6 +328,23 @@ struct RemoteCellularControlMutationRequest: Codable, Equatable, Sendable {
     let requestID: UUID
 }
 
+struct RemoteCellularControlReceiptRequest: Codable, Equatable, Sendable {
+    let requestID: UUID
+    let receiptContext: RemoteCellularReceiptContext
+}
+
+enum RemoteCellularStartResult: String, Codable, Equatable, Sendable {
+    case accepted
+    case error
+}
+
+struct RemoteCellularControlStartResultRequest: Codable, Equatable, Sendable {
+    let requestID: UUID
+    let result: RemoteCellularStartResult
+    let safeErrorDomain: String?
+    let safeErrorCode: Int?
+}
+
 struct RemoteCellularControlView: Codable, Equatable, Sendable {
     let requestID: UUID
     let state: RemoteCellularControlState
@@ -334,6 +355,52 @@ struct RemoteCellularControlView: Codable, Equatable, Sendable {
     let targetPlatform: String
     let sameOwnerAuthorized: Bool
     let mutationApplied: Bool?
+    let terminalReason: String?
+    let receiptContext: RemoteCellularReceiptContext?
+    let receivedAt: Date?
+    let startAttemptedAt: Date?
+    let startResultAt: Date?
+    let startResult: RemoteCellularStartResult?
+    let safeErrorDomain: String?
+    let safeErrorCode: Int?
+
+    init(
+        requestID: UUID,
+        state: RemoteCellularControlState,
+        createdAt: Date,
+        expiresAt: Date,
+        deliveryStatus: String?,
+        sourcePlatform: String,
+        targetPlatform: String,
+        sameOwnerAuthorized: Bool,
+        mutationApplied: Bool?,
+        terminalReason: String? = nil,
+        receiptContext: RemoteCellularReceiptContext? = nil,
+        receivedAt: Date? = nil,
+        startAttemptedAt: Date? = nil,
+        startResultAt: Date? = nil,
+        startResult: RemoteCellularStartResult? = nil,
+        safeErrorDomain: String? = nil,
+        safeErrorCode: Int? = nil
+    ) {
+        self.requestID = requestID
+        self.state = state
+        self.createdAt = createdAt
+        self.expiresAt = expiresAt
+        self.deliveryStatus = deliveryStatus
+        self.sourcePlatform = sourcePlatform
+        self.targetPlatform = targetPlatform
+        self.sameOwnerAuthorized = sameOwnerAuthorized
+        self.mutationApplied = mutationApplied
+        self.terminalReason = terminalReason
+        self.receiptContext = receiptContext
+        self.receivedAt = receivedAt
+        self.startAttemptedAt = startAttemptedAt
+        self.startResultAt = startResultAt
+        self.startResult = startResult
+        self.safeErrorDomain = safeErrorDomain
+        self.safeErrorCode = safeErrorCode
+    }
 }
 
 struct RemoteCellularControlStartGrant: Codable, Sendable {
@@ -347,14 +414,16 @@ struct RemoteCellularControlStartGrant: Codable, Sendable {
     let sameOwnerAuthorized: Bool
     let mutationApplied: Bool?
     let terminalReason: String?
-    let phoneNumber: String?
+    var phoneNumber: String?
 
     var control: RemoteCellularControlView {
         RemoteCellularControlView(
             requestID: requestID, state: state, createdAt: createdAt, expiresAt: expiresAt,
             deliveryStatus: deliveryStatus, sourcePlatform: sourcePlatform,
             targetPlatform: targetPlatform, sameOwnerAuthorized: sameOwnerAuthorized,
-            mutationApplied: mutationApplied
+            mutationApplied: mutationApplied, terminalReason: terminalReason,
+            receiptContext: nil, receivedAt: nil, startAttemptedAt: nil, startResultAt: nil,
+            startResult: nil, safeErrorDomain: nil, safeErrorCode: nil
         )
     }
 
@@ -393,6 +462,7 @@ struct RemoteCellularControlPushEnvelope: Equatable, Sendable {
 
 enum RemoteCellularControlPolicy {
     static let requestTTL: TimeInterval = 120
+    static let backgroundFetchCompletionDeadlineNanoseconds: UInt64 = 20_000_000_000
 
     static func normalizedE164(_ value: String) -> String? {
         guard value == value.trimmingCharacters(in: .whitespacesAndNewlines),
@@ -404,7 +474,15 @@ enum RemoteCellularControlPolicy {
 enum RemoteCellularReceiptContext: String, Codable, Equatable, Sendable {
     case foreground
     case background
+    case inactive
     case openedFromNotification = "opened_from_notification"
+}
+
+enum RemoteCellularApplicationState: String, Codable, Equatable, Sendable {
+    case foreground
+    case background
+    case inactive
+    case unknown
 }
 
 struct RemoteCellularControlDiagnostic: Codable, Equatable, Sendable {
@@ -413,18 +491,50 @@ struct RemoteCellularControlDiagnostic: Codable, Equatable, Sendable {
     let expiresAt: Date?
     let state: RemoteCellularControlState
     let receiptContext: RemoteCellularReceiptContext
+    let applicationStateAtReceipt: RemoteCellularApplicationState
     let sameOwnerAuthorized: Bool
     let userActionRequired: Bool
+    let startClaimObtained: Bool
     let systemStartAttempted: Bool
+    let publicStartReturnedSuccess: Bool?
     let safeResult: String
+
+    init(
+        requestID: UUID,
+        accountID: UUID,
+        expiresAt: Date?,
+        state: RemoteCellularControlState,
+        receiptContext: RemoteCellularReceiptContext,
+        applicationStateAtReceipt: RemoteCellularApplicationState = .unknown,
+        sameOwnerAuthorized: Bool,
+        userActionRequired: Bool,
+        startClaimObtained: Bool = false,
+        systemStartAttempted: Bool,
+        publicStartReturnedSuccess: Bool? = nil,
+        safeResult: String
+    ) {
+        self.requestID = requestID
+        self.accountID = accountID
+        self.expiresAt = expiresAt
+        self.state = state
+        self.receiptContext = receiptContext
+        self.applicationStateAtReceipt = applicationStateAtReceipt
+        self.sameOwnerAuthorized = sameOwnerAuthorized
+        self.userActionRequired = userActionRequired
+        self.startClaimObtained = startClaimObtained
+        self.systemStartAttempted = systemStartAttempted
+        self.publicStartReturnedSuccess = publicStartReturnedSuccess
+        self.safeResult = safeResult
+    }
 }
 
 protocol RemoteCellularControlAPI: Sendable {
     func createRemoteCellularControl(accountID: UUID, requestID: UUID, phoneNumber: String) async throws -> RemoteCellularControlView
     func remoteCellularControl(accountID: UUID, requestID: UUID) async throws -> RemoteCellularControlView
-    func receiveRemoteCellularControl(accountID: UUID, requestID: UUID, mutationID: UUID) async throws -> RemoteCellularControlView
+    func receiveRemoteCellularControl(accountID: UUID, requestID: UUID, mutationID: UUID, context: RemoteCellularReceiptContext) async throws -> RemoteCellularControlView
     func claimRemoteCellularControlStart(accountID: UUID, requestID: UUID, mutationID: UUID) async throws -> RemoteCellularControlStartGrant
-    func markRemoteCellularControlStartRequested(accountID: UUID, requestID: UUID, mutationID: UUID) async throws -> RemoteCellularControlView
+    func markRemoteCellularControlStartAttempted(accountID: UUID, requestID: UUID, mutationID: UUID) async throws -> RemoteCellularControlView
+    func completeRemoteCellularControlStart(accountID: UUID, requestID: UUID, mutationID: UUID, result: RemoteCellularStartResult, errorDomain: String?, errorCode: Int?) async throws -> RemoteCellularControlView
     func cancelRemoteCellularControl(accountID: UUID, requestID: UUID, mutationID: UUID) async throws -> RemoteCellularControlView
 }
 
