@@ -1,5 +1,7 @@
 import AVFoundation
 import Intents
+import SwiftUI
+import UIKit
 import XCTest
 
 final class WatchSystemDialerNumberTests: XCTestCase {
@@ -3993,12 +3995,400 @@ final class RemoteCellularControlTests: XCTestCase {
         let beforeCounts = await api.counts()
         XCTAssertEqual(beforeCounts.claim, 0)
         XCTAssertTrue(coordinator.diagnostic?.appConfirmationRequired == true)
+        XCTAssertEqual(
+            coordinator.manualStartAvailability(requestID: requestID, accountID: accountID),
+            .ready
+        )
+        XCTAssertEqual(coordinator.manualActionResult, "READY_FOR_IPHONE_ACTION")
 
-        await coordinator.startPendingControl()
+        await coordinator.startPendingControl(requestID: requestID, accountID: accountID)
         XCTAssertEqual(starter.numbers.count, 1)
         let afterCounts = await api.counts()
         XCTAssertEqual(afterCounts.claim, 1)
         XCTAssertEqual(coordinator.diagnostic?.safeResult, "SYSTEM_START_ACCEPTED")
+        XCTAssertTrue(coordinator.publicStarterEntered)
+        XCTAssertEqual(coordinator.manualActionResult, "SYSTEM_START_ACCEPTED")
+    }
+
+    func testForegroundRequestAccountModeIsExplicitAndRequestScopedOptInDoesNotStartCall() async throws {
+        let requestAccount = UUID(), activeAccount = UUID(), requestID = UUID()
+        let accountStore = try Self.accountStore(accountID: requestAccount)
+        try accountStore.addLinkedAccount(
+            accountID: activeAccount,
+            userID: UUID(),
+            phoneNumber: nil,
+            displayLabel: "Active settings account",
+            tokens: AccountTokens(
+                accessToken: "second-access", accessExpiresAt: .distantFuture,
+                refreshToken: "second-refresh", refreshExpiresAt: .distantFuture
+            )
+        )
+        XCTAssertEqual(accountStore.activeAccountID, activeAccount)
+        let view = Self.view(requestID: requestID, state: .iPhoneActionRequired, receiptContext: .foreground)
+        let api = RemoteControlAPIStub(
+            view: view,
+            grant: RemoteCellularControlStartGrant(
+                control: Self.view(requestID: requestID, state: .iPhoneStartAuthorized),
+                startGranted: true,
+                phoneNumber: "+380501234567"
+            )
+        )
+        let modeStore = Self.executionModeStore()
+        let starter = RemoteCellularStarterSpy(services: [])
+        let coordinator = IOSRemoteCellularControlCoordinator(
+            api: api,
+            accountStore: accountStore,
+            starter: starter,
+            lineSelectionStore: Self.lineSelectionStore(),
+            executionModeStore: modeStore
+        )
+
+        await coordinator.receive(
+            .init(requestID: requestID, accountID: requestAccount),
+            context: .foreground,
+            applicationState: .foreground
+        )
+        XCTAssertEqual(coordinator.executionMode, .strictExplicitSIM)
+        XCTAssertEqual(coordinator.requestExecutionMode(accountID: requestAccount), .strictExplicitSIM)
+        XCTAssertTrue(coordinator.requestAccountLabel(accountID: requestAccount).contains("Secure account"))
+        XCTAssertFalse(coordinator.requestAccountLabel(accountID: requestAccount).contains("Active settings account"))
+
+        await coordinator.startPendingControl(requestID: requestID, accountID: requestAccount)
+        XCTAssertEqual(coordinator.manualActionResult, "OWNER_LINE_MAPPING_REQUIRED")
+        XCTAssertEqual(coordinator.diagnostic?.state, .iPhoneActionRequired)
+        XCTAssertTrue(coordinator.diagnostic?.appConfirmationRequired == true)
+        XCTAssertEqual(
+            coordinator.manualStartAvailability(requestID: requestID, accountID: requestAccount),
+            .ready
+        )
+        var counts = await api.counts()
+        XCTAssertEqual(counts.claim, 0)
+        XCTAssertTrue(starter.numbers.isEmpty)
+
+        coordinator.confirmSystemManagedDiagnosticOptIn(requestID: requestID, accountID: requestAccount)
+        XCTAssertEqual(coordinator.requestExecutionMode(accountID: requestAccount), .systemManagedDiagnostic)
+        XCTAssertEqual(coordinator.requestExecutionMode(accountID: activeAccount), .strictExplicitSIM)
+        XCTAssertEqual(coordinator.executionMode, .strictExplicitSIM)
+        counts = await api.counts()
+        XCTAssertEqual(counts.claim, 0)
+        XCTAssertTrue(starter.numbers.isEmpty)
+
+        await coordinator.startPendingControl(requestID: requestID, accountID: requestAccount)
+        counts = await api.counts()
+        XCTAssertEqual(counts.claim, 1)
+        XCTAssertEqual(starter.startedModes, [.systemManagedDiagnostic])
+        XCTAssertEqual(starter.numbers, ["+380501234567"])
+    }
+
+    func testManualRequestExpiryBetweenDisplayAndTapIsVisibleAndNeverClaims() async throws {
+        let accountID = UUID(), requestID = UUID()
+        let accountStore = try Self.accountStore(accountID: accountID)
+        let expiresAt = Date().addingTimeInterval(2)
+        let view = Self.view(
+            requestID: requestID,
+            state: .iPhoneActionRequired,
+            receiptContext: .foreground,
+            expiresAt: expiresAt
+        )
+        let api = RemoteControlAPIStub(
+            view: view,
+            grant: RemoteCellularControlStartGrant(
+                control: Self.view(requestID: requestID, state: .iPhoneStartAuthorized),
+                startGranted: true,
+                phoneNumber: "+380501234567"
+            )
+        )
+        let starter = RemoteCellularStarterSpy()
+        let coordinator = try Self.configuredCoordinator(api: api, accountStore: accountStore, starter: starter)
+        await coordinator.receive(
+            .init(requestID: requestID, accountID: accountID),
+            context: .foreground,
+            applicationState: .foreground
+        )
+        try await Task.sleep(nanoseconds: 2_100_000_000)
+
+        await coordinator.startPendingControl(requestID: requestID, accountID: accountID)
+
+        XCTAssertEqual(coordinator.manualActionResult, "REQUEST_EXPIRED")
+        XCTAssertEqual(coordinator.diagnostic?.state, .expired)
+        XCTAssertEqual(
+            coordinator.manualStartAvailability(requestID: requestID, accountID: accountID),
+            .expired
+        )
+        let counts = await api.counts()
+        XCTAssertEqual(counts.claim, 0)
+        XCTAssertTrue(starter.numbers.isEmpty)
+    }
+
+    func testDoubleTapDuplicatePushAndStarterReentrancyRemainExactlyOnce() async throws {
+        let accountID = UUID(), requestID = UUID()
+        let accountStore = try Self.accountStore(accountID: accountID)
+        let modeStore = Self.executionModeStore()
+        modeStore.setMode(.systemManagedDiagnostic, for: accountID)
+        let claimGate = RemoteCellularTestGate()
+        let starterGate = RemoteCellularTestGate()
+        let view = Self.view(requestID: requestID, state: .iPhoneActionRequired, receiptContext: .foreground)
+        let api = RemoteControlAPIStub(
+            view: view,
+            grant: RemoteCellularControlStartGrant(
+                control: Self.view(requestID: requestID, state: .iPhoneStartAuthorized),
+                startGranted: true,
+                phoneNumber: "+380501234567"
+            ),
+            claimGate: claimGate
+        )
+        let starter = RemoteCellularStarterSpy(services: [], beforeStart: { await starterGate.wait() })
+        let coordinator = IOSRemoteCellularControlCoordinator(
+            api: api,
+            accountStore: accountStore,
+            starter: starter,
+            lineSelectionStore: Self.lineSelectionStore(),
+            executionModeStore: modeStore
+        )
+        let envelope = RemoteCellularControlPushEnvelope(requestID: requestID, accountID: accountID)
+        await coordinator.receive(envelope, context: .foreground, applicationState: .foreground)
+
+        let firstTap = Task { @MainActor in
+            await coordinator.startPendingControl(requestID: requestID, accountID: accountID)
+        }
+        await claimGate.waitUntilReached()
+        await coordinator.startPendingControl(requestID: requestID, accountID: accountID)
+        await coordinator.receive(envelope, context: .foreground, applicationState: .foreground)
+        XCTAssertEqual(coordinator.manualActionResult, "ALREADY_EXECUTED_OR_IN_PROGRESS")
+        await claimGate.open()
+        await starterGate.waitUntilReached()
+        XCTAssertTrue(coordinator.publicStarterEntered)
+        XCTAssertTrue(coordinator.diagnostic?.systemStartAttempted == true)
+        XCTAssertEqual(coordinator.manualActionResult, "PUBLIC_STARTER_ENTERED")
+        await coordinator.startPendingControl(requestID: requestID, accountID: accountID)
+        await starterGate.open()
+        await firstTap.value
+
+        XCTAssertEqual(starter.numbers, ["+380501234567"])
+        let counts = await api.counts()
+        XCTAssertEqual(counts.receive, 1)
+        XCTAssertEqual(counts.claim, 1)
+        XCTAssertEqual(counts.attempt, 1)
+        XCTAssertEqual(counts.completion, 1)
+        XCTAssertEqual(coordinator.diagnostic?.safeResult, "SYSTEM_START_ACCEPTED")
+    }
+
+    func testLateOlderReceiveCannotOverwriteNewerRequest() async throws {
+        let accountID = UUID(), oldRequestID = UUID(), newRequestID = UUID()
+        let accountStore = try Self.accountStore(accountID: accountID)
+        let oldGate = RemoteCellularTestGate()
+        let oldCreatedAt = Date(timeIntervalSince1970: 1_000)
+        let newCreatedAt = Date(timeIntervalSince1970: 1_001)
+        let api = RemoteCellularOrderedReceiveAPIStub(
+            views: [
+                oldRequestID: Self.view(
+                    requestID: oldRequestID, state: .iPhoneActionRequired,
+                    receiptContext: .foreground, createdAt: oldCreatedAt
+                ),
+                newRequestID: Self.view(
+                    requestID: newRequestID, state: .iPhoneActionRequired,
+                    receiptContext: .foreground, createdAt: newCreatedAt
+                ),
+            ],
+            delayedRequestID: oldRequestID,
+            gate: oldGate
+        )
+        let coordinator = IOSRemoteCellularControlCoordinator(
+            api: api,
+            accountStore: accountStore,
+            starter: RemoteCellularStarterSpy(),
+            lineSelectionStore: Self.lineSelectionStore(),
+            executionModeStore: Self.executionModeStore()
+        )
+        let olderReceive = Task { @MainActor in
+            await coordinator.receive(
+                .init(requestID: oldRequestID, accountID: accountID),
+                context: .foreground,
+                applicationState: .foreground
+            )
+        }
+        await oldGate.waitUntilReached()
+        await coordinator.receive(
+            .init(requestID: newRequestID, accountID: accountID),
+            context: .foreground,
+            applicationState: .foreground
+        )
+        XCTAssertEqual(coordinator.diagnostic?.requestID, newRequestID)
+        await oldGate.open()
+        await olderReceive.value
+
+        XCTAssertEqual(coordinator.diagnostic?.requestID, newRequestID)
+        XCTAssertEqual(
+            coordinator.manualStartAvailability(requestID: oldRequestID, accountID: accountID),
+            .requestReplaced
+        )
+        await coordinator.startPendingControl(requestID: oldRequestID, accountID: accountID)
+        XCTAssertEqual(coordinator.manualActionResult, "REQUEST_REPLACED")
+        XCTAssertEqual(coordinator.diagnostic?.requestID, newRequestID)
+        XCTAssertEqual(
+            coordinator.manualStartAvailability(requestID: newRequestID, accountID: accountID),
+            .ready
+        )
+
+        await coordinator.receive(
+            .init(requestID: oldRequestID, accountID: accountID),
+            context: .foreground,
+            applicationState: .foreground
+        )
+        XCTAssertEqual(coordinator.diagnostic?.requestID, newRequestID)
+        XCTAssertEqual(
+            coordinator.manualStartAvailability(requestID: newRequestID, accountID: accountID),
+            .ready
+        )
+    }
+
+    func testClaimRejectionUnauthorizedAndMissingRequestExposeSafeReasonsWithoutStart() async throws {
+        let accountID = UUID(), requestID = UUID()
+        let accountStore = try Self.accountStore(accountID: accountID)
+        let modeStore = Self.executionModeStore()
+        modeStore.setMode(.systemManagedDiagnostic, for: accountID)
+        let rejectedView = Self.view(requestID: requestID, state: .iPhoneActionRequired, receiptContext: .foreground)
+        let rejectedAPI = RemoteControlAPIStub(
+            view: rejectedView,
+            grant: RemoteCellularControlStartGrant(control: rejectedView, startGranted: false, phoneNumber: nil)
+        )
+        let starter = RemoteCellularStarterSpy(services: [])
+        let coordinator = IOSRemoteCellularControlCoordinator(
+            api: rejectedAPI,
+            accountStore: accountStore,
+            starter: starter,
+            lineSelectionStore: Self.lineSelectionStore(),
+            executionModeStore: modeStore
+        )
+        await coordinator.startPendingControl()
+        XCTAssertEqual(coordinator.manualActionResult, "NO_REQUEST")
+
+        await coordinator.receive(
+            .init(requestID: requestID, accountID: accountID),
+            context: .foreground,
+            applicationState: .foreground
+        )
+        await coordinator.startPendingControl(requestID: requestID, accountID: accountID)
+        XCTAssertEqual(coordinator.manualActionResult, "START_NOT_GRANTED")
+        XCTAssertEqual(coordinator.diagnostic?.state, .failedSafe)
+        XCTAssertTrue(starter.numbers.isEmpty)
+        let rejectedCounts = await rejectedAPI.counts()
+        XCTAssertEqual(rejectedCounts.claim, 1)
+
+        let busyID = UUID()
+        let busyView = Self.view(
+            requestID: busyID, state: .iPhoneActionRequired, receiptContext: .foreground
+        )
+        let busyAPI = RemoteControlAPIStub(
+            view: busyView,
+            grant: RemoteCellularControlStartGrant(control: busyView, startGranted: false, phoneNumber: nil),
+            claimError: AccountAPIError.status(
+                409, AccountAPIErrorResponse(error: "request_busy", retryAt: nil)
+            )
+        )
+        let busyStarter = RemoteCellularStarterSpy(services: [])
+        let busyCoordinator = IOSRemoteCellularControlCoordinator(
+            api: busyAPI,
+            accountStore: accountStore,
+            starter: busyStarter,
+            lineSelectionStore: Self.lineSelectionStore(),
+            executionModeStore: modeStore
+        )
+        await busyCoordinator.receive(
+            .init(requestID: busyID, accountID: accountID),
+            context: .foreground,
+            applicationState: .foreground
+        )
+        await busyCoordinator.startPendingControl(requestID: busyID, accountID: accountID)
+        XCTAssertEqual(busyCoordinator.manualActionResult, "request_busy")
+        XCTAssertEqual(busyCoordinator.diagnostic?.state, .failedSafe)
+        XCTAssertTrue(busyStarter.numbers.isEmpty)
+        let busyCounts = await busyAPI.counts()
+        XCTAssertEqual(busyCounts.claim, 1)
+
+        let unauthorizedID = UUID()
+        let unauthorizedView = Self.view(
+            requestID: unauthorizedID,
+            state: .iPhoneActionRequired,
+            receiptContext: .foreground,
+            sameOwnerAuthorized: false
+        )
+        let unauthorizedAPI = RemoteControlAPIStub(
+            view: unauthorizedView,
+            grant: RemoteCellularControlStartGrant(control: unauthorizedView, startGranted: false, phoneNumber: nil)
+        )
+        let unauthorizedCoordinator = IOSRemoteCellularControlCoordinator(
+            api: unauthorizedAPI,
+            accountStore: accountStore,
+            starter: RemoteCellularStarterSpy(services: []),
+            lineSelectionStore: Self.lineSelectionStore(),
+            executionModeStore: modeStore
+        )
+        await unauthorizedCoordinator.receive(
+            .init(requestID: unauthorizedID, accountID: accountID),
+            context: .foreground,
+            applicationState: .foreground
+        )
+        XCTAssertEqual(
+            unauthorizedCoordinator.manualStartAvailability(requestID: unauthorizedID, accountID: accountID),
+            .unauthorized
+        )
+        await unauthorizedCoordinator.startPendingControl(requestID: unauthorizedID, accountID: accountID)
+        XCTAssertEqual(unauthorizedCoordinator.manualActionResult, "REQUEST_UNAUTHORIZED")
+    }
+
+    func testPendingRequestActionIsVisibleAtTopOnIPhoneSE2WithLargeText() async throws {
+        let accountID = UUID(), requestID = UUID()
+        let accountStore = try Self.accountStore(accountID: accountID)
+        let view = Self.view(requestID: requestID, state: .iPhoneActionRequired, receiptContext: .foreground)
+        let api = RemoteControlAPIStub(
+            view: view,
+            grant: RemoteCellularControlStartGrant(control: view, startGranted: false, phoneNumber: nil)
+        )
+        let coordinator = try Self.configuredCoordinator(
+            api: api,
+            accountStore: accountStore,
+            starter: RemoteCellularStarterSpy()
+        )
+        await coordinator.receive(
+            .init(requestID: requestID, accountID: accountID),
+            context: .foreground,
+            applicationState: .foreground
+        )
+
+        let panel = IOSRemoteCellularPendingRequestPanel(
+            requestID: requestID,
+            accountLabel: coordinator.requestAccountLabel(accountID: accountID),
+            requestMode: coordinator.requestExecutionMode(accountID: accountID),
+            actionResult: coordinator.manualActionResult,
+            availability: coordinator.manualStartAvailability(requestID: requestID, accountID: accountID),
+            isStarting: coordinator.isStarting,
+            onStart: {},
+            onRequestModeOptIn: {}
+        )
+        let root = panel
+            .environment(\.sizeCategory, .accessibilityExtraExtraExtraLarge)
+        let host = UIHostingController(rootView: root)
+        let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 375, height: 667))
+        window.rootViewController = host
+        window.isHidden = false
+        let fittedSize = host.sizeThatFits(in: window.bounds.size)
+        XCTAssertGreaterThan(fittedSize.height, 100)
+        XCTAssertLessThanOrEqual(fittedSize.height, window.bounds.height)
+        host.view.frame = CGRect(origin: .zero, size: CGSize(width: window.bounds.width, height: fittedSize.height))
+        host.view.setNeedsLayout()
+        host.view.layoutIfNeeded()
+        await Task.yield()
+        await Task.yield()
+        host.view.layoutIfNeeded()
+        let renderer = UIGraphicsImageRenderer(bounds: host.view.bounds)
+        let image = renderer.image { context in
+            host.view.layer.render(in: context.cgContext)
+        }
+        XCTAssertEqual(image.size.width, 375)
+        XCTAssertEqual(image.size.height, fittedSize.height, accuracy: 0.5)
+        XCTAssertNotNil(image.pngData())
+        window.isHidden = true
     }
 
     func testPublicStartFailureIsReportedOnceAndNeverAutomaticallyRetried() async throws {
@@ -4818,14 +5208,19 @@ final class RemoteCellularControlTests: XCTestCase {
         requestID: UUID,
         state: RemoteCellularControlState,
         receiptContext: RemoteCellularReceiptContext? = nil,
-        terminalReason: String? = nil
+        terminalReason: String? = nil,
+        expiresAt: Date = Date().addingTimeInterval(120),
+        createdAt: Date = Date(timeIntervalSince1970: 1_000),
+        sameOwnerAuthorized: Bool = true,
+        sourcePlatform: String = "watchOS",
+        targetPlatform: String = "iOS"
     ) -> RemoteCellularControlView {
         RemoteCellularControlView(
             requestID: requestID, state: state,
-            createdAt: Date(timeIntervalSince1970: 1_000),
-            expiresAt: Date().addingTimeInterval(120),
-            deliveryStatus: "submission_accepted", sourcePlatform: "watchOS",
-            targetPlatform: "iOS", sameOwnerAuthorized: true, mutationApplied: true,
+            createdAt: createdAt,
+            expiresAt: expiresAt,
+            deliveryStatus: "submission_accepted", sourcePlatform: sourcePlatform,
+            targetPlatform: targetPlatform, sameOwnerAuthorized: sameOwnerAuthorized, mutationApplied: true,
             terminalReason: terminalReason, receiptContext: receiptContext,
             receivedAt: receiptContext == nil ? nil : Date(),
             startAttemptedAt: nil, startResultAt: nil
@@ -4943,6 +5338,9 @@ private final class RemoteCellularStarterSpy: CellularConversationStarting {
 private actor RemoteControlAPIStub: RemoteCellularControlAPI {
     private var viewValue: RemoteCellularControlView
     private let grantValue: RemoteCellularControlStartGrant
+    private let receiveGate: RemoteCellularTestGate?
+    private let claimGate: RemoteCellularTestGate?
+    private let claimError: Error?
     private var receiveCount = 0
     private var claimCount = 0
     private var attemptCount = 0
@@ -4953,9 +5351,18 @@ private actor RemoteControlAPIStub: RemoteCellularControlAPI {
     private var claimCountsAtStarterInvocation: [Int] = []
     private var receiptContext: RemoteCellularReceiptContext?
 
-    init(view: RemoteCellularControlView, grant: RemoteCellularControlStartGrant) {
+    init(
+        view: RemoteCellularControlView,
+        grant: RemoteCellularControlStartGrant,
+        receiveGate: RemoteCellularTestGate? = nil,
+        claimGate: RemoteCellularTestGate? = nil,
+        claimError: Error? = nil
+    ) {
         viewValue = view
         grantValue = grant
+        self.receiveGate = receiveGate
+        self.claimGate = claimGate
+        self.claimError = claimError
     }
 
     func createRemoteCellularControl(accountID: UUID, requestID: UUID, phoneNumber: String) async throws -> RemoteCellularControlView { viewValue }
@@ -4963,10 +5370,13 @@ private actor RemoteControlAPIStub: RemoteCellularControlAPI {
     func receiveRemoteCellularControl(accountID: UUID, requestID: UUID, mutationID: UUID, context: RemoteCellularReceiptContext) async throws -> RemoteCellularControlView {
         receiveCount += 1
         receiptContext = receiptContext ?? context
+        await receiveGate?.wait()
         return viewValue
     }
     func claimRemoteCellularControlStart(accountID: UUID, requestID: UUID, mutationID: UUID) async throws -> RemoteCellularControlStartGrant {
         claimCount += 1
+        await claimGate?.wait()
+        if let claimError { throw claimError }
         guard claimCount == 1 else {
             return RemoteCellularControlStartGrant(control: viewValue, startGranted: false, phoneNumber: nil)
         }
@@ -5049,5 +5459,93 @@ private actor RemoteControlAPIStub: RemoteCellularControlAPI {
 
     private func resultTerminalReason(_ state: RemoteCellularControlState) -> String? {
         state == .publicStartError ? "public_start_error" : nil
+    }
+}
+
+private actor RemoteCellularTestGate {
+    private var isOpen = false
+    private var isReached = false
+    private var waitContinuation: CheckedContinuation<Void, Never>?
+    private var reachedContinuations: [CheckedContinuation<Void, Never>] = []
+
+    func wait() async {
+        isReached = true
+        let continuations = reachedContinuations
+        reachedContinuations.removeAll()
+        continuations.forEach { $0.resume() }
+        guard !isOpen else { return }
+        await withCheckedContinuation { waitContinuation = $0 }
+    }
+
+    func waitUntilReached() async {
+        if isReached { return }
+        await withCheckedContinuation { reachedContinuations.append($0) }
+    }
+
+    func open() {
+        isOpen = true
+        waitContinuation?.resume()
+        waitContinuation = nil
+    }
+}
+
+private actor RemoteCellularOrderedReceiveAPIStub: RemoteCellularControlAPI {
+    private let views: [UUID: RemoteCellularControlView]
+    private let delayedRequestID: UUID
+    private let gate: RemoteCellularTestGate
+
+    init(views: [UUID: RemoteCellularControlView], delayedRequestID: UUID, gate: RemoteCellularTestGate) {
+        self.views = views
+        self.delayedRequestID = delayedRequestID
+        self.gate = gate
+    }
+
+    func createRemoteCellularControl(accountID: UUID, requestID: UUID, phoneNumber: String) async throws -> RemoteCellularControlView {
+        try view(requestID)
+    }
+
+    func remoteCellularControl(accountID: UUID, requestID: UUID) async throws -> RemoteCellularControlView {
+        try view(requestID)
+    }
+
+    func receiveRemoteCellularControl(
+        accountID: UUID,
+        requestID: UUID,
+        mutationID: UUID,
+        context: RemoteCellularReceiptContext
+    ) async throws -> RemoteCellularControlView {
+        if requestID == delayedRequestID { await gate.wait() }
+        return try view(requestID)
+    }
+
+    func claimRemoteCellularControlStart(accountID: UUID, requestID: UUID, mutationID: UUID) async throws -> RemoteCellularControlStartGrant {
+        let value = try view(requestID)
+        return RemoteCellularControlStartGrant(control: value, startGranted: false, phoneNumber: nil)
+    }
+
+    func markRemoteCellularControlStartAttempted(accountID: UUID, requestID: UUID, mutationID: UUID) async throws -> RemoteCellularControlView {
+        try view(requestID)
+    }
+
+    func completeRemoteCellularControlStart(
+        accountID: UUID,
+        requestID: UUID,
+        mutationID: UUID,
+        result: RemoteCellularStartResult,
+        errorDomain: String?,
+        errorCode: Int?
+    ) async throws -> RemoteCellularControlView {
+        try view(requestID)
+    }
+
+    func cancelRemoteCellularControl(accountID: UUID, requestID: UUID, mutationID: UUID) async throws -> RemoteCellularControlView {
+        try view(requestID)
+    }
+
+    private func view(_ requestID: UUID) throws -> RemoteCellularControlView {
+        guard let value = views[requestID] else {
+            throw NSError(domain: "RemoteCellularOrderedReceiveAPIStub", code: 404)
+        }
+        return value
     }
 }
