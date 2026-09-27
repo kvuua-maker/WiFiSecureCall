@@ -48,7 +48,12 @@ jobs:
             IOS_INFO='/tmp/carrier-probe-derived-data/Build/Products/Debug-iphoneos/WiFi Secure Call.app/Info.plist'
             test -f "$IOS_INFO"
             python3 -c 'import plistlib, sys; modes = plistlib.load(open(sys.argv[1], "rb")).get("UIBackgroundModes", []); assert modes.count("remote-notification") == 1; assert set(modes) == {"audio", "remote-notification", "voip"}' "$IOS_INFO"
-            printf 'IOS_TYPE_CHECK=PASS\nWATCHOS_TYPE_CHECK=PASS\nWATCHOS_10_6_2_COMPATIBLE=PASS\nIOS_REMOTE_NOTIFICATION_BACKGROUND_MODE=PASS\n' > "$OUT/result.txt"
+            python3 -c 'import plistlib, sys; entitlements = plistlib.load(open(sys.argv[1], "rb")); assert entitlements.get("aps-environment") == "production"; assert entitlements.get("com.apple.developer.calling-app") is True; assert entitlements.get("com.apple.developer.dialing-app") is True; assert entitlements.get("com.apple.developer.applesignin") == ["Default"]' iOS/WiFiSecureCall.entitlements
+            RELEASE_SETTINGS="$OUT/ios-release-build-settings.txt"
+            xcodebuild -project WiFiSecureCall.xcodeproj -target WiFiSecureCall -configuration Release -showBuildSettings > "$RELEASE_SETTINGS"
+            grep -Eq '^[[:space:]]*CODE_SIGN_ENTITLEMENTS = iOS/WiFiSecureCall.entitlements$' "$RELEASE_SETTINGS"
+            grep -Eq '^[[:space:]]*PROVISIONING_PROFILE_SPECIFIER = WiFiSecureCallAppStoreD24$' "$RELEASE_SETTINGS"
+            printf 'IOS_TYPE_CHECK=PASS\nWATCHOS_TYPE_CHECK=PASS\nWATCHOS_10_6_2_COMPATIBLE=PASS\nIOS_REMOTE_NOTIFICATION_BACKGROUND_MODE=PASS\nIOS_CALLING_DIALING_ENTITLEMENTS=PASS\n' > "$OUT/result.txt"
       - store_artifacts:
           path: /tmp/carrier-probe-validation/versions.txt
           destination: carrier-probe-validation/versions.txt

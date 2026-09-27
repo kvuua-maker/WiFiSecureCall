@@ -4155,6 +4155,23 @@ final class RemoteCellularControlTests: XCTestCase {
             let source = try String(contentsOf: root.appendingPathComponent(file), encoding: .utf8)
             XCTAssertFalse(source.contains("com.apple.CommCenter.fine-grained"))
         }
+        let iOSEntitlementsData = try Data(contentsOf: root.appendingPathComponent("iOS/WiFiSecureCall.entitlements"))
+        let iOSEntitlements = try XCTUnwrap(
+            PropertyListSerialization.propertyList(from: iOSEntitlementsData, format: nil) as? [String: Any]
+        )
+        XCTAssertEqual(iOSEntitlements["aps-environment"] as? String, "production")
+        XCTAssertEqual(iOSEntitlements["com.apple.developer.calling-app"] as? Bool, true)
+        XCTAssertEqual(iOSEntitlements["com.apple.developer.dialing-app"] as? Bool, true)
+        XCTAssertEqual(iOSEntitlements["com.apple.developer.applesignin"] as? [String], ["Default"])
+        XCTAssertEqual(iOSEntitlements["com.apple.developer.usernotifications.time-sensitive"] as? Bool, true)
+
+        let watchEntitlementsData = try Data(contentsOf: root.appendingPathComponent("Watch/WiFiSecureCallWatch.entitlements"))
+        let watchEntitlements = try XCTUnwrap(
+            PropertyListSerialization.propertyList(from: watchEntitlementsData, format: nil) as? [String: Any]
+        )
+        XCTAssertNil(watchEntitlements["com.apple.developer.calling-app"])
+        XCTAssertNil(watchEntitlements["com.apple.developer.dialing-app"])
+
         let iOSPlistData = try Data(contentsOf: root.appendingPathComponent("iOS/Info.plist"))
         let iOSPlist = try XCTUnwrap(PropertyListSerialization.propertyList(from: iOSPlistData, format: nil) as? [String: Any])
         let iOSModes = iOSPlist["UIBackgroundModes"] as? [String]
@@ -4171,6 +4188,11 @@ final class RemoteCellularControlTests: XCTestCase {
             contentsOf: root.appendingPathComponent("WiFiSecureCall.xcodeproj/project.pbxproj"),
             encoding: .utf8
         )
+        XCTAssertEqual(
+            project.components(separatedBy: "CODE_SIGN_ENTITLEMENTS = iOS/WiFiSecureCall.entitlements;").count - 1,
+            2
+        )
+        XCTAssertTrue(project.contains("PROVISIONING_PROFILE_SPECIFIER = WiFiSecureCallAppStoreD24;"))
         XCTAssertTrue(project.contains(
             "T10000000000000000000001 = {CreatedOnToolsVersion = 26.6; SystemCapabilities = {com.apple.BackgroundModes = {enabled = 1; }; }; };"
         ))
