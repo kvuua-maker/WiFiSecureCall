@@ -3775,6 +3775,42 @@ final class RemoteCellularControlTests: XCTestCase {
         XCTAssertFalse(encoded.contains("e164"))
     }
 
+    func testWatchLiveRequestGateBlocksDoubleTapDifferentRequestAndPreservesInvalidAttempt() {
+        let first = UUID(), second = UUID(), third = UUID()
+        var gate = RemoteCellularLiveRequestGate()
+        XCTAssertTrue(gate.begin(requestID: first))
+        XCTAssertTrue(gate.isLive)
+        XCTAssertTrue(gate.owns(first))
+        XCTAssertFalse(gate.begin(requestID: first), "double tap must not create a second request")
+        XCTAssertFalse(gate.begin(requestID: second), "different destination must not replace a live request")
+        XCTAssertNil(RemoteCellularControlPolicy.normalizedE164("invalid"))
+        XCTAssertTrue(gate.isLive, "invalid second input must not disturb live monitoring")
+        XCTAssertTrue(gate.owns(first))
+
+        gate.finish(requestID: second)
+        XCTAssertTrue(gate.isLive, "a stale terminal response must not finish the current request")
+        gate.finish(requestID: first)
+        XCTAssertFalse(gate.isLive)
+        XCTAssertTrue(gate.begin(requestID: second), "cancelled request permits a new request")
+        gate.finish(requestID: second)
+        XCTAssertTrue(gate.begin(requestID: third), "terminal request permits a new request")
+    }
+
+    func testWatchPollingDeadlineIsBoundedByKnownExpiryPlusGrace() {
+        let started = Date(timeIntervalSince1970: 10_000)
+        let expiry = started.addingTimeInterval(120)
+        XCTAssertEqual(
+            RemoteCellularControlPolicy.watchPollingDeadline(expiresAt: expiry, startedAt: started),
+            expiry.addingTimeInterval(RemoteCellularControlPolicy.watchPollingGrace)
+        )
+        XCTAssertEqual(
+            RemoteCellularControlPolicy.watchPollingDeadline(expiresAt: nil, startedAt: started),
+            started.addingTimeInterval(
+                RemoteCellularControlPolicy.requestTTL + RemoteCellularControlPolicy.watchPollingGrace
+            )
+        )
+    }
+
     func testFlattenedStartGrantMatchesServerAuthorizationContract() throws {
         let requestID = UUID()
         let json = Data("""
@@ -3929,7 +3965,7 @@ final class RemoteCellularControlTests: XCTestCase {
         XCTAssertEqual(firstCounts.attempt, 1)
         XCTAssertEqual(firstCounts.completion, 1)
         let attemptCountsAtPublicCall = await api.starterAttemptObservations()
-        XCTAssertEqual(attemptCountsAtPublicCall, [0])
+        XCTAssertEqual(attemptCountsAtPublicCall, [1])
         let claimCountsAtPublicCall = await api.starterClaimObservations()
         XCTAssertEqual(claimCountsAtPublicCall, [1])
         XCTAssertTrue(coordinator.diagnostic?.startClaimObtained == true)
@@ -4008,6 +4044,192 @@ final class RemoteCellularControlTests: XCTestCase {
         XCTAssertEqual(coordinator.diagnostic?.safeResult, "SYSTEM_START_ACCEPTED")
         XCTAssertTrue(coordinator.publicStarterEntered)
         XCTAssertEqual(coordinator.manualActionResult, "SYSTEM_START_ACCEPTED")
+    }
+
+    func testTerminalManualStatesAreStaticAndOnlyActiveOperationShowsProgress() async throws {
+        XCTAssertTrue(RemoteCellularManualActionAvailability.inProgress.showsProgress)
+        for value in [
+            RemoteCellularManualActionAvailability.completed,
+            .terminalError, .expired, .cancelled, .ready,
+        ] {
+            XCTAssertFalse(value.showsProgress, value.rawValue)
+        }
+
+        let accountID = UUID(), acceptedID = UUID(), errorID = UUID()
+        let store = try Self.accountStore(accountID: accountID)
+        let acceptedView = Self.view(requestID: acceptedID, state: .systemStartAccepted)
+        let acceptedAPI = RemoteControlAPIStub(
+            view: acceptedView,
+            grant: .init(control: acceptedView, startGranted: false, phoneNumber: nil)
+        )
+        let accepted = try Self.configuredCoordinator(
+            api: acceptedAPI, accountStore: store, starter: RemoteCellularStarterSpy()
+        )
+        await accepted.receive(
+            .init(requestID: acceptedID, accountID: accountID),
+            context: .openedFromNotification,
+            applicationState: .foreground
+        )
+        XCTAssertEqual(
+            accepted.manualStartAvailability(requestID: acceptedID, accountID: accountID),
+            .completed
+        )
+        XCTAssertFalse(accepted.isStarting)
+
+        let errorView = Self.view(requestID: errorID, state: .publicStartError)
+        let errorAPI = RemoteControlAPIStub(
+            view: errorView,
+            grant: .init(control: errorView, startGranted: false, phoneNumber: nil)
+        )
+        let failed = try Self.configuredCoordinator(
+            api: errorAPI, accountStore: store, starter: RemoteCellularStarterSpy()
+        )
+        await failed.receive(
+            .init(requestID: errorID, accountID: accountID),
+            context: .openedFromNotification,
+            applicationState: .foreground
+        )
+        XCTAssertEqual(
+            failed.manualStartAvailability(requestID: errorID, accountID: accountID),
+            .terminalError
+        )
+        XCTAssertFalse(failed.isStarting)
+    }
+
+    func testLostClaimResponseFailsSafeWithoutPublicStart() async throws {
+        let accountID = UUID(), requestID = UUID()
+        let store = try Self.accountStore(accountID: accountID)
+        let initial = Self.view(requestID: requestID, state: .iPhoneBackgroundReceived, receiptContext: .background)
+        let grantView = Self.view(requestID: requestID, state: .iPhoneStartAuthorized)
+        let api = RemoteControlAPIStub(
+            view: initial,
+            grant: .init(control: grantView, startGranted: true, phoneNumber: "+380501234567"),
+            loseFirstClaimResponse: true
+        )
+        let starter = RemoteCellularStarterSpy()
+        let coordinator = try Self.configuredCoordinator(
+            api: api, accountStore: store, starter: starter,
+            mutationRetryDelaysNanoseconds: [0, 0, 0]
+        )
+
+        await coordinator.receive(
+            .init(requestID: requestID, accountID: accountID),
+            context: .background,
+            applicationState: .background
+        )
+
+        let counts = await api.counts()
+        XCTAssertEqual(counts.claim, 2)
+        XCTAssertEqual(counts.attempt, 0)
+        XCTAssertEqual(counts.completion, 0)
+        XCTAssertTrue(starter.numbers.isEmpty)
+        XCTAssertEqual(coordinator.diagnostic?.state, .failedSafe)
+        XCTAssertEqual(coordinator.diagnostic?.safeResult, "SERVER_CLAIM_ACK_UNAVAILABLE")
+        let ids = await api.mutationIDs()
+        XCTAssertEqual(Set(ids.claim).count, 1)
+    }
+
+    func testLostAttemptAndCompletionResponsesRetryStableAcknowledgementsWithoutRepeatingPublicStart() async throws {
+        let accountID = UUID(), requestID = UUID()
+        let store = try Self.accountStore(accountID: accountID)
+        let initial = Self.view(requestID: requestID, state: .iPhoneBackgroundReceived, receiptContext: .background)
+        let grantView = Self.view(requestID: requestID, state: .iPhoneStartAuthorized)
+        let api = RemoteControlAPIStub(
+            view: initial,
+            grant: .init(control: grantView, startGranted: true, phoneNumber: "+380501234567"),
+            loseFirstAttemptResponse: true,
+            completionTransportFailures: 1
+        )
+        let starter = RemoteCellularStarterSpy()
+        let coordinator = try Self.configuredCoordinator(
+            api: api, accountStore: store, starter: starter,
+            mutationRetryDelaysNanoseconds: [0, 0, 0]
+        )
+
+        await coordinator.receive(
+            .init(requestID: requestID, accountID: accountID),
+            context: .background,
+            applicationState: .background
+        )
+
+        XCTAssertEqual(starter.numbers.count, 1)
+        XCTAssertEqual(coordinator.diagnostic?.state, .systemStartAccepted)
+        let counts = await api.counts()
+        XCTAssertEqual(counts.attempt, 2)
+        XCTAssertEqual(counts.completion, 2)
+        let ids = await api.mutationIDs()
+        XCTAssertEqual(Set(ids.attempt).count, 1)
+        XCTAssertEqual(Set(ids.completion).count, 1)
+    }
+
+    func testResultAcknowledgementFailureIsHonestAndDuplicatePushCannotRepeatPublicStart() async throws {
+        let accountID = UUID(), requestID = UUID()
+        let store = try Self.accountStore(accountID: accountID)
+        let initial = Self.view(requestID: requestID, state: .iPhoneBackgroundReceived, receiptContext: .background)
+        let grantView = Self.view(requestID: requestID, state: .iPhoneStartAuthorized)
+        let completionGate = RemoteCellularTestGate()
+        let api = RemoteControlAPIStub(
+            view: initial,
+            grant: .init(control: grantView, startGranted: true, phoneNumber: "+380501234567"),
+            completionGate: completionGate,
+            completionTransportFailures: 3
+        )
+        let starter = RemoteCellularStarterSpy()
+        let coordinator = try Self.configuredCoordinator(
+            api: api, accountStore: store, starter: starter,
+            mutationRetryDelaysNanoseconds: [0, 0, 0]
+        )
+        let envelope = RemoteCellularControlPushEnvelope(requestID: requestID, accountID: accountID)
+        let first = Task { @MainActor in
+            await coordinator.receive(envelope, context: .background, applicationState: .background)
+        }
+        await completionGate.waitUntilReached()
+        await coordinator.receive(envelope, context: .background, applicationState: .background)
+        XCTAssertEqual(starter.numbers.count, 1)
+        await completionGate.open()
+        await first.value
+
+        XCTAssertEqual(starter.numbers.count, 1)
+        let counts = await api.counts()
+        XCTAssertEqual(counts.claim, 1)
+        XCTAssertEqual(counts.attempt, 1)
+        XCTAssertEqual(counts.completion, 3)
+        XCTAssertEqual(coordinator.diagnostic?.state, .failedSafe)
+        XCTAssertEqual(
+            coordinator.diagnostic?.safeResult,
+            "SERVER_RESULT_ACK_FAILED_AFTER_PUBLIC_START_SUCCESS"
+        )
+        XCTAssertEqual(coordinator.diagnostic?.publicStartReturnedSuccess, true)
+        let ids = await api.mutationIDs()
+        XCTAssertEqual(Set(ids.completion).count, 1)
+    }
+
+    func testTemporaryExactlyOnceStateIsBoundedAcrossManySequentialRequests() async throws {
+        let accountID = UUID()
+        let store = try Self.accountStore(accountID: accountID)
+        let api = RemoteCellularSequenceAPIStub()
+        let starter = RemoteCellularStarterSpy()
+        let coordinator = try Self.configuredCoordinator(
+            api: api,
+            accountStore: store,
+            starter: starter,
+            mutationRetryDelaysNanoseconds: [0, 0, 0],
+            maximumRetainedRequestStates: 8
+        )
+
+        for _ in 0..<40 {
+            let requestID = UUID()
+            await coordinator.receive(
+                .init(requestID: requestID, accountID: accountID),
+                context: .background,
+                applicationState: .background
+            )
+        }
+
+        XCTAssertEqual(starter.numbers.count, 40)
+        XCTAssertLessThanOrEqual(coordinator.temporaryRequestStateCount, 8)
+        let completionCount = await api.publicStartCompletions()
+        XCTAssertEqual(completionCount, 40)
     }
 
     func testForegroundRequestAccountModeIsExplicitAndRequestScopedOptInDoesNotStartCall() async throws {
@@ -4154,7 +4376,7 @@ final class RemoteCellularControlTests: XCTestCase {
         await claimGate.waitUntilReached()
         await coordinator.startPendingControl(requestID: requestID, accountID: accountID)
         await coordinator.receive(envelope, context: .foreground, applicationState: .foreground)
-        XCTAssertEqual(coordinator.manualActionResult, "ALREADY_EXECUTED_OR_IN_PROGRESS")
+        XCTAssertEqual(coordinator.manualActionResult, "START_IN_PROGRESS")
         await claimGate.open()
         await starterGate.waitUntilReached()
         XCTAssertTrue(coordinator.publicStarterEntered)
@@ -4638,7 +4860,7 @@ final class RemoteCellularControlTests: XCTestCase {
         XCTAssertEqual(counts.attempt, 1)
         XCTAssertEqual(counts.completion, 1)
         let attemptCountsAtPublicCall = await api.starterAttemptObservations()
-        XCTAssertEqual(attemptCountsAtPublicCall, [0])
+        XCTAssertEqual(attemptCountsAtPublicCall, [1])
         let claimCountsAtPublicCall = await api.starterClaimObservations()
         XCTAssertEqual(claimCountsAtPublicCall, [1])
         let labels = Set(Mirror(reflecting: try XCTUnwrap(coordinator.diagnostic)).children.compactMap(\.label))
@@ -5053,12 +5275,17 @@ final class RemoteCellularControlTests: XCTestCase {
         XCTAssertTrue(watchSource.contains("Button(\"Test cellular start on iPhone\")"))
         XCTAssertTrue(watchSource.contains("WatchSystemDialerNumber.appending"))
         XCTAssertTrue(watchSource.contains("WatchSystemDialerNumber.deletingLast"))
+        XCTAssertTrue(watchSource.contains("liveRequestGate.begin"))
+        XCTAssertTrue(watchSource.contains("probe.hasLiveRequest"))
+        XCTAssertTrue(watchSource.contains("watchPollingDeadline"))
+        XCTAssertTrue(watchSource.contains("request_not_found"))
         XCTAssertTrue(watchSource.contains("BACKGROUND_EXECUTION_NOT_OBSERVED"))
         XCTAssertTrue(watchSource.contains("PUBLIC_START_ERROR"))
         XCTAssertTrue(watchSource.contains("SYSTEM_START_ACCEPTED"))
         XCTAssertFalse(watchSource.contains("PUBLIC_START_ERROR_\\(domain)"))
         XCTAssertFalse(watchSource.contains("openSystemURL("))
         XCTAssertFalse(watchSource.contains("tel:"))
+        XCTAssertFalse(watchSource.contains("pollTask?.cancel()\n        state = .validating"))
 
         XCTAssertTrue(iOSSource.contains("Request within TTL now"))
         XCTAssertTrue(iOSSource.contains("App confirmation required"))
@@ -5071,17 +5298,17 @@ final class RemoteCellularControlTests: XCTestCase {
         XCTAssertFalse(iOSSource.contains("SIM picker absent"))
         XCTAssertFalse(iOSSource.contains("CONNECTED"))
 
+        let serverAttemptReport = try XCTUnwrap(
+            iOSSource.range(of: "api.markRemoteCellularControlStartAttempted")
+        )
         let publicStart = try XCTUnwrap(
-            iOSSource.range(of: "try await starter.startCellularConversation(to: transientNumber, using: preparedStart)")
+            iOSSource.range(of: "try await starter.startCellularConversation(to: number, using: preparedStart)")
         )
         let immediateClear = try XCTUnwrap(
-            iOSSource.range(of: "transientNumber.removeAll(keepingCapacity: false)", range: publicStart.upperBound..<iOSSource.endIndex)
+            iOSSource.range(of: "transientNumber?.removeAll(keepingCapacity: false)", range: publicStart.upperBound..<iOSSource.endIndex)
         )
-        let serverAttemptReport = try XCTUnwrap(
-            iOSSource.range(of: "api.markRemoteCellularControlStartAttempted", range: immediateClear.upperBound..<iOSSource.endIndex)
-        )
+        XCTAssertLessThan(serverAttemptReport.lowerBound, publicStart.lowerBound)
         XCTAssertLessThan(publicStart.lowerBound, immediateClear.lowerBound)
-        XCTAssertLessThan(immediateClear.lowerBound, serverAttemptReport.lowerBound)
 
         let voIPDelegate = try XCTUnwrap(notificationSource.range(of: "extension IOSNotificationController: PKPushRegistryDelegate"))
         XCTAssertFalse(notificationSource[voIPDelegate.lowerBound...].contains("remote_cellular_control"))
@@ -5137,6 +5364,64 @@ final class RemoteCellularControlTests: XCTestCase {
         XCTAssertTrue(project.contains(
             "T10000000000000000000002 = {CreatedOnToolsVersion = 26.6; };"
         ))
+
+        let notificationSource = try String(
+            contentsOf: root.appendingPathComponent("iOS/IOSNotificationController.swift"),
+            encoding: .utf8
+        )
+        XCTAssertTrue(notificationSource.contains("private var lastAlertToken: Data?"))
+        XCTAssertTrue(notificationSource.contains("notificationAuthorizationKnown"))
+        XCTAssertTrue(notificationSource.contains("func applicationDidBecomeActive"))
+        XCTAssertTrue(notificationSource.contains("refreshNotificationAuthorization"))
+        XCTAssertTrue(notificationSource.contains("upload(lastAlertToken, pushType: .alert)"))
+        XCTAssertFalse(notificationSource.contains("String(decoding: token"))
+    }
+
+    func testCurrentAlertTokenCanReregisterWhenNotificationAuthorizationChanges() async throws {
+        let accountID = UUID()
+        let store = try Self.accountStore(accountID: accountID)
+        let requests = LockedRequests()
+        AccountURLProtocol.handler = { request in
+            requests.append(request)
+            return (204, AccountAPIErrorResponse(error: "", retryAt: nil))
+        }
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [AccountURLProtocol.self]
+        let session = URLSession(configuration: configuration)
+        let client = AccountAPIClient(
+            config: Self.config,
+            tokenStore: store.tokenStore,
+            session: session,
+            deviceID: UUID(),
+            platform: "iOS"
+        )
+        let coordinator = AccountPushRegistrationCoordinator(
+            store: store,
+            client: client,
+            platform: "iOS",
+            generation: 5
+        )
+        let token = Data([0x01, 0x02, 0x03])
+        await coordinator.update(
+            token: token,
+            pushType: .alert,
+            capabilities: .init(voipPush: true, alertPush: true, notificationsAuthorized: false, microphoneReady: true)
+        )
+        await coordinator.update(
+            token: token,
+            pushType: .alert,
+            capabilities: .init(voipPush: true, alertPush: true, notificationsAuthorized: true, microphoneReady: true)
+        )
+
+        XCTAssertEqual(requests.values.count, 2)
+        let bodies = try requests.values.map {
+            try JSONDecoder.account.decode(
+                AccountDeviceRegistrationRequest.self,
+                from: try XCTUnwrap($0.httpBody)
+            )
+        }
+        XCTAssertEqual(bodies.map(\.token), ["010203", "010203"])
+        XCTAssertEqual(bodies.map(\.capabilities.notificationsAuthorized), [false, true])
     }
 
     func testBackgroundFetchCompletionIsExactlyOnceAndDeadlineIsSubThirtySeconds() {
@@ -5246,7 +5531,9 @@ final class RemoteCellularControlTests: XCTestCase {
     private static func configuredCoordinator(
         api: any RemoteCellularControlAPI,
         accountStore: AccountSessionStore,
-        starter: RemoteCellularStarterSpy
+        starter: RemoteCellularStarterSpy,
+        mutationRetryDelaysNanoseconds: [UInt64] = [0, 100_000_000, 250_000_000],
+        maximumRetainedRequestStates: Int = 64
     ) throws -> IOSRemoteCellularControlCoordinator {
         let suite = "RemoteCellularLineSelectionTests.\(UUID().uuidString)"
         let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
@@ -5259,7 +5546,9 @@ final class RemoteCellularControlTests: XCTestCase {
             accountStore: accountStore,
             starter: starter,
             lineSelectionStore: selectionStore,
-            executionModeStore: Self.executionModeStore()
+            executionModeStore: Self.executionModeStore(),
+            mutationRetryDelaysNanoseconds: mutationRetryDelaysNanoseconds,
+            maximumRetainedRequestStates: maximumRetainedRequestStates
         )
     }
 }
@@ -5340,7 +5629,11 @@ private actor RemoteControlAPIStub: RemoteCellularControlAPI {
     private let grantValue: RemoteCellularControlStartGrant
     private let receiveGate: RemoteCellularTestGate?
     private let claimGate: RemoteCellularTestGate?
+    private let completionGate: RemoteCellularTestGate?
     private let claimError: Error?
+    private let loseFirstClaimResponse: Bool
+    private let loseFirstAttemptResponse: Bool
+    private let completionTransportFailures: Int
     private var receiveCount = 0
     private var claimCount = 0
     private var attemptCount = 0
@@ -5350,19 +5643,30 @@ private actor RemoteControlAPIStub: RemoteCellularControlAPI {
     private var attemptCountsAtStarterInvocation: [Int] = []
     private var claimCountsAtStarterInvocation: [Int] = []
     private var receiptContext: RemoteCellularReceiptContext?
+    private var claimMutationValues: [UUID] = []
+    private var attemptMutationValues: [UUID] = []
+    private var completionMutationValues: [UUID] = []
 
     init(
         view: RemoteCellularControlView,
         grant: RemoteCellularControlStartGrant,
         receiveGate: RemoteCellularTestGate? = nil,
         claimGate: RemoteCellularTestGate? = nil,
-        claimError: Error? = nil
+        completionGate: RemoteCellularTestGate? = nil,
+        claimError: Error? = nil,
+        loseFirstClaimResponse: Bool = false,
+        loseFirstAttemptResponse: Bool = false,
+        completionTransportFailures: Int = 0
     ) {
         viewValue = view
         grantValue = grant
         self.receiveGate = receiveGate
         self.claimGate = claimGate
+        self.completionGate = completionGate
         self.claimError = claimError
+        self.loseFirstClaimResponse = loseFirstClaimResponse
+        self.loseFirstAttemptResponse = loseFirstAttemptResponse
+        self.completionTransportFailures = completionTransportFailures
     }
 
     func createRemoteCellularControl(accountID: UUID, requestID: UUID, phoneNumber: String) async throws -> RemoteCellularControlView { viewValue }
@@ -5375,8 +5679,13 @@ private actor RemoteControlAPIStub: RemoteCellularControlAPI {
     }
     func claimRemoteCellularControlStart(accountID: UUID, requestID: UUID, mutationID: UUID) async throws -> RemoteCellularControlStartGrant {
         claimCount += 1
+        claimMutationValues.append(mutationID)
         await claimGate?.wait()
         if let claimError { throw claimError }
+        if loseFirstClaimResponse && claimCount == 1 {
+            viewValue = grantValue.control
+            throw AccountAPIError.transport(domain: "NSURLErrorDomain", code: -1005)
+        }
         guard claimCount == 1 else {
             return RemoteCellularControlStartGrant(control: viewValue, startGranted: false, phoneNumber: nil)
         }
@@ -5384,11 +5693,15 @@ private actor RemoteControlAPIStub: RemoteCellularControlAPI {
     }
     func markRemoteCellularControlStartAttempted(accountID: UUID, requestID: UUID, mutationID: UUID) async throws -> RemoteCellularControlView {
         attemptCount += 1
+        attemptMutationValues.append(mutationID)
         let background = receiptContext == .background || receiptContext == .inactive
         viewValue = replacing(
             state: background ? .iPhoneBackgroundStartAttempted : .iPhoneForegroundStartAttempted,
             startAttemptedAt: Date()
         )
+        if loseFirstAttemptResponse && attemptCount == 1 {
+            throw AccountAPIError.transport(domain: "NSURLErrorDomain", code: -1005)
+        }
         return viewValue
     }
     func completeRemoteCellularControlStart(
@@ -5400,6 +5713,8 @@ private actor RemoteControlAPIStub: RemoteCellularControlAPI {
         errorCode: Int?
     ) async throws -> RemoteCellularControlView {
         completionCount += 1
+        completionMutationValues.append(mutationID)
+        await completionGate?.wait()
         completionValues.append(result)
         if let errorDomain { completionErrorDomains.append(errorDomain) }
         viewValue = replacing(
@@ -5410,6 +5725,9 @@ private actor RemoteControlAPIStub: RemoteCellularControlAPI {
             safeErrorDomain: errorDomain,
             safeErrorCode: errorCode
         )
+        if completionCount <= completionTransportFailures {
+            throw AccountAPIError.transport(domain: "NSURLErrorDomain", code: -1005)
+        }
         return viewValue
     }
     func cancelRemoteCellularControl(accountID: UUID, requestID: UUID, mutationID: UUID) async throws -> RemoteCellularControlView { viewValue }
@@ -5427,6 +5745,9 @@ private actor RemoteControlAPIStub: RemoteCellularControlAPI {
     }
     func starterAttemptObservations() -> [Int] { attemptCountsAtStarterInvocation }
     func starterClaimObservations() -> [Int] { claimCountsAtStarterInvocation }
+    func mutationIDs() -> (claim: [UUID], attempt: [UUID], completion: [UUID]) {
+        (claimMutationValues, attemptMutationValues, completionMutationValues)
+    }
 
     private func replacing(
         state: RemoteCellularControlState,
@@ -5547,5 +5868,106 @@ private actor RemoteCellularOrderedReceiveAPIStub: RemoteCellularControlAPI {
             throw NSError(domain: "RemoteCellularOrderedReceiveAPIStub", code: 404)
         }
         return value
+    }
+}
+
+private actor RemoteCellularSequenceAPIStub: RemoteCellularControlAPI {
+    private var sequence: TimeInterval = Date().timeIntervalSince1970
+    private var completionCount = 0
+
+    func createRemoteCellularControl(accountID: UUID, requestID: UUID, phoneNumber: String) async throws -> RemoteCellularControlView {
+        view(requestID: requestID, state: .deliveryPending)
+    }
+
+    func remoteCellularControl(accountID: UUID, requestID: UUID) async throws -> RemoteCellularControlView {
+        view(requestID: requestID, state: .deliveryPending)
+    }
+
+    func receiveRemoteCellularControl(
+        accountID: UUID,
+        requestID: UUID,
+        mutationID: UUID,
+        context: RemoteCellularReceiptContext
+    ) async throws -> RemoteCellularControlView {
+        sequence += 1
+        return view(
+            requestID: requestID,
+            state: context == .background || context == .inactive
+                ? .iPhoneBackgroundReceived
+                : .iPhoneActionRequired,
+            receiptContext: context
+        )
+    }
+
+    func claimRemoteCellularControlStart(
+        accountID: UUID,
+        requestID: UUID,
+        mutationID: UUID
+    ) async throws -> RemoteCellularControlStartGrant {
+        RemoteCellularControlStartGrant(
+            control: view(requestID: requestID, state: .iPhoneStartAuthorized),
+            startGranted: true,
+            phoneNumber: "+380501234567"
+        )
+    }
+
+    func markRemoteCellularControlStartAttempted(
+        accountID: UUID,
+        requestID: UUID,
+        mutationID: UUID
+    ) async throws -> RemoteCellularControlView {
+        view(requestID: requestID, state: .iPhoneBackgroundStartAttempted, receiptContext: .background)
+    }
+
+    func completeRemoteCellularControlStart(
+        accountID: UUID,
+        requestID: UUID,
+        mutationID: UUID,
+        result: RemoteCellularStartResult,
+        errorDomain: String?,
+        errorCode: Int?
+    ) async throws -> RemoteCellularControlView {
+        completionCount += 1
+        return view(
+            requestID: requestID,
+            state: result == .accepted ? .systemStartAccepted : .publicStartError,
+            receiptContext: .background
+        )
+    }
+
+    func cancelRemoteCellularControl(
+        accountID: UUID,
+        requestID: UUID,
+        mutationID: UUID
+    ) async throws -> RemoteCellularControlView {
+        view(requestID: requestID, state: .cancelled)
+    }
+
+    func publicStartCompletions() -> Int { completionCount }
+
+    private func view(
+        requestID: UUID,
+        state: RemoteCellularControlState,
+        receiptContext: RemoteCellularReceiptContext? = nil
+    ) -> RemoteCellularControlView {
+        let createdAt = Date(timeIntervalSince1970: sequence)
+        return RemoteCellularControlView(
+            requestID: requestID,
+            state: state,
+            createdAt: createdAt,
+            expiresAt: createdAt.addingTimeInterval(10_000),
+            deliveryStatus: "submission_accepted",
+            sourcePlatform: "watchOS",
+            targetPlatform: "iOS",
+            sameOwnerAuthorized: true,
+            mutationApplied: true,
+            receiptContext: receiptContext,
+            receivedAt: receiptContext == nil ? nil : createdAt,
+            startAttemptedAt: state == .iPhoneBackgroundStartAttempted ? createdAt : nil,
+            startResultAt: state == .systemStartAccepted || state == .publicStartError ? createdAt : nil,
+            startResult: state == .systemStartAccepted ? .accepted : (state == .publicStartError ? .error : nil),
+            safeErrorDomain: state == .publicStartError ? "PublicCellularAPI" : nil,
+            safeErrorCode: state == .publicStartError ? 1 : nil
+        )
     }
 }

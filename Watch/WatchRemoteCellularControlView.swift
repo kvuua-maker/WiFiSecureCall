@@ -3,6 +3,8 @@ import SwiftUI
 
 @MainActor
 final class WatchRemoteCellularControlProbe: ObservableObject {
+    static let shared = WatchRemoteCellularControlProbe()
+
     enum SafeState: String, Equatable {
         case idle = "IDLE"
         case validating = "VALIDATING"
@@ -29,12 +31,14 @@ final class WatchRemoteCellularControlProbe: ObservableObject {
     @Published private(set) var iPhoneReceived = false
     @Published private(set) var startAttempted = false
     @Published private(set) var safeResult = "NOT_STARTED"
+    @Published private(set) var submissionResult = "READY"
 
     private let api: any RemoteCellularControlAPI
     private let accountStore: AccountSessionStore
     private var pollTask: Task<Void, Never>?
     private var cancelMutationID: UUID?
     private var controlAccountID: UUID?
+    private var liveRequestGate = RemoteCellularLiveRequestGate()
 
     convenience init() {
         let runtime = NotificationRuntime.shared
@@ -56,22 +60,39 @@ final class WatchRemoteCellularControlProbe: ObservableObject {
         }
     }
 
-    func submit(transientE164 value: String) async {
-        pollTask?.cancel()
-        state = .validating
+    var hasLiveRequest: Bool { liveRequestGate.isLive }
+
+    @discardableResult
+    func submit(transientE164 value: String) async -> Bool {
         guard let number = RemoteCellularControlPolicy.normalizedE164(value) else {
-            state = .failedSafe
-            safeResult = "INVALID_E164"
-            return
+            submissionResult = liveRequestGate.isLive
+                ? "INVALID_E164_EXISTING_REQUEST_PRESERVED"
+                : "INVALID_E164"
+            if !liveRequestGate.isLive {
+                state = .failedSafe
+                safeResult = "INVALID_E164"
+            }
+            return false
         }
         guard let accountID = accountStore.activeAccountID,
               accountStore.callableAccounts.contains(where: { $0.accountID == accountID }) else {
-            state = .failedSafe
-            safeResult = "ACCOUNT_SESSION_REQUIRED"
-            return
+            submissionResult = liveRequestGate.isLive
+                ? "ACCOUNT_SESSION_REQUIRED_EXISTING_REQUEST_PRESERVED"
+                : "ACCOUNT_SESSION_REQUIRED"
+            if !liveRequestGate.isLive {
+                state = .failedSafe
+                safeResult = "ACCOUNT_SESSION_REQUIRED"
+            }
+            return false
         }
 
         let controlID = UUID()
+        guard liveRequestGate.begin(requestID: controlID) else {
+            submissionResult = "LIVE_REQUEST_MUST_CANCEL_OR_FINISH"
+            return false
+        }
+        pollTask?.cancel()
+        pollTask = nil
         requestID = controlID
         controlAccountID = accountID
         cancelMutationID = UUID()
@@ -80,6 +101,7 @@ final class WatchRemoteCellularControlProbe: ObservableObject {
         startAttempted = false
         state = .requesting
         safeResult = "REQUESTING"
+        submissionResult = "REQUEST_ACCEPTED_LOCALLY"
         do {
             let result = try await api.createRemoteCellularControl(
                 accountID: accountID,
@@ -87,11 +109,23 @@ final class WatchRemoteCellularControlProbe: ObservableObject {
                 phoneNumber: number
             )
             apply(result)
-            beginPolling(accountID: accountID, requestID: controlID)
+            if liveRequestGate.isLive {
+                beginPolling(accountID: accountID, requestID: controlID, expiresAt: result.expiresAt)
+            }
         } catch {
-            state = .failedSafe
-            safeResult = Self.safeError(error)
+            if Self.isAmbiguousTransport(error) {
+                state = .iPhoneDeliveryPending
+                safeResult = "CREATE_RESPONSE_AMBIGUOUS_RECONCILING"
+                let localExpiry = Date().addingTimeInterval(RemoteCellularControlPolicy.requestTTL)
+                expiresAt = localExpiry
+                beginPolling(accountID: accountID, requestID: controlID, expiresAt: localExpiry)
+            } else {
+                state = .failedSafe
+                safeResult = Self.safeError(error)
+                finishLiveRequest(controlID)
+            }
         }
+        return true
     }
 
     func cancel() async {
@@ -115,17 +149,30 @@ final class WatchRemoteCellularControlProbe: ObservableObject {
         pollTask = nil
     }
 
-    private func beginPolling(accountID: UUID, requestID: UUID) {
+    private func beginPolling(accountID: UUID, requestID: UUID, expiresAt: Date?) {
         pollTask?.cancel()
+        let deadline = RemoteCellularControlPolicy.watchPollingDeadline(expiresAt: expiresAt, startedAt: Date())
         pollTask = Task { [weak self] in
             while !Task.isCancelled {
-                do { try await Task.sleep(nanoseconds: 1_000_000_000) } catch { return }
                 guard let self else { return }
+                if Date() >= deadline {
+                    self.finishPollingDeadline(requestID: requestID)
+                    return
+                }
+                do { try await Task.sleep(nanoseconds: 1_000_000_000) } catch { return }
+                guard Date() < deadline else {
+                    self.finishPollingDeadline(requestID: requestID)
+                    return
+                }
                 do {
                     let value = try await self.api.remoteCellularControl(accountID: accountID, requestID: requestID)
                     self.apply(value)
                     if Self.isTerminal(value.state) { return }
                 } catch {
+                    if Self.isRequestNotFound(error), Date() >= (self.expiresAt ?? deadline) {
+                        self.finishPollingDeadline(requestID: requestID)
+                        return
+                    }
                     self.safeResult = Self.safeError(error)
                 }
             }
@@ -133,6 +180,7 @@ final class WatchRemoteCellularControlProbe: ObservableObject {
     }
 
     private func apply(_ value: RemoteCellularControlView) {
+        guard liveRequestGate.owns(value.requestID), requestID == value.requestID else { return }
         expiresAt = value.expiresAt
         deliveryStatus = (value.deliveryStatus ?? "unknown").uppercased()
         iPhoneReceived = iPhoneReceived || value.receivedAt != nil
@@ -177,6 +225,27 @@ final class WatchRemoteCellularControlProbe: ObservableObject {
             state = .failedSafe
             safeResult = "FAILED_SAFE"
         }
+        if Self.isTerminal(value.state) {
+            finishLiveRequest(value.requestID)
+        }
+    }
+
+    private func finishPollingDeadline(requestID: UUID) {
+        guard liveRequestGate.owns(requestID) else { return }
+        if deliveryStatus == "SUBMISSION_ACCEPTED" && !iPhoneReceived {
+            state = .backgroundExecutionNotObserved
+            safeResult = "BACKGROUND_EXECUTION_NOT_OBSERVED"
+        } else {
+            state = .expired
+            safeResult = "EXPIRED_WITHOUT_TERMINAL_RESPONSE"
+        }
+        finishLiveRequest(requestID)
+    }
+
+    private func finishLiveRequest(_ requestID: UUID) {
+        liveRequestGate.finish(requestID: requestID)
+        pollTask?.cancel()
+        pollTask = nil
     }
 
     private static func isTerminal(_ value: RemoteCellularControlState) -> Bool {
@@ -196,11 +265,23 @@ final class WatchRemoteCellularControlProbe: ObservableObject {
         if case let AccountAPIError.transport(domain, code) = error { return "TRANSPORT_\(domain)_\(code)" }
         return "FAILED_SAFE"
     }
+
+    private static func isAmbiguousTransport(_ error: Error) -> Bool {
+        if case AccountAPIError.transport = error { return true }
+        return false
+    }
+
+    private static func isRequestNotFound(_ error: Error) -> Bool {
+        if case let AccountAPIError.status(status, response) = error {
+            return status == 404 && response?.error == "request_not_found"
+        }
+        return false
+    }
 }
 
 struct WatchRemoteCellularControlView: View {
     @Environment(\.dismiss) private var dismiss
-    @StateObject private var probe = WatchRemoteCellularControlProbe()
+    @StateObject private var probe = WatchRemoteCellularControlProbe.shared
     @State private var e164 = ""
     private let columns = Array(repeating: GridItem(.flexible(), spacing: 3), count: 3)
     private let digits: [Character] = ["1", "2", "3", "4", "5", "6", "7", "8", "9"]
@@ -251,10 +332,13 @@ struct WatchRemoteCellularControlView: View {
             }
             Button("Test cellular start on iPhone") {
                 let transientNumber = e164
-                e164.removeAll(keepingCapacity: false)
-                Task { await probe.submit(transientE164: transientNumber) }
+                Task {
+                    if await probe.submit(transientE164: transientNumber) {
+                        e164.removeAll(keepingCapacity: false)
+                    }
+                }
             }
-            .disabled(probe.state == .requesting || e164.isEmpty)
+            .disabled(probe.hasLiveRequest || e164.isEmpty)
             Text("Source-line mode is configured locally on iPhone. SYSTEM_START_ACCEPTED means API acceptance only—not a connected call, hidden SIM picker, or Watch audio.")
                 .font(.caption2)
                 .foregroundStyle(.secondary)
@@ -264,6 +348,7 @@ struct WatchRemoteCellularControlView: View {
             line("iPhone received", probe.iPhoneReceived ? "YES" : "NO")
             line("Start attempted", probe.startAttempted ? "YES" : "NO")
             line("Result", probe.safeResult)
+            line("Submit", probe.submissionResult)
             if probe.canCancel {
                 Button("Cancel pending request", role: .destructive) { Task { await probe.cancel() } }
             }
@@ -272,7 +357,6 @@ struct WatchRemoteCellularControlView: View {
         .navigationTitle("Remote cellular probe")
         .onDisappear {
             e164.removeAll(keepingCapacity: false)
-            probe.stop()
         }
     }
 

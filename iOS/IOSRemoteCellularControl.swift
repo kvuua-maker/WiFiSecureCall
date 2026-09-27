@@ -35,6 +35,9 @@ enum RemoteCellularLocalError: String, Error {
     case selectedLineUnavailable = "SELECTED_CELLULAR_SERVICE_UNAVAILABLE"
     case ambiguousLine = "AMBIGUOUS_CELLULAR_SERVICE_ID"
     case startModeMismatch = "CELLULAR_START_MODE_MISMATCH"
+    case claimAcknowledgementUnavailable = "SERVER_CLAIM_ACK_UNAVAILABLE"
+    case startAttemptAcknowledgementUnavailable = "SERVER_START_ATTEMPT_ACK_UNAVAILABLE"
+    case resultAcknowledgementUnavailable = "SERVER_RESULT_ACK_UNAVAILABLE"
 }
 
 struct RemoteCellularServiceOption: Identifiable, Equatable, Sendable {
@@ -72,10 +75,23 @@ enum RemoteCellularManualActionAvailability: String, Equatable, Sendable {
     case unauthorized = "REQUEST_UNAUTHORIZED"
     case expired = "REQUEST_EXPIRED"
     case notAwaitingAction = "REQUEST_NOT_AWAITING_IPHONE_ACTION"
-    case alreadyExecutingOrConsumed = "ALREADY_EXECUTED_OR_IN_PROGRESS"
+    case inProgress = "START_IN_PROGRESS"
+    case completed = "START_COMPLETED"
+    case terminalError = "START_TERMINAL_ERROR"
+    case cancelled = "REQUEST_CANCELLED"
     case anotherRequestInProgress = "ANOTHER_REQUEST_IN_PROGRESS"
 
     var allowsStart: Bool { self == .ready }
+    var showsProgress: Bool { self == .inProgress }
+}
+
+private struct RemoteCellularMutationState {
+    var claimID: UUID? = nil
+    var startAttemptID: UUID? = nil
+    var completionID: UUID? = nil
+    var consumed = false
+    var lastTouched: Date
+    var retainUntil: Date
 }
 
 @MainActor
@@ -229,15 +245,16 @@ final class IOSRemoteCellularControlCoordinator: ObservableObject {
     private let starter: any CellularConversationStarting
     private let lineSelectionStore: RemoteCellularLineSelectionStore
     private let executionModeStore: RemoteCellularExecutionModeStore
-    private var claimMutationIDs: [UUID: UUID] = [:]
-    private var startAttemptMutationIDs: [UUID: UUID] = [:]
-    private var completionMutationIDs: [UUID: UUID] = [:]
-    private var locallyConsumed: Set<UUID> = []
+    private var mutationStates: [RemoteCellularRequestKey: RemoteCellularMutationState] = [:]
     private var displayedRequestKey: RemoteCellularRequestKey?
     private var displayedRequestCreatedAt: Date?
     private var activeStartKey: RemoteCellularRequestKey?
     private var receiveGeneration: UInt64 = 0
     private var latestReceiveGenerationByKey: [RemoteCellularRequestKey: UInt64] = [:]
+    private let mutationRetryDelaysNanoseconds: [UInt64]
+    private let maximumRetainedRequestStates: Int
+
+    var temporaryRequestStateCount: Int { mutationStates.count + latestReceiveGenerationByKey.count }
 
     convenience private init() {
         let runtime = NotificationRuntime.shared
@@ -255,13 +272,17 @@ final class IOSRemoteCellularControlCoordinator: ObservableObject {
         accountStore: AccountSessionStore,
         starter: any CellularConversationStarting,
         lineSelectionStore: RemoteCellularLineSelectionStore = RemoteCellularLineSelectionStore(),
-        executionModeStore: RemoteCellularExecutionModeStore = RemoteCellularExecutionModeStore()
+        executionModeStore: RemoteCellularExecutionModeStore = RemoteCellularExecutionModeStore(),
+        mutationRetryDelaysNanoseconds: [UInt64] = [0, 100_000_000, 250_000_000],
+        maximumRetainedRequestStates: Int = 64
     ) {
         self.api = api
         self.accountStore = accountStore
         self.starter = starter
         self.lineSelectionStore = lineSelectionStore
         self.executionModeStore = executionModeStore
+        self.mutationRetryDelaysNanoseconds = mutationRetryDelaysNanoseconds.isEmpty ? [0] : mutationRetryDelaysNanoseconds
+        self.maximumRetainedRequestStates = max(8, maximumRetainedRequestStates)
         executionMode = accountStore.activeAccountID.map(executionModeStore.mode(for:)) ?? .strictExplicitSIM
     }
 
@@ -346,10 +367,21 @@ final class IOSRemoteCellularControlCoordinator: ObservableObject {
               current.accountID == accountID else { return .requestReplaced }
         guard current.sameOwnerAuthorized,
               accountStore.accounts.contains(where: { $0.accountID == accountID }) else { return .unauthorized }
-        guard current.expiresAt.map({ $0 > now }) == true else { return .expired }
-        if activeStartKey == key || locallyConsumed.contains(requestID) {
-            return .alreadyExecutingOrConsumed
+        switch current.state {
+        case .systemStartAccepted:
+            return .completed
+        case .publicStartError, .failedSafe:
+            return .terminalError
+        case .cancelled:
+            return .cancelled
+        case .expired:
+            return .expired
+        default:
+            break
         }
+        guard current.expiresAt.map({ $0 > now }) == true else { return .expired }
+        if activeStartKey == key { return .inProgress }
+        if isLocallyConsumed(key) { return .terminalError }
         if activeStartKey != nil { return .anotherRequestInProgress }
         guard current.state == .iPhoneActionRequired,
               current.appConfirmationRequired else { return .notAwaitingAction }
@@ -435,10 +467,20 @@ final class IOSRemoteCellularControlCoordinator: ObservableObject {
     ) async {
         let key = RemoteCellularRequestKey(requestID: envelope.requestID, accountID: envelope.accountID)
         let automaticBackgroundAttempt = context == .background || context == .inactive
+        pruneTemporaryState()
 
-        if activeStartKey == key || locallyConsumed.contains(envelope.requestID) {
+        if activeStartKey == key || isLocallyConsumed(key) {
             if displayedRequestKey == key {
-                manualActionResult = RemoteCellularManualActionAvailability.alreadyExecutingOrConsumed.rawValue
+                if activeStartKey == key {
+                    manualActionResult = RemoteCellularManualActionAvailability.inProgress.rawValue
+                } else if let diagnostic,
+                          diagnostic.state == .systemStartAccepted || diagnostic.state == .publicStartError ||
+                            diagnostic.state == .cancelled || diagnostic.state == .expired ||
+                            diagnostic.state == .failedSafe {
+                    manualActionResult = diagnostic.safeResult
+                } else {
+                    manualActionResult = RemoteCellularManualActionAvailability.terminalError.rawValue
+                }
             }
             presentationRequested = !automaticBackgroundAttempt
             return
@@ -559,14 +601,14 @@ final class IOSRemoteCellularControlCoordinator: ObservableObject {
         guard activeStartKey == nil else {
             if displayedRequestKey == key {
                 manualActionResult = activeStartKey == key
-                    ? RemoteCellularManualActionAvailability.alreadyExecutingOrConsumed.rawValue
+                    ? RemoteCellularManualActionAvailability.inProgress.rawValue
                     : RemoteCellularManualActionAvailability.anotherRequestInProgress.rawValue
             }
             return
         }
-        guard !locallyConsumed.contains(current.requestID) else {
+        guard !isLocallyConsumed(key) else {
             if displayedRequestKey == key {
-                manualActionResult = RemoteCellularManualActionAvailability.alreadyExecutingOrConsumed.rawValue
+                manualActionResult = RemoteCellularManualActionAvailability.terminalError.rawValue
             }
             return
         }
@@ -614,7 +656,7 @@ final class IOSRemoteCellularControlCoordinator: ObservableObject {
 
         isStarting = true
         activeStartKey = key
-        locallyConsumed.insert(current.requestID)
+        markLocallyConsumed(key, expiresAt: current.expiresAt)
         if displayedRequestKey == key {
             explicitCellularServicePassed = false
             systemManagedPublicStartUsed = false
@@ -623,27 +665,33 @@ final class IOSRemoteCellularControlCoordinator: ObservableObject {
         defer {
             if activeStartKey == key { activeStartKey = nil }
             isStarting = activeStartKey != nil
+            pruneTemporaryState()
         }
-        let claimID = claimMutationIDs[current.requestID] ?? UUID()
-        claimMutationIDs[current.requestID] = claimID
 
+        let claimID = mutationID(for: .claim, key: key, expiresAt: current.expiresAt)
+        var transientNumber: String?
         do {
-            var grant = try await api.claimRemoteCellularControlStart(
-                accountID: current.accountID,
-                requestID: current.requestID,
-                mutationID: claimID
-            )
+            var grant = try await retryingAcknowledgement {
+                try await self.api.claimRemoteCellularControlStart(
+                    accountID: current.accountID,
+                    requestID: current.requestID,
+                    mutationID: claimID
+                )
+            }
+            if grant.state == .iPhoneStartAuthorized && !grant.startGranted {
+                throw RemoteCellularLocalError.claimAcknowledgementUnavailable
+            }
             guard grant.requestID == current.requestID,
                   grant.expiresAt > Date(),
                   grant.sameOwnerAuthorized,
                   grant.sourcePlatform == "watchOS",
                   grant.targetPlatform == "iOS",
-                  grant.startGranted, var transientNumber = grant.phoneNumber,
-                  RemoteCellularControlPolicy.normalizedE164(transientNumber) != nil else {
+                  grant.startGranted, let grantedNumber = grant.phoneNumber,
+                  RemoteCellularControlPolicy.normalizedE164(grantedNumber) != nil else {
                 throw RemoteCellularLocalError.startNotGranted
             }
+            transientNumber = grantedNumber
             grant.phoneNumber = nil
-            defer { transientNumber.removeAll(keepingCapacity: false) }
             setVisibleDiagnostic(Self.replacingDiagnostic(
                 current,
                 state: .iPhoneStartAuthorized,
@@ -653,57 +701,111 @@ final class IOSRemoteCellularControlCoordinator: ObservableObject {
                 publicStartReturnedSuccess: nil,
                 safeResult: "IPHONE_START_AUTHORIZED"
             ), for: key, manualResult: "START_CLAIM_OBTAINED")
+        } catch {
+            transientNumber?.removeAll(keepingCapacity: false)
+            transientNumber = nil
+            updateClaimFailure(Self.safeError(error), current: current, key: key)
+            return
+        }
 
-            let publicStartError: Error?
-            do {
-                if displayedRequestKey == key {
-                    explicitCellularServicePassed = modeSnapshot == .strictExplicitSIM
-                    systemManagedPublicStartUsed = modeSnapshot == .systemManagedDiagnostic
-                    publicStarterEntered = true
-                    setVisibleDiagnostic(Self.replacingDiagnostic(
-                        current,
-                        state: Self.attemptedState(for: current.receiptContext),
-                        appConfirmationRequired: false,
-                        startClaimObtained: true,
-                        systemStartAttempted: true,
-                        publicStartReturnedSuccess: nil,
-                        safeResult: "PUBLIC_STARTER_ENTERED"
-                    ), for: key, manualResult: "PUBLIC_STARTER_ENTERED")
-                }
-                try await starter.startCellularConversation(to: transientNumber, using: preparedStart)
-                publicStartError = nil
-            } catch {
-                publicStartError = error
+        let attemptID = mutationID(for: .startAttempt, key: key, expiresAt: current.expiresAt)
+        do {
+            let attemptedView = try await retryingAcknowledgement {
+                try await self.api.markRemoteCellularControlStartAttempted(
+                    accountID: current.accountID,
+                    requestID: current.requestID,
+                    mutationID: attemptID
+                )
             }
-            transientNumber.removeAll(keepingCapacity: false)
-
-            let attemptID = startAttemptMutationIDs[current.requestID] ?? UUID()
-            startAttemptMutationIDs[current.requestID] = attemptID
-            let attemptedView = try? await api.markRemoteCellularControlStartAttempted(
-                accountID: current.accountID,
-                requestID: current.requestID,
-                mutationID: attemptID
-            )
+            guard attemptedView.requestID == current.requestID,
+                  attemptedView.sameOwnerAuthorized,
+                  attemptedView.state == Self.attemptedState(for: current.receiptContext) else {
+                throw RemoteCellularLocalError.startAttemptAcknowledgementUnavailable
+            }
             setVisibleDiagnostic(Self.replacingDiagnostic(
                 current,
-                state: attemptedView?.state ?? Self.attemptedState(for: current.receiptContext),
+                state: attemptedView.state,
+                appConfirmationRequired: false,
+                startClaimObtained: true,
+                systemStartAttempted: false,
+                publicStartReturnedSuccess: nil,
+                safeResult: "SERVER_START_ATTEMPT_ACKNOWLEDGED"
+            ), for: key, manualResult: "SERVER_START_ATTEMPT_ACKNOWLEDGED")
+        } catch {
+            transientNumber?.removeAll(keepingCapacity: false)
+            transientNumber = nil
+            updateAcknowledgementFailure(
+                Self.safeError(error),
+                current: current,
+                key: key,
+                startClaimObtained: true,
+                systemStartAttempted: false,
+                publicStartReturnedSuccess: nil
+            )
+            return
+        }
+
+        guard var number = transientNumber else {
+            updateAcknowledgementFailure(
+                RemoteCellularLocalError.claimAcknowledgementUnavailable.rawValue,
+                current: current,
+                key: key,
+                startClaimObtained: true,
+                systemStartAttempted: false,
+                publicStartReturnedSuccess: nil
+            )
+            return
+        }
+        if displayedRequestKey == key {
+            explicitCellularServicePassed = modeSnapshot == .strictExplicitSIM
+            systemManagedPublicStartUsed = modeSnapshot == .systemManagedDiagnostic
+            publicStarterEntered = true
+            setVisibleDiagnostic(Self.replacingDiagnostic(
+                current,
+                state: Self.attemptedState(for: current.receiptContext),
                 appConfirmationRequired: false,
                 startClaimObtained: true,
                 systemStartAttempted: true,
                 publicStartReturnedSuccess: nil,
-                safeResult: Self.attemptedResult(for: current.receiptContext)
-            ), for: key, manualResult: Self.attemptedResult(for: current.receiptContext))
-            if publicStartError == nil {
-                let completionID = completionMutationIDs[current.requestID] ?? UUID()
-                completionMutationIDs[current.requestID] = completionID
-                _ = try? await api.completeRemoteCellularControlStart(
+                safeResult: "PUBLIC_STARTER_ENTERED"
+            ), for: key, manualResult: "PUBLIC_STARTER_ENTERED")
+        }
+
+        let publicStartError: Error?
+        do {
+            try await starter.startCellularConversation(to: number, using: preparedStart)
+            publicStartError = nil
+        } catch {
+            publicStartError = error
+        }
+        number.removeAll(keepingCapacity: false)
+        transientNumber?.removeAll(keepingCapacity: false)
+        transientNumber = nil
+
+        let completionID = mutationID(for: .completion, key: key, expiresAt: current.expiresAt)
+        let result: RemoteCellularStartResult = publicStartError == nil ? .accepted : .error
+        let metadata = publicStartError.map(Self.safePublicStartError)
+        do {
+            if displayedRequestKey == key {
+                manualActionResult = "SERVER_RESULT_ACK_PENDING"
+            }
+            let completedView = try await retryingAcknowledgement {
+                try await self.api.completeRemoteCellularControlStart(
                     accountID: current.accountID,
                     requestID: current.requestID,
                     mutationID: completionID,
-                    result: .accepted,
-                    errorDomain: nil,
-                    errorCode: nil
+                    result: result,
+                    errorDomain: metadata?.domain,
+                    errorCode: metadata?.code
                 )
+            }
+            let expectedState: RemoteCellularControlState = result == .accepted ? .systemStartAccepted : .publicStartError
+            guard completedView.requestID == current.requestID,
+                  completedView.sameOwnerAuthorized,
+                  completedView.state == expectedState else {
+                throw RemoteCellularLocalError.resultAcknowledgementUnavailable
+            }
+            if result == .accepted {
                 setVisibleDiagnostic(Self.replacingDiagnostic(
                     current,
                     state: .systemStartAccepted, receiptContext: current.receiptContext,
@@ -711,18 +813,7 @@ final class IOSRemoteCellularControlCoordinator: ObservableObject {
                     startClaimObtained: true, systemStartAttempted: true,
                     publicStartReturnedSuccess: true, safeResult: "SYSTEM_START_ACCEPTED"
                 ), for: key, manualResult: "SYSTEM_START_ACCEPTED")
-            } else if let publicStartError {
-                let metadata = Self.safePublicStartError(publicStartError)
-                let completionID = completionMutationIDs[current.requestID] ?? UUID()
-                completionMutationIDs[current.requestID] = completionID
-                _ = try? await api.completeRemoteCellularControlStart(
-                    accountID: current.accountID,
-                    requestID: current.requestID,
-                    mutationID: completionID,
-                    result: .error,
-                    errorDomain: metadata.domain,
-                    errorCode: metadata.code
-                )
+            } else if let metadata {
                 setVisibleDiagnostic(Self.replacingDiagnostic(
                     current,
                     state: .publicStartError,
@@ -732,7 +823,15 @@ final class IOSRemoteCellularControlCoordinator: ObservableObject {
                 ), for: key, manualResult: metadata.classification)
             }
         } catch {
-            updateClaimFailure(Self.safeError(error), current: current, key: key)
+            let suffix = result == .accepted ? "SUCCESS" : "ERROR"
+            updateAcknowledgementFailure(
+                "SERVER_RESULT_ACK_FAILED_AFTER_PUBLIC_START_\(suffix)",
+                current: current,
+                key: key,
+                startClaimObtained: true,
+                systemStartAttempted: true,
+                publicStartReturnedSuccess: result == .accepted
+            )
         }
     }
 
@@ -774,6 +873,133 @@ final class IOSRemoteCellularControlCoordinator: ObservableObject {
             safeResult: result
         )
         setVisibleDiagnostic(value, for: key, manualResult: result)
+    }
+
+    private func updateAcknowledgementFailure(
+        _ result: String,
+        current: RemoteCellularControlDiagnostic,
+        key: RemoteCellularRequestKey,
+        startClaimObtained: Bool,
+        systemStartAttempted: Bool,
+        publicStartReturnedSuccess: Bool?
+    ) {
+        let value = Self.replacingDiagnostic(
+            current,
+            state: .failedSafe,
+            appConfirmationRequired: false,
+            startClaimObtained: startClaimObtained,
+            systemStartAttempted: systemStartAttempted,
+            publicStartReturnedSuccess: publicStartReturnedSuccess,
+            safeResult: result
+        )
+        setVisibleDiagnostic(value, for: key, manualResult: result)
+    }
+
+    private enum MutationKind { case claim, startAttempt, completion }
+
+    private func mutationID(
+        for kind: MutationKind,
+        key: RemoteCellularRequestKey,
+        expiresAt: Date?
+    ) -> UUID {
+        pruneTemporaryState()
+        let now = Date()
+        let retainUntil = max(expiresAt ?? now.addingTimeInterval(RemoteCellularControlPolicy.requestTTL), now)
+            .addingTimeInterval(60)
+        var state = mutationStates[key] ?? RemoteCellularMutationState(
+            lastTouched: now,
+            retainUntil: retainUntil
+        )
+        let value: UUID
+        switch kind {
+        case .claim:
+            value = state.claimID ?? UUID()
+            state.claimID = value
+        case .startAttempt:
+            value = state.startAttemptID ?? UUID()
+            state.startAttemptID = value
+        case .completion:
+            value = state.completionID ?? UUID()
+            state.completionID = value
+        }
+        state.lastTouched = now
+        state.retainUntil = max(state.retainUntil, retainUntil)
+        mutationStates[key] = state
+        pruneTemporaryState()
+        return value
+    }
+
+    private func markLocallyConsumed(_ key: RemoteCellularRequestKey, expiresAt: Date?) {
+        let now = Date()
+        let retainUntil = max(expiresAt ?? now.addingTimeInterval(RemoteCellularControlPolicy.requestTTL), now)
+            .addingTimeInterval(60)
+        var state = mutationStates[key] ?? RemoteCellularMutationState(
+            lastTouched: now,
+            retainUntil: retainUntil
+        )
+        state.consumed = true
+        state.lastTouched = now
+        state.retainUntil = max(state.retainUntil, retainUntil)
+        mutationStates[key] = state
+        pruneTemporaryState()
+    }
+
+    private func isLocallyConsumed(_ key: RemoteCellularRequestKey) -> Bool {
+        mutationStates[key]?.consumed == true
+    }
+
+    private func pruneTemporaryState(now: Date = Date()) {
+        mutationStates = mutationStates.filter { key, value in
+            key == activeStartKey || value.retainUntil > now
+        }
+        guard mutationStates.count > maximumRetainedRequestStates else { return }
+        let removable = mutationStates
+            .filter { $0.key != activeStartKey && $0.key != displayedRequestKey }
+            .sorted { $0.value.lastTouched < $1.value.lastTouched }
+        var excess = mutationStates.count - maximumRetainedRequestStates
+        for entry in removable where excess > 0 {
+            mutationStates.removeValue(forKey: entry.key)
+            excess -= 1
+        }
+        if excess > 0 {
+            let remaining = mutationStates
+                .filter { $0.key != activeStartKey }
+                .sorted { $0.value.lastTouched < $1.value.lastTouched }
+            for entry in remaining where excess > 0 {
+                mutationStates.removeValue(forKey: entry.key)
+                excess -= 1
+            }
+        }
+    }
+
+    private func retryingAcknowledgement<Value>(
+        _ operation: () async throws -> Value
+    ) async throws -> Value {
+        var lastError: Error?
+        for index in mutationRetryDelaysNanoseconds.indices {
+            do {
+                return try await operation()
+            } catch {
+                lastError = error
+                guard Self.isRetryableAcknowledgementError(error),
+                      index + 1 < mutationRetryDelaysNanoseconds.count else {
+                    throw error
+                }
+                let delay = mutationRetryDelaysNanoseconds[index + 1]
+                if delay > 0 {
+                    try await Task.sleep(nanoseconds: delay)
+                } else {
+                    await Task.yield()
+                }
+            }
+        }
+        throw lastError ?? RemoteCellularLocalError.resultAcknowledgementUnavailable
+    }
+
+    private static func isRetryableAcknowledgementError(_ error: Error) -> Bool {
+        if case AccountAPIError.transport = error { return true }
+        if case let AccountAPIError.status(status, _) = error { return status >= 500 && status <= 599 }
+        return false
     }
 
     private func expireVisibleRequest(_ current: RemoteCellularControlDiagnostic) {
@@ -976,9 +1202,19 @@ struct IOSRemoteCellularPendingRequestPanel: View {
                 Button("Запустити виклик НА ЦЬОМУ iPhone", action: onStart)
                     .buttonStyle(.borderedProminent)
                     .accessibilityIdentifier("remoteCellular.pendingStartButton")
-            } else if isStarting || availability == .alreadyExecutingOrConsumed {
-                ProgressView("Виклик уже виконується або виконаний")
+            } else if availability.showsProgress && isStarting {
+                ProgressView("Виконується одноразовий запуск")
                     .accessibilityIdentifier("remoteCellular.pendingStartProgress")
+            } else if availability == .completed {
+                Text("Публічний API прийняв запуск. Це не підтверджує з’єднання оператора.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .accessibilityIdentifier("remoteCellular.pendingStartCompleted")
+            } else if availability == .terminalError || availability == .expired || availability == .cancelled {
+                Text("Запит завершено: \(actionResult)")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .accessibilityIdentifier("remoteCellular.pendingStartTerminal")
             }
 
             if availability.allowsStart && requestMode == .strictExplicitSIM {

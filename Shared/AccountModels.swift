@@ -462,12 +462,40 @@ struct RemoteCellularControlPushEnvelope: Equatable, Sendable {
 
 enum RemoteCellularControlPolicy {
     static let requestTTL: TimeInterval = 120
+    static let watchPollingGrace: TimeInterval = 10
     static let backgroundFetchCompletionDeadlineNanoseconds: UInt64 = 20_000_000_000
 
     static func normalizedE164(_ value: String) -> String? {
         guard value == value.trimmingCharacters(in: .whitespacesAndNewlines),
               value.range(of: #"^\+[1-9][0-9]{7,14}$"#, options: .regularExpression) != nil else { return nil }
         return value
+    }
+
+    static func watchPollingDeadline(expiresAt: Date?, startedAt: Date) -> Date {
+        (expiresAt ?? startedAt.addingTimeInterval(requestTTL)).addingTimeInterval(watchPollingGrace)
+    }
+}
+
+/// Process-local guard for the Watch diagnostic. It intentionally retains no
+/// destination number and prevents a second server request while one is live.
+struct RemoteCellularLiveRequestGate: Equatable, Sendable {
+    private(set) var requestID: UUID?
+    private(set) var isLive = false
+
+    mutating func begin(requestID: UUID) -> Bool {
+        guard !isLive else { return false }
+        self.requestID = requestID
+        isLive = true
+        return true
+    }
+
+    mutating func finish(requestID: UUID) {
+        guard self.requestID == requestID else { return }
+        isLive = false
+    }
+
+    func owns(_ requestID: UUID) -> Bool {
+        self.requestID == requestID
     }
 }
 
