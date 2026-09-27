@@ -26,6 +26,37 @@ jobs:
             test "$IOS_SDK" = "27.0"
             test "$WATCH_SDK" = "27.0"
       - run:
+          name: Verify SDK 27 cellular-service and default-role public surface
+          command: |
+            set -euo pipefail
+            OUT=/tmp/carrier-probe-validation
+            IOS_SDK_ROOT="$(xcrun --sdk iphoneos --show-sdk-path)"
+            LCK_INTERFACE="$IOS_SDK_ROOT/System/Library/Frameworks/LiveCommunicationKit.framework/Modules/LiveCommunicationKit.swiftmodule/arm64e-apple-ios.swiftinterface"
+            UIAPPLICATION_HEADER="$IOS_SDK_ROOT/System/Library/Frameworks/UIKit.framework/Headers/UIApplication.h"
+            REPORT="$OUT/sdk27-cellular-services-role-surface.txt"
+            test -f "$LCK_INTERFACE"
+            test -f "$UIAPPLICATION_HEADER"
+            grep -Fq 'public static let sharedInstance: LiveCommunicationKit.TelephonyConversationManager' "$LCK_INTERFACE"
+            grep -Fq 'final public var cellularServices: [LiveCommunicationKit.CellularService]' "$LCK_INTERFACE"
+            grep -Fq 'public init(_ handle: LiveCommunicationKit.Handle, cellularService: LiveCommunicationKit.CellularService? = nil)' "$LCK_INTERFACE"
+            grep -Fq 'UIApplicationCategoryWebBrowser = 1' "$UIAPPLICATION_HEADER"
+            CATEGORY_BLOCK="$(sed -n '/typedef NS_ENUM(NSInteger, UIApplicationCategory) {/,/NS_SWIFT_NAME(UIApplication.Category);/p' "$UIAPPLICATION_HEADER")"
+            test "$(printf '%s\n' "$CATEGORY_BLOCK" | grep -Ec '^[[:space:]]*UIApplicationCategory[A-Za-z]+[[:space:]]*=')" -eq 1
+            if printf '%s\n' "$CATEGORY_BLOCK" | grep -Eq 'Calling|Dialer|Phone'; then
+              echo UNEXPECTED_PUBLIC_CALLING_ROLE_CATEGORY >&2
+              exit 1
+            fi
+            {
+              echo 'XCODE=27.0 (27A266a)'
+              echo 'IOS_SDK=27.0'
+              echo 'TELEPHONY_MANAGER=sharedInstance; synchronous read-only cellularServices getter'
+              echo 'CELLULAR_SERVICE=id,label'
+              echo 'START_ACTION=handle plus optional cellularService'
+              echo 'UIAPPLICATION_CATEGORY=webBrowser only'
+              echo 'CALLING_DIALER_ROLE_CHECK=UNKNOWN_PUBLIC_API_NOT_EXPOSED'
+              echo 'ASYNC_CATALOG_UPDATE_CHANNEL=NOT_DECLARED_IN_PUBLIC_MANAGER_SURFACE'
+            } > "$REPORT"
+      - run:
           name: iOS and watchOS public-API compile validation
           command: |
             set -euo pipefail
@@ -53,13 +84,16 @@ jobs:
             xcodebuild -project WiFiSecureCall.xcodeproj -target WiFiSecureCall -configuration Release -showBuildSettings > "$RELEASE_SETTINGS"
             grep -Eq '^[[:space:]]*CODE_SIGN_ENTITLEMENTS = iOS/WiFiSecureCall.entitlements$' "$RELEASE_SETTINGS"
             grep -Eq '^[[:space:]]*PROVISIONING_PROFILE_SPECIFIER = WiFiSecureCallAppStoreD24$' "$RELEASE_SETTINGS"
-            printf 'IOS_TYPE_CHECK=PASS\nWATCHOS_TYPE_CHECK=PASS\nWATCHOS_10_6_2_COMPATIBLE=PASS\nIOS_REMOTE_NOTIFICATION_BACKGROUND_MODE=PASS\nIOS_CALLING_DIALING_ENTITLEMENTS=PASS\n' > "$OUT/result.txt"
+            printf 'IOS_TYPE_CHECK=PASS\nWATCHOS_TYPE_CHECK=PASS\nWATCHOS_10_6_2_COMPATIBLE=PASS\nIOS_REMOTE_NOTIFICATION_BACKGROUND_MODE=PASS\nIOS_CALLING_DIALING_ENTITLEMENTS=PASS\nSDK27_CELLULAR_SERVICES_SURFACE=PASS\nSDK27_CALLING_ROLE_CHECK=UNKNOWN_PUBLIC_API_NOT_EXPOSED\n' > "$OUT/result.txt"
       - store_artifacts:
           path: /tmp/carrier-probe-validation/versions.txt
           destination: carrier-probe-validation/versions.txt
       - store_artifacts:
           path: /tmp/carrier-probe-validation/result.txt
           destination: carrier-probe-validation/result.txt
+      - store_artifacts:
+          path: /tmp/carrier-probe-validation/sdk27-cellular-services-role-surface.txt
+          destination: carrier-probe-validation/sdk27-cellular-services-role-surface.txt
 
 workflows:
   sdk27-carrier-probe-validation:

@@ -40,6 +40,19 @@ struct RemoteCellularServiceOption: Identifiable, Equatable, Sendable {
     let label: String
 }
 
+enum RemoteCellularServiceCatalogState: String, Equatable, Sendable {
+    case notChecked = "NOT_CHECKED"
+    case loading = "LOADING"
+    case emptyWithUnknownCause = "EMPTY_WITH_UNKNOWN_CAUSE"
+    case available = "AVAILABLE"
+    case unsupported = "UNSUPPORTED"
+    case error = "ERROR"
+}
+
+enum RemoteCellularDefaultCallingRoleStatus: String, Equatable, Sendable {
+    case unknownPublicAPINotExposed = "UNKNOWN_PUBLIC_API_NOT_EXPOSED"
+}
+
 @MainActor
 struct RemoteCellularPreparedService {
     let id: UUID
@@ -129,6 +142,14 @@ final class IOSRemoteCellularControlCoordinator: ObservableObject {
     @Published private(set) var selectedCellularServiceLabel: String?
     @Published private(set) var cellularLineSelectionState = "OWNER_LINE_MAPPING_REQUIRED"
     @Published private(set) var explicitCellularServicePassed = false
+    @Published private(set) var cellularServiceCatalogState: RemoteCellularServiceCatalogState = .notChecked
+    @Published private(set) var cellularServiceCatalogCount = 0
+    @Published private(set) var cellularServiceCatalogReadAt: Date?
+    @Published private(set) var storedCellularServiceIDPresent = false
+    @Published private(set) var storedCellularServiceIDMatchesCatalog: Bool?
+
+    let cellularServiceCatalogReadMethod = "SYNCHRONOUS_PUBLIC_GETTER"
+    let defaultCallingRoleStatus: RemoteCellularDefaultCallingRoleStatus = .unknownPublicAPINotExposed
 
     private let api: any RemoteCellularControlAPI
     private let accountStore: AccountSessionStore
@@ -162,23 +183,31 @@ final class IOSRemoteCellularControlCoordinator: ObservableObject {
     }
 
     func refreshCellularLines() {
-        guard let accountID = accountStore.activeAccountID else {
-            availableCellularServices = []
-            selectedCellularServiceID = nil
-            selectedCellularServiceLabel = nil
-            cellularLineSelectionState = "ACCOUNT_SESSION_REQUIRED"
-            return
-        }
+        cellularServiceCatalogState = .loading
+        cellularServiceCatalogCount = 0
+        cellularServiceCatalogReadAt = nil
+        availableCellularServices = []
+        resetSelectionDiagnostics(for: accountStore.activeAccountID)
         do {
             let services = try starter.availableCellularServices()
             availableCellularServices = services
-            applyStoredSelection(accountID: accountID, services: services)
+            cellularServiceCatalogCount = services.count
+            cellularServiceCatalogReadAt = Date()
+            cellularServiceCatalogState = services.isEmpty ? .emptyWithUnknownCause : .available
+            applyStoredSelection(accountID: accountStore.activeAccountID, services: services)
         } catch {
             availableCellularServices = []
-            selectedCellularServiceID = lineSelectionStore.selectedServiceID(for: accountID)
-            selectedCellularServiceLabel = nil
-            cellularLineSelectionState = Self.safeError(error)
+            cellularServiceCatalogCount = 0
+            cellularServiceCatalogReadAt = Date()
+            cellularServiceCatalogState = error as? RemoteCellularLocalError == .unsupportedOS
+                ? .unsupported
+                : .error
+            applyCatalogFailure(error, accountID: accountStore.activeAccountID)
         }
+    }
+
+    func activeAccountDidChange() {
+        refreshCellularLines()
     }
 
     func selectCellularLine(_ serviceID: UUID) {
@@ -198,25 +227,55 @@ final class IOSRemoteCellularControlCoordinator: ObservableObject {
         lineSelectionStore.setSelectedServiceID(serviceID, for: accountID)
         selectedCellularServiceID = serviceID
         selectedCellularServiceLabel = selected.label
+        storedCellularServiceIDPresent = true
+        storedCellularServiceIDMatchesCatalog = true
         cellularLineSelectionState = "EXPLICIT_CELLULAR_SERVICE_SELECTED"
     }
 
-    private func applyStoredSelection(accountID: UUID, services: [RemoteCellularServiceOption]) {
+    private func resetSelectionDiagnostics(for accountID: UUID?) {
+        let storedID = accountID.flatMap(lineSelectionStore.selectedServiceID(for:))
+        selectedCellularServiceID = storedID
+        selectedCellularServiceLabel = nil
+        storedCellularServiceIDPresent = storedID != nil
+        storedCellularServiceIDMatchesCatalog = nil
+        cellularLineSelectionState = accountID == nil ? "ACCOUNT_SESSION_REQUIRED" : "LOADING"
+    }
+
+    private func applyCatalogFailure(_ error: Error, accountID: UUID?) {
+        resetSelectionDiagnostics(for: accountID)
+        guard accountID != nil else { return }
+        cellularLineSelectionState = Self.safeError(error)
+    }
+
+    private func applyStoredSelection(accountID: UUID?, services: [RemoteCellularServiceOption]) {
+        guard let accountID else {
+            selectedCellularServiceID = nil
+            selectedCellularServiceLabel = nil
+            storedCellularServiceIDPresent = false
+            storedCellularServiceIDMatchesCatalog = nil
+            cellularLineSelectionState = "ACCOUNT_SESSION_REQUIRED"
+            return
+        }
         guard let storedID = lineSelectionStore.selectedServiceID(for: accountID) else {
             selectedCellularServiceID = nil
             selectedCellularServiceLabel = nil
+            storedCellularServiceIDPresent = false
+            storedCellularServiceIDMatchesCatalog = nil
             cellularLineSelectionState = services.isEmpty
-                ? "CELLULAR_SERVICE_LIST_EMPTY"
+                ? RemoteCellularServiceCatalogState.emptyWithUnknownCause.rawValue
                 : "OWNER_LINE_MAPPING_REQUIRED"
             return
         }
         selectedCellularServiceID = storedID
+        storedCellularServiceIDPresent = true
         let matches = services.filter { $0.id == storedID }
         if matches.count == 1, let selected = matches.first {
             selectedCellularServiceLabel = selected.label
+            storedCellularServiceIDMatchesCatalog = true
             cellularLineSelectionState = "EXPLICIT_CELLULAR_SERVICE_SELECTED"
         } else {
             selectedCellularServiceLabel = nil
+            storedCellularServiceIDMatchesCatalog = false
             cellularLineSelectionState = matches.isEmpty
                 ? "SELECTED_CELLULAR_SERVICE_UNAVAILABLE"
                 : "AMBIGUOUS_CELLULAR_SERVICE_ID"
@@ -320,6 +379,8 @@ final class IOSRemoteCellularControlCoordinator: ObservableObject {
             preparedService = try starter.prepareCellularService(id: selectedID)
             selectedCellularServiceID = preparedService.id
             selectedCellularServiceLabel = preparedService.label
+            storedCellularServiceIDPresent = true
+            storedCellularServiceIDMatchesCatalog = true
             cellularLineSelectionState = "EXPLICIT_CELLULAR_SERVICE_SELECTED"
         } catch {
             explicitCellularServicePassed = false
@@ -558,13 +619,24 @@ final class IOSRemoteCellularControlCoordinator: ObservableObject {
 
 struct IOSRemoteCellularControlView: View {
     @Environment(\.dismiss) private var dismiss
-    @ObservedObject var coordinator = IOSRemoteCellularControlCoordinator.shared
+    @ObservedObject var coordinator: IOSRemoteCellularControlCoordinator
+    @ObservedObject private var accountStore: AccountSessionStore
+
+    init(
+        coordinator: IOSRemoteCellularControlCoordinator = .shared,
+        accountStore: AccountSessionStore = NotificationRuntime.shared.accountStore
+    ) {
+        self.coordinator = coordinator
+        _accountStore = ObservedObject(wrappedValue: accountStore)
+    }
 
     var body: some View {
         NavigationView {
             List {
                 Section("Outgoing cellular line") {
-                    if coordinator.availableCellularServices.isEmpty {
+                    if coordinator.cellularServiceCatalogState == .loading {
+                        ProgressView("Reading public cellular services")
+                    } else if coordinator.availableCellularServices.isEmpty {
                         Text("No public cellular services currently listed")
                             .font(.caption)
                             .foregroundStyle(.secondary)
@@ -588,6 +660,16 @@ struct IOSRemoteCellularControlView: View {
                             }
                         }
                     }
+                    line("Catalog state", coordinator.cellularServiceCatalogState.rawValue)
+                    line("Public role check", coordinator.defaultCallingRoleStatus.rawValue)
+                    line("Catalog read method", coordinator.cellularServiceCatalogReadMethod)
+                    line("Catalog read at", coordinator.cellularServiceCatalogReadAt.map(Self.timestamp) ?? "none")
+                    line("Cellular services returned", String(coordinator.cellularServiceCatalogCount))
+                    line("Stored service ID", coordinator.storedCellularServiceIDPresent ? "PRESENT" : "NONE")
+                    line(
+                        "Stored ID matches current list",
+                        coordinator.storedCellularServiceIDMatchesCatalog.map { $0 ? "YES" : "NO" } ?? "UNKNOWN"
+                    )
                     line("Line selection", coordinator.cellularLineSelectionState)
                     line("Selected line", coordinator.selectedCellularServiceLabel ?? "none")
                     line(
@@ -622,11 +704,16 @@ struct IOSRemoteCellularControlView: View {
             .navigationTitle("Remote cellular probe")
             .toolbar { ToolbarItem(placement: .cancellationAction) { Button("Close") { dismiss() } } }
             .onAppear { coordinator.refreshCellularLines() }
+            .onChange(of: accountStore.activeAccountID) { _ in coordinator.activeAccountDidChange() }
         }
     }
 
     private static func shortID(_ id: UUID) -> String {
         String(id.uuidString.lowercased().prefix(8))
+    }
+
+    private static func timestamp(_ date: Date) -> String {
+        ISO8601DateFormatter().string(from: date)
     }
 
     private func line(_ title: String, _ value: String) -> some View {

@@ -44,3 +44,51 @@ Offline inspection of the byte-verified signed Build44 iPhone and Watch bundles 
 ## Result
 
 `NO_PUBLIC_PATH_FOUND`: no public SDK 27 API or legitimately requestable entitlement found that lets an ordinary third-party app provision Wi-Fi Calling on iCloud-connected/companion devices for an existing mobile subscription. Missing public observability is reported as `UNKNOWN_PUBLIC_API_NOT_EXPOSED`, never as `NO`.
+
+## Build48 `cellularServices` empty-list review
+
+Evidence checked against Xcode 27.0 (27A266a), iOS SDK 27.0 exported interfaces and Apple's public documentation:
+
+- `$SDKROOT/System/Library/Frameworks/LiveCommunicationKit.framework/Modules/LiveCommunicationKit.swiftmodule/arm64e-apple-ios.swiftinterface`
+- `$SDKROOT/System/Library/Frameworks/UIKit.framework/Headers/UIApplication.h`
+
+```swift
+final class TelephonyConversationManager: Sendable {
+    static let sharedInstance: TelephonyConversationManager
+    final var cellularServices: [CellularService] { get }
+    final func startCellularConversation(_ action: StartCellularConversationAction) async throws
+}
+
+struct CellularService: Identifiable, Codable, Hashable, Sendable {
+    let id: UUID
+    let label: String
+}
+
+init(_ handle: Handle, cellularService: CellularService? = nil)
+```
+
+The exported `TelephonyConversationManager` surface has no public initializer, refresh/request-access method, delegate, notification, publisher, or asynchronous service-catalog accessor. The app's use of `sharedInstance` and a synchronous read of the read-only `cellularServices` getter therefore matches the public lifecycle contract. The diagnostic performs one bounded getter read per explicit refresh; it does not poll or wait for an undocumented update.
+
+Apple documents that access to the cellular-service accounts requires the app to be the default calling app. Apple separately documents the dialing-app entitlement as required for `TelephonyConversationManager` and `StartCellularConversationAction`, and distinguishes the default calling role from the default dialer role. The public SDK does not expose a calling/dialer category through `UIApplication.isDefault(_:)`: the SDK 27 `UIApplication.Category` public surface lists only `webBrowser`. Consequently the current calling/dialer role cannot be measured by this app and remains `UNKNOWN_PUBLIC_API_NOT_EXPOSED`; an empty getter result is not converted to `NOT_DEFAULT`, `PERMISSION_DENIED`, or `NO_SIM`.
+
+Apple also documents EU account/device conditions for testing default-dialer behavior. That is a prerequisite to consider, not proof of the cause of this specific physical empty result.
+
+Answers to the focused review questions:
+
+- Required role/rights: default calling role for service-account access; dialing-app entitlement for the manager/action. The public contract distinguishes calling and dialer.
+- Public role check: none for calling or dialer in SDK 27; `UIApplication.isDefault(_:)` cannot legitimately be called with a fabricated category.
+- Population/update contract: synchronous read-only array; no public asynchronous initial-population or update channel is declared.
+- Current manager lifecycle: correct use of the public shared singleton and current returned `CellularService` objects.
+- Additional public getter setup missing in source: none documented. The signed Build48 app already contains calling-app, dialing-app, Apple Sign In, and production APNs entitlements.
+
+Root cause of the physical empty list: **UNKNOWN**. Confirmed source defect repaired in the diagnostic: catalog acquisition had been incorrectly gated on an app account even though the system catalog is independent of app account identity. Catalog acquisition is now independent, while the selected UUID remains account-scoped and is reapplied on account changes. Empty, available, unsupported, and error results are reported separately with read time, method, actual count, and stored-ID match state. This is a functional isolation repair plus targeted evidence collection; it does not claim that the physical SIM list is restored.
+
+Build48 signed-byte recheck: IPA SHA-256 `06a36796136f76d89a52cf50ac45b173332626e217efc3c83c1ff56bd164642e`; effective iPhone entitlements contain `com.apple.developer.calling-app = true`, `com.apple.developer.dialing-app = true`, `com.apple.developer.applesignin = [Default]`, and production APNs. `UIBackgroundModes` remains `audio`, `remote-notification`, and `voip`.
+
+Public references:
+
+- <https://developer.apple.com/documentation/livecommunicationkit/telephonyconversationmanager/cellularservices>
+- <https://developer.apple.com/documentation/livecommunicationkit/telephonyconversationmanager>
+- <https://developer.apple.com/documentation/livecommunicationkit/preparing-your-app-to-be-the-default-dialer-app>
+- <https://developer.apple.com/documentation/uikit/uiapplication/isdefault(_:)>
+- <https://developer.apple.com/documentation/uikit/uiapplication/category>

@@ -4143,6 +4143,124 @@ final class RemoteCellularControlTests: XCTestCase {
         XCTAssertFalse(persisted.joined().contains("+380"))
     }
 
+    func testCellularServiceCatalogReportsLoadingThenEmptyWithUnknownCause() throws {
+        let accountID = UUID()
+        let accountStore = try Self.accountStore(accountID: accountID)
+        let starter = RemoteCellularStarterSpy(services: [])
+        let coordinator = IOSRemoteCellularControlCoordinator(
+            api: Self.unusedRemoteControlAPI(),
+            accountStore: accountStore,
+            starter: starter,
+            lineSelectionStore: Self.lineSelectionStore()
+        )
+        var stateObservedInsidePublicGetter: RemoteCellularServiceCatalogState?
+        starter.beforeAvailableServices = {
+            stateObservedInsidePublicGetter = coordinator.cellularServiceCatalogState
+        }
+
+        coordinator.refreshCellularLines()
+
+        XCTAssertEqual(stateObservedInsidePublicGetter, .loading)
+        XCTAssertEqual(coordinator.cellularServiceCatalogState, .emptyWithUnknownCause)
+        XCTAssertEqual(coordinator.cellularServiceCatalogCount, 0)
+        XCTAssertNotNil(coordinator.cellularServiceCatalogReadAt)
+        XCTAssertEqual(coordinator.cellularServiceCatalogReadMethod, "SYNCHRONOUS_PUBLIC_GETTER")
+        XCTAssertEqual(coordinator.defaultCallingRoleStatus, .unknownPublicAPINotExposed)
+        XCTAssertEqual(coordinator.cellularLineSelectionState, "EMPTY_WITH_UNKNOWN_CAUSE")
+        XCTAssertEqual(starter.availableServicesReadCount, 1)
+    }
+
+    func testCellularServiceCatalogReadIsIndependentFromAppAccount() throws {
+        let suite = "RemoteCellularNoAccountCatalog.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defaults.removePersistentDomain(forName: suite)
+        let accountStore = AccountSessionStore(tokenStore: InMemorySecureTokenStore(), defaults: defaults)
+        let service = RemoteCellularServiceOption(id: UUID(), label: "System line")
+        let starter = RemoteCellularStarterSpy(services: [service])
+        let coordinator = IOSRemoteCellularControlCoordinator(
+            api: Self.unusedRemoteControlAPI(),
+            accountStore: accountStore,
+            starter: starter,
+            lineSelectionStore: Self.lineSelectionStore()
+        )
+
+        coordinator.refreshCellularLines()
+
+        XCTAssertEqual(coordinator.cellularServiceCatalogState, .available)
+        XCTAssertEqual(coordinator.cellularServiceCatalogCount, 1)
+        XCTAssertEqual(coordinator.availableCellularServices, [service])
+        XCTAssertEqual(coordinator.cellularLineSelectionState, "ACCOUNT_SESSION_REQUIRED")
+        XCTAssertNil(coordinator.selectedCellularServiceID)
+        XCTAssertEqual(starter.availableServicesReadCount, 1)
+    }
+
+    func testCellularServiceCatalogErrorDoesNotBecomeRoleDenialOrNoSIM() throws {
+        let accountID = UUID()
+        let accountStore = try Self.accountStore(accountID: accountID)
+        let starter = RemoteCellularStarterSpy(
+            services: [],
+            availableServicesError: NSError(domain: "PublicCellularCatalog", code: 9)
+        )
+        let coordinator = IOSRemoteCellularControlCoordinator(
+            api: Self.unusedRemoteControlAPI(),
+            accountStore: accountStore,
+            starter: starter,
+            lineSelectionStore: Self.lineSelectionStore()
+        )
+
+        coordinator.refreshCellularLines()
+
+        XCTAssertEqual(coordinator.cellularServiceCatalogState, .error)
+        XCTAssertEqual(coordinator.defaultCallingRoleStatus, .unknownPublicAPINotExposed)
+        XCTAssertEqual(coordinator.cellularLineSelectionState, "FAILED_SAFE")
+        XCTAssertFalse(coordinator.cellularLineSelectionState.contains("NO_SIM"))
+        XCTAssertFalse(coordinator.cellularLineSelectionState.contains("NOT_DEFAULT"))
+        XCTAssertEqual(starter.availableServicesReadCount, 1)
+    }
+
+    func testAccountChangeReappliesOnlyThatAccountsStoredServiceAgainstCurrentCatalog() throws {
+        let firstAccount = UUID(), secondAccount = UUID()
+        let firstService = RemoteCellularServiceOption(id: UUID(), label: "First owner line")
+        let secondService = RemoteCellularServiceOption(id: UUID(), label: "Second owner line")
+        let accountStore = try Self.accountStore(accountID: firstAccount)
+        try accountStore.addLinkedAccount(
+            accountID: secondAccount,
+            userID: UUID(),
+            phoneNumber: nil,
+            displayLabel: "Second account",
+            tokens: AccountTokens(
+                accessToken: "second-access", accessExpiresAt: .distantFuture,
+                refreshToken: "second-refresh", refreshExpiresAt: .distantFuture
+            )
+        )
+        let selection = Self.lineSelectionStore()
+        selection.setSelectedServiceID(firstService.id, for: firstAccount)
+        selection.setSelectedServiceID(secondService.id, for: secondAccount)
+        let starter = RemoteCellularStarterSpy(services: [secondService, firstService])
+        let coordinator = IOSRemoteCellularControlCoordinator(
+            api: Self.unusedRemoteControlAPI(),
+            accountStore: accountStore,
+            starter: starter,
+            lineSelectionStore: selection
+        )
+
+        coordinator.refreshCellularLines()
+        XCTAssertEqual(coordinator.selectedCellularServiceID, secondService.id)
+
+        accountStore.switchAccount(to: firstAccount)
+        coordinator.activeAccountDidChange()
+        XCTAssertEqual(coordinator.selectedCellularServiceID, firstService.id)
+        XCTAssertEqual(coordinator.selectedCellularServiceLabel, firstService.label)
+        XCTAssertEqual(coordinator.storedCellularServiceIDMatchesCatalog, true)
+
+        starter.services = [secondService]
+        coordinator.refreshCellularLines()
+        XCTAssertEqual(coordinator.selectedCellularServiceID, firstService.id)
+        XCTAssertNil(coordinator.selectedCellularServiceLabel)
+        XCTAssertEqual(coordinator.storedCellularServiceIDMatchesCatalog, false)
+        XCTAssertEqual(coordinator.cellularLineSelectionState, "SELECTED_CELLULAR_SERVICE_UNAVAILABLE")
+    }
+
     func testMissingEmptyOrAmbiguousCellularSelectionStopsBeforeClaimAndPublicStart() async throws {
         let cases: [(storedID: UUID?, services: [RemoteCellularServiceOption], expected: String)] = [
             (nil, [.init(id: UUID(), label: "Only line")], "OWNER_LINE_MAPPING_REQUIRED"),
@@ -4261,6 +4379,9 @@ final class RemoteCellularControlTests: XCTestCase {
         XCTAssertTrue(iOSSource.contains("StartCellularConversationAction(handle, cellularService: selectedService)"))
         XCTAssertTrue(iOSSource.contains("TelephonyConversationManager.sharedInstance.startCellularConversation(action)"))
         XCTAssertTrue(iOSSource.contains("TelephonyConversationManager.sharedInstance.cellularServices"))
+        XCTAssertTrue(iOSSource.contains("UNKNOWN_PUBLIC_API_NOT_EXPOSED"))
+        XCTAssertFalse(iOSSource.contains("UIApplication.shared.isDefault"))
+        XCTAssertFalse(iOSSource.contains("UIApplication.Category(rawValue:"))
         XCTAssertFalse(iOSSource.contains("UIApplication.shared.applicationState == .active"))
         XCTAssertFalse(iOSSource.contains("foregroundRequired"))
         XCTAssertFalse(iOSSource.contains("PushKit"))
@@ -4398,6 +4519,22 @@ final class RemoteCellularControlTests: XCTestCase {
         role: .B, bearerToken: String(repeating: "b", count: 64)
     )
 
+    private static func unusedRemoteControlAPI() -> RemoteControlAPIStub {
+        let requestID = UUID()
+        let view = Self.view(requestID: requestID, state: .deliveryPending)
+        return RemoteControlAPIStub(
+            view: view,
+            grant: RemoteCellularControlStartGrant(control: view, startGranted: false, phoneNumber: nil)
+        )
+    }
+
+    private static func lineSelectionStore() -> RemoteCellularLineSelectionStore {
+        let suite = "RemoteCellularCatalogSelection.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        defaults.removePersistentDomain(forName: suite)
+        return RemoteCellularLineSelectionStore(defaults: defaults)
+    }
+
     private static func view(
         requestID: UUID,
         state: RemoteCellularControlState,
@@ -4459,24 +4596,32 @@ private final class RemoteCellularStarterSpy: CellularConversationStarting {
     private(set) var numbers: [String] = []
     private(set) var preparedServiceIDs: [UUID] = []
     private(set) var startedServiceIDs: [UUID] = []
+    private(set) var availableServicesReadCount = 0
     var services: [RemoteCellularServiceOption]
     private let error: Error?
+    private let availableServicesError: Error?
     private let beforeStart: (() async -> Void)?
+    var beforeAvailableServices: (() -> Void)?
 
     init(
         services: [RemoteCellularServiceOption]? = nil,
         error: Error? = nil,
+        availableServicesError: Error? = nil,
         beforeStart: (() async -> Void)? = nil
     ) {
         self.services = services ?? [
             RemoteCellularServiceOption(id: Self.defaultServiceID, label: "Owner selected line")
         ]
         self.error = error
+        self.availableServicesError = availableServicesError
         self.beforeStart = beforeStart
     }
 
     func availableCellularServices() throws -> [RemoteCellularServiceOption] {
-        services
+        availableServicesReadCount += 1
+        beforeAvailableServices?()
+        if let availableServicesError { throw availableServicesError }
+        return services
     }
 
     func prepareCellularService(id: UUID) throws -> RemoteCellularPreparedService {
