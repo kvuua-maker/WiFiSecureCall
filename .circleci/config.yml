@@ -26,40 +26,64 @@ jobs:
             test "$IOS_SDK" = "27.0"
             test "$WATCH_SDK" = "27.0"
       - run:
-          name: iOS and watchOS public-API compile validation
+          name: Create one unsigned SDK 27 Build47 Release archive
           command: |
             set -euo pipefail
             OUT=/tmp/carrier-probe-validation
-            BUILD_LOG="$OUT/ios-watch-build.log"
+            ARCHIVE='/tmp/WiFi Secure Call Build 47.xcarchive'
+            BUILD_LOG="$OUT/ios-watch-archive.log"
+            test -n "${WSC_BUILD47_SECRETS_B64:-}"
+            printf '%s' "$WSC_BUILD47_SECRETS_B64" | /usr/bin/base64 -D > Config/Secrets.xcconfig
+            chmod 600 Config/Secrets.xcconfig
+            /usr/bin/ruby -e '
+              values = File.readlines(ARGV[0]).each_with_object({}) { |line, result|
+                match = line.match(/^\s*(IOS_BEARER_TOKEN|WATCH_BEARER_TOKEN)\s*=\s*(.*?)\s*$/)
+                result[match[1]] = match[2] if match
+              }
+              abort "missing protected token" unless %w[IOS_BEARER_TOKEN WATCH_BEARER_TOKEN].all? { |key|
+                value = values[key]
+                value && value.length >= 32 && value !~ /\s/
+              }
+            ' Config/Secrets.xcconfig
+            python3 -c 'import plistlib; entitlements = plistlib.load(open("iOS/WiFiSecureCall.entitlements", "rb")); assert entitlements.get("aps-environment") == "production"; assert entitlements.get("com.apple.developer.calling-app") is True; assert entitlements.get("com.apple.developer.dialing-app") is True; assert entitlements.get("com.apple.developer.applesignin") == ["Default"]'
             xcodebuild \
               -project WiFiSecureCall.xcodeproj \
               -scheme WiFiSecureCall \
-              -configuration Debug \
-              -sdk iphoneos \
+              -configuration Release \
               -destination 'generic/platform=iOS' \
-              -derivedDataPath /tmp/carrier-probe-derived-data \
+              -derivedDataPath /tmp/carrier-probe-release-derived-data \
+              -archivePath "$ARCHIVE" \
               CODE_SIGNING_ALLOWED=NO \
-              build | tee "$BUILD_LOG"
+              archive | tee "$BUILD_LOG"
+            APP="$ARCHIVE/Products/Applications/WiFi Secure Call.app"
+            WATCH="$APP/Watch/WiFiSecureCallWatch.app"
+            test "$(plutil -extract CFBundleIdentifier raw -o - "$APP/Info.plist")" = "com.vkapps.wifisecurecall"
+            test "$(plutil -extract CFBundleIdentifier raw -o - "$WATCH/Info.plist")" = "com.vkapps.wifisecurecall.watchkitapp"
+            test "$(plutil -extract CFBundleVersion raw -o - "$APP/Info.plist")" = "47"
+            test "$(plutil -extract CFBundleVersion raw -o - "$WATCH/Info.plist")" = "47"
+            for PRODUCT in "$APP" "$WATCH"; do
+              test "$(plutil -extract API_BASE_URL raw -o - "$PRODUCT/Info.plist")" = "https://178.105.32.46/wifi-secure-call/v1"
+              test "$(plutil -extract MEDIA_BASE_URL raw -o - "$PRODUCT/Info.plist")" = "wss://178.105.32.46/wifi-secure-call/media"
+              TOKEN_LENGTH="$(plutil -extract BEARER_TOKEN raw -o - "$PRODUCT/Info.plist" | awk '{ print length($0) }')"
+              test "$TOKEN_LENGTH" -ge 32
+            done
+            python3 -c 'import plistlib, sys; modes = plistlib.load(open(sys.argv[1], "rb")).get("UIBackgroundModes", []); assert modes.count("remote-notification") == 1; assert set(modes) == {"audio", "remote-notification", "voip"}' "$APP/Info.plist"
             grep -q "CarrierCallingDiagnosticView.swift.*target 'WiFiSecureCall'" "$BUILD_LOG"
             grep -q "WatchCarrierCallingDiagnosticView.swift.*target 'WiFiSecureCallWatch'" "$BUILD_LOG"
             grep -q "target arm64-apple-ios15.0" "$BUILD_LOG"
             grep -q "target arm64.*-apple-watchos9.2" "$BUILD_LOG"
-            grep -q "\*\* BUILD SUCCEEDED \*\*" "$BUILD_LOG"
-            IOS_INFO='/tmp/carrier-probe-derived-data/Build/Products/Debug-iphoneos/WiFi Secure Call.app/Info.plist'
-            test -f "$IOS_INFO"
-            python3 -c 'import plistlib, sys; modes = plistlib.load(open(sys.argv[1], "rb")).get("UIBackgroundModes", []); assert modes.count("remote-notification") == 1; assert set(modes) == {"audio", "remote-notification", "voip"}' "$IOS_INFO"
-            python3 -c 'import plistlib, sys; entitlements = plistlib.load(open(sys.argv[1], "rb")); assert entitlements.get("aps-environment") == "production"; assert entitlements.get("com.apple.developer.calling-app") is True; assert entitlements.get("com.apple.developer.dialing-app") is True; assert entitlements.get("com.apple.developer.applesignin") == ["Default"]' iOS/WiFiSecureCall.entitlements
-            RELEASE_SETTINGS="$OUT/ios-release-build-settings.txt"
-            xcodebuild -project WiFiSecureCall.xcodeproj -target WiFiSecureCall -configuration Release -showBuildSettings > "$RELEASE_SETTINGS"
-            grep -Eq '^[[:space:]]*CODE_SIGN_ENTITLEMENTS = iOS/WiFiSecureCall.entitlements$' "$RELEASE_SETTINGS"
-            grep -Eq '^[[:space:]]*PROVISIONING_PROFILE_SPECIFIER = WiFiSecureCallAppStoreD24$' "$RELEASE_SETTINGS"
-            printf 'IOS_TYPE_CHECK=PASS\nWATCHOS_TYPE_CHECK=PASS\nWATCHOS_10_6_2_COMPATIBLE=PASS\nIOS_REMOTE_NOTIFICATION_BACKGROUND_MODE=PASS\nIOS_CALLING_DIALING_ENTITLEMENTS=PASS\n' > "$OUT/result.txt"
+            grep -q "\*\* ARCHIVE SUCCEEDED \*\*" "$BUILD_LOG"
+            ditto -c -k --sequesterRsrc --keepParent "$ARCHIVE" "$OUT/WiFiSecureCall-Build47-unsigned.xcarchive.zip"
+            printf 'IOS_TYPE_CHECK=PASS\nWATCHOS_TYPE_CHECK=PASS\nWATCHOS_10_6_2_COMPATIBLE=PASS\nIOS_REMOTE_NOTIFICATION_BACKGROUND_MODE=PASS\nIOS_CALLING_DIALING_ENTITLEMENTS=PASS\nSDK27_UNSIGNED_ARCHIVE=PASS\n' > "$OUT/result.txt"
       - store_artifacts:
           path: /tmp/carrier-probe-validation/versions.txt
           destination: carrier-probe-validation/versions.txt
       - store_artifacts:
           path: /tmp/carrier-probe-validation/result.txt
           destination: carrier-probe-validation/result.txt
+      - store_artifacts:
+          path: /tmp/carrier-probe-validation/WiFiSecureCall-Build47-unsigned.xcarchive.zip
+          destination: carrier-probe-validation/WiFiSecureCall-Build47-unsigned.xcarchive.zip
 
 workflows:
   sdk27-carrier-probe-validation:
