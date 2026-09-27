@@ -36,9 +36,9 @@ jobs:
             REPORT="$OUT/sdk27-cellular-services-role-surface.txt"
             test -f "$LCK_INTERFACE"
             test -f "$UIAPPLICATION_HEADER"
-            grep -Fq 'public static let sharedInstance: LiveCommunicationKit.TelephonyConversationManager' "$LCK_INTERFACE"
-            grep -Fq 'final public var cellularServices: [LiveCommunicationKit.CellularService]' "$LCK_INTERFACE"
-            grep -Fq 'public init(_ handle: LiveCommunicationKit.Handle, cellularService: LiveCommunicationKit.CellularService? = nil)' "$LCK_INTERFACE"
+            grep -Fq 'public static let sharedInstance: LiveCommunicationKit::TelephonyConversationManager' "$LCK_INTERFACE"
+            grep -Fq 'final public var cellularServices: [LiveCommunicationKit::CellularService]' "$LCK_INTERFACE"
+            grep -Fq 'public init(_ handle: LiveCommunicationKit::Handle, cellularService: LiveCommunicationKit::CellularService? = nil)' "$LCK_INTERFACE"
             grep -Fq 'UIApplicationCategoryWebBrowser = 1' "$UIAPPLICATION_HEADER"
             CATEGORY_BLOCK="$(sed -n '/typedef NS_ENUM(NSInteger, UIApplicationCategory) {/,/NS_SWIFT_NAME(UIApplication.Category);/p' "$UIAPPLICATION_HEADER")"
             test "$(printf '%s\n' "$CATEGORY_BLOCK" | grep -Ec '^[[:space:]]*UIApplicationCategory[A-Za-z]+[[:space:]]*=')" -eq 1

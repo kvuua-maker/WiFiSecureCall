@@ -53,18 +53,18 @@ Evidence checked against Xcode 27.0 (27A266a), iOS SDK 27.0 exported interfaces 
 - `$SDKROOT/System/Library/Frameworks/UIKit.framework/Headers/UIApplication.h`
 
 ```swift
-final class TelephonyConversationManager: Sendable {
-    static let sharedInstance: TelephonyConversationManager
-    final var cellularServices: [CellularService] { get }
-    final func startCellularConversation(_ action: StartCellularConversationAction) async throws
+final public class TelephonyConversationManager : Swift::Sendable {
+    public static let sharedInstance: LiveCommunicationKit::TelephonyConversationManager
+    final public var cellularServices: [LiveCommunicationKit::CellularService] { get }
+    final public func startCellularConversation(_ action: LiveCommunicationKit::StartCellularConversationAction) async throws
 }
 
-struct CellularService: Identifiable, Codable, Hashable, Sendable {
-    let id: UUID
-    let label: String
+public struct CellularService : Swift::Identifiable, Swift::Codable, Swift::Hashable, Swift::Sendable {
+    public let id: Foundation::UUID
+    public let label: Swift::String
 }
 
-init(_ handle: Handle, cellularService: CellularService? = nil)
+public init(_ handle: LiveCommunicationKit::Handle, cellularService: LiveCommunicationKit::CellularService? = nil)
 ```
 
 The exported `TelephonyConversationManager` surface has no public initializer, refresh/request-access method, delegate, notification, publisher, or asynchronous service-catalog accessor. The app's use of `sharedInstance` and a synchronous read of the read-only `cellularServices` getter therefore matches the public lifecycle contract. The diagnostic performs one bounded getter read per explicit refresh; it does not poll or wait for an undocumented update.
