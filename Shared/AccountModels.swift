@@ -305,6 +305,129 @@ struct CrossUserCallCreateRequest: Codable, Sendable {
     let targetUserID: UUID
 }
 
+enum RemoteCellularControlState: String, Codable, Equatable, Sendable {
+    case deliveryPending = "iphone_delivery_pending"
+    case iPhoneActionRequired = "iphone_action_required"
+    case iPhoneStartAuthorized = "iphone_start_authorized"
+    case startRequested = "iphone_start_requested"
+    case cancelled
+    case expired
+    case failedSafe = "failed_safe"
+}
+
+struct RemoteCellularControlCreateRequest: Codable, Equatable, Sendable {
+    let requestID: UUID
+    let phoneNumber: String
+}
+
+struct RemoteCellularControlMutationRequest: Codable, Equatable, Sendable {
+    let requestID: UUID
+}
+
+struct RemoteCellularControlView: Codable, Equatable, Sendable {
+    let requestID: UUID
+    let state: RemoteCellularControlState
+    let createdAt: Date
+    let expiresAt: Date
+    let deliveryStatus: String?
+    let sourcePlatform: String
+    let targetPlatform: String
+    let sameOwnerAuthorized: Bool
+    let mutationApplied: Bool?
+}
+
+struct RemoteCellularControlStartGrant: Codable, Sendable {
+    let requestID: UUID
+    let state: RemoteCellularControlState
+    let createdAt: Date
+    let expiresAt: Date
+    let deliveryStatus: String?
+    let sourcePlatform: String
+    let targetPlatform: String
+    let sameOwnerAuthorized: Bool
+    let mutationApplied: Bool?
+    let terminalReason: String?
+    let phoneNumber: String?
+
+    var control: RemoteCellularControlView {
+        RemoteCellularControlView(
+            requestID: requestID, state: state, createdAt: createdAt, expiresAt: expiresAt,
+            deliveryStatus: deliveryStatus, sourcePlatform: sourcePlatform,
+            targetPlatform: targetPlatform, sameOwnerAuthorized: sameOwnerAuthorized,
+            mutationApplied: mutationApplied
+        )
+    }
+
+    var startGranted: Bool {
+        state == .iPhoneStartAuthorized && mutationApplied == true && phoneNumber != nil
+    }
+
+    init(control: RemoteCellularControlView, startGranted: Bool, phoneNumber: String?) {
+        requestID = control.requestID
+        state = control.state
+        createdAt = control.createdAt
+        expiresAt = control.expiresAt
+        deliveryStatus = control.deliveryStatus
+        sourcePlatform = control.sourcePlatform
+        targetPlatform = control.targetPlatform
+        sameOwnerAuthorized = control.sameOwnerAuthorized
+        mutationApplied = startGranted
+        terminalReason = nil
+        self.phoneNumber = phoneNumber
+    }
+}
+
+struct RemoteCellularControlPushEnvelope: Equatable, Sendable {
+    let requestID: UUID
+    let accountID: UUID
+
+    static func parse(_ payload: [AnyHashable: Any]) -> Self? {
+        guard payload["event"] as? String == "remote_cellular_control",
+              let requestValue = payload["requestID"] as? String,
+              let accountValue = payload["accountID"] as? String,
+              let requestID = UUID(uuidString: requestValue),
+              let accountID = UUID(uuidString: accountValue) else { return nil }
+        return Self(requestID: requestID, accountID: accountID)
+    }
+}
+
+enum RemoteCellularControlPolicy {
+    static let requestTTL: TimeInterval = 120
+
+    static func normalizedE164(_ value: String) -> String? {
+        guard value == value.trimmingCharacters(in: .whitespacesAndNewlines),
+              value.range(of: #"^\+[1-9][0-9]{7,14}$"#, options: .regularExpression) != nil else { return nil }
+        return value
+    }
+}
+
+enum RemoteCellularReceiptContext: String, Codable, Equatable, Sendable {
+    case foreground
+    case background
+    case openedFromNotification = "opened_from_notification"
+}
+
+struct RemoteCellularControlDiagnostic: Codable, Equatable, Sendable {
+    let requestID: UUID
+    let accountID: UUID
+    let expiresAt: Date?
+    let state: RemoteCellularControlState
+    let receiptContext: RemoteCellularReceiptContext
+    let sameOwnerAuthorized: Bool
+    let userActionRequired: Bool
+    let systemStartAttempted: Bool
+    let safeResult: String
+}
+
+protocol RemoteCellularControlAPI: Sendable {
+    func createRemoteCellularControl(accountID: UUID, requestID: UUID, phoneNumber: String) async throws -> RemoteCellularControlView
+    func remoteCellularControl(accountID: UUID, requestID: UUID) async throws -> RemoteCellularControlView
+    func receiveRemoteCellularControl(accountID: UUID, requestID: UUID, mutationID: UUID) async throws -> RemoteCellularControlView
+    func claimRemoteCellularControlStart(accountID: UUID, requestID: UUID, mutationID: UUID) async throws -> RemoteCellularControlStartGrant
+    func markRemoteCellularControlStartRequested(accountID: UUID, requestID: UUID, mutationID: UUID) async throws -> RemoteCellularControlView
+    func cancelRemoteCellularControl(accountID: UUID, requestID: UUID, mutationID: UUID) async throws -> RemoteCellularControlView
+}
+
 enum CrossUserLegState: String, Codable, Sendable {
     case ringing
     case accepted

@@ -196,6 +196,51 @@ actor AccountAPIClient {
         try await authorizedV3("calls/\(callID.uuidString.lowercased())/\(action.rawValue)", accountID: accountID, body: AccountCallMutationRequest(requestID: requestID))
     }
 
+    func createRemoteCellularControl(accountID: UUID, requestID: UUID, phoneNumber: String) async throws -> RemoteCellularControlView {
+        try await authorizedV3(
+            "cellular-controls",
+            accountID: accountID,
+            body: RemoteCellularControlCreateRequest(requestID: requestID, phoneNumber: phoneNumber)
+        )
+    }
+
+    func remoteCellularControl(accountID: UUID, requestID: UUID) async throws -> RemoteCellularControlView {
+        try await authorizedV3(
+            "cellular-controls/\(requestID.uuidString.lowercased())",
+            method: "GET",
+            accountID: accountID,
+            body: Optional<EmptyAccountRequest>.none
+        )
+    }
+
+    func receiveRemoteCellularControl(accountID: UUID, requestID: UUID, mutationID: UUID = UUID()) async throws -> RemoteCellularControlView {
+        try await remoteCellularMutation(accountID: accountID, controlID: requestID, action: "receive", mutationID: mutationID)
+    }
+
+    func claimRemoteCellularControlStart(accountID: UUID, requestID: UUID, mutationID: UUID = UUID()) async throws -> RemoteCellularControlStartGrant {
+        try await authorizedV3(
+            "cellular-controls/\(requestID.uuidString.lowercased())/start",
+            accountID: accountID,
+            body: RemoteCellularControlMutationRequest(requestID: mutationID)
+        )
+    }
+
+    func markRemoteCellularControlStartRequested(accountID: UUID, requestID: UUID, mutationID: UUID = UUID()) async throws -> RemoteCellularControlView {
+        try await remoteCellularMutation(accountID: accountID, controlID: requestID, action: "start-requested", mutationID: mutationID)
+    }
+
+    func cancelRemoteCellularControl(accountID: UUID, requestID: UUID, mutationID: UUID = UUID()) async throws -> RemoteCellularControlView {
+        try await remoteCellularMutation(accountID: accountID, controlID: requestID, action: "cancel", mutationID: mutationID)
+    }
+
+    private func remoteCellularMutation(accountID: UUID, controlID: UUID, action: String, mutationID: UUID) async throws -> RemoteCellularControlView {
+        try await authorizedV3(
+            "cellular-controls/\(controlID.uuidString.lowercased())/\(action)",
+            accountID: accountID,
+            body: RemoteCellularControlMutationRequest(requestID: mutationID)
+        )
+    }
+
     private func authorizedV3<T: Decodable, B: Encodable>(_ path: String, method: String = "POST", accountID: UUID, body: B?) async throws -> T {
         var tokens = try tokenStore.tokens(for: accountID) ?? { throw AccountAPIError.missingSession }()
         if tokens.accessExpiresAt <= Date() { tokens = try await refresh(accountID: accountID, expectedRefreshToken: tokens.refreshToken) }
@@ -327,3 +372,5 @@ private struct EmptyAccountResponse: Codable {}
 private extension Data {
     var hexString: String { map { String(format: "%02x", $0) }.joined() }
 }
+
+extension AccountAPIClient: RemoteCellularControlAPI {}

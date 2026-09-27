@@ -16,6 +16,8 @@ final class IOSNotificationController: NSObject, UIApplicationDelegate, UNUserNo
         center.setNotificationCategories([UNNotificationCategory(identifier: "INCOMING_CALL", actions: [
             UNNotificationAction(identifier: "ACCEPT", title: "Accept", options: .foreground),
             UNNotificationAction(identifier: "REJECT", title: "Reject")
+        ], intentIdentifiers: []), UNNotificationCategory(identifier: "REMOTE_CELLULAR_CONTROL", actions: [
+            UNNotificationAction(identifier: "OPEN_REMOTE_CELLULAR_CONTROL", title: "Review", options: .foreground)
         ], intentIdentifiers: [])])
         application.registerForRemoteNotifications(); configureVoIPPushes()
         Task { await NotificationRuntime.shared.api.reportNotificationDiagnostic(event: "apns_registration_started", status: "started") }
@@ -61,13 +63,37 @@ final class IOSNotificationController: NSObject, UIApplicationDelegate, UNUserNo
     private func registrationFailed(_ error: Error) { let value = error as NSError; Diagnostics.shared.record(role: .B, category: "pushRegistration", value: "failed \(value.domain):\(value.code)"); Task { await NotificationRuntime.shared.api.reportNotificationDiagnostic(event: "apns_registration_failed", status: "domain=\(value.domain) code=\(value.code)") } }
     private static func authorizationStatus(_ status: UNAuthorizationStatus, error: Error?) -> String { if error != nil { return "error" }; switch status { case .notDetermined: return "notDetermined"; case .denied: return "denied"; case .authorized: return "authorized"; case .provisional: return "provisional"; case .ephemeral: return "ephemeral"; @unknown default: return "unknown" } }
 
+    func application(
+        _ application: UIApplication,
+        didReceiveRemoteNotification userInfo: [AnyHashable: Any],
+        fetchCompletionHandler completionHandler: @escaping (UIBackgroundFetchResult) -> Void
+    ) {
+        guard let envelope = RemoteCellularControlPushEnvelope.parse(userInfo) else {
+            completionHandler(.noData)
+            return
+        }
+        Task { @MainActor in
+            await IOSRemoteCellularControlCoordinator.shared.receive(envelope, context: .background)
+            completionHandler(.newData)
+        }
+    }
+
     nonisolated func userNotificationCenter(_ center: UNUserNotificationCenter, willPresent notification: UNNotification, withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void) {
+        if let envelope = RemoteCellularControlPushEnvelope.parse(notification.request.content.userInfo) {
+            Task { @MainActor in await IOSRemoteCellularControlCoordinator.shared.receive(envelope, context: .foreground) }
+            completionHandler([.banner, .sound])
+            return
+        }
         guard let envelope = ForegroundIncomingNotification.envelope(from: notification.request.content.userInfo) else { completionHandler([.banner, .sound]); return }
         Task { @MainActor in await self.handle(envelope, voip: false, requestAnswer: false) }
         completionHandler([])
     }
 
     nonisolated func userNotificationCenter(_ center: UNUserNotificationCenter, didReceive response: UNNotificationResponse) async {
+        if let envelope = RemoteCellularControlPushEnvelope.parse(response.notification.request.content.userInfo) {
+            await IOSRemoteCellularControlCoordinator.shared.receive(envelope, context: .openedFromNotification)
+            return
+        }
         guard let envelope = IncomingNotificationEnvelope.parse(response.notification.request.content.userInfo) else { return }
         await handle(envelope, voip: false, requestAnswer: false)
         let session = await MainActor.run { NotificationRuntime.shared.callSession }

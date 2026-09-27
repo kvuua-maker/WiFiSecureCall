@@ -7,7 +7,9 @@ final class WatchCarrierCallingDiagnosticProbe: ObservableObject {
     @Published private(set) var record = CarrierCallingDiagnosticRecord.baseline(platform: .watchOS)
 
     func refresh(network: CarrierCallingNetworkSnapshot) {
+        let savedInternetCheck = record.firstPartyInternetCheck
         var next = CarrierCallingDiagnosticRecord.baseline(platform: .watchOS)
+        next.firstPartyInternetCheck = savedInternetCheck
         next.network = network
         if WCSession.isSupported() {
             let session = WCSession.default
@@ -20,6 +22,11 @@ final class WatchCarrierCallingDiagnosticProbe: ObservableObject {
             next.watchConnectivityState = "unsupported"
         }
         record = next
+    }
+
+    func checkFirstPartyInternet() async {
+        record.firstPartyInternetCheck = .checking
+        record.firstPartyInternetCheck = await CarrierCallingFirstPartyInternetCheck.run()
     }
 
     private static func activationState(_ value: WCSessionActivationState) -> String {
@@ -38,12 +45,18 @@ struct WatchCarrierCallingDiagnosticView: View {
     @StateObject private var probe = WatchCarrierCallingDiagnosticProbe()
     @ObservedObject private var dialStore = SystemDialDiagnosticStore.shared
     @ObservedObject private var observations = CarrierCallingObservationStore.shared
+    @State private var internetCheckTask: Task<Void, Never>?
 
     var body: some View {
         List {
             Section("WATCH NETWORK") {
-                line("Status", probe.record.network.status)
-                line("Interfaces", list(probe.record.network.interfaces))
+                line("NWPath monitor status", probe.record.network.status)
+                line("NWPath interfaces", list(probe.record.network.interfaces))
+                line("First-party Internet check", probe.record.firstPartyInternetCheck.rawValue)
+                Button("Check first-party Internet") {
+                    internetCheckTask?.cancel()
+                    internetCheckTask = Task { await probe.checkFirstPartyInternet() }
+                }
                 line("Expensive", optionalYesNo(probe.record.network.isExpensive))
                 line("Constrained", optionalYesNo(probe.record.network.isConstrained))
             }
@@ -110,7 +123,10 @@ struct WatchCarrierCallingDiagnosticView: View {
             refresh()
         }
         .onChange(of: network.snapshot) { value in probe.refresh(network: value) }
-        .onDisappear { network.stop() }
+        .onDisappear {
+            internetCheckTask?.cancel()
+            network.stop()
+        }
     }
 
     private var currentObservation: CarrierCallingObservationSnapshot {

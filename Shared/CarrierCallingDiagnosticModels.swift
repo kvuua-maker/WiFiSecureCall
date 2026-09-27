@@ -148,6 +148,7 @@ struct CarrierCallingSystemDialObservation: Codable, Equatable, Sendable {
 
 struct CarrierCallingObservationSnapshot: Codable, Equatable, Sendable {
     let network: CarrierCallingNetworkSnapshot
+    let firstPartyInternetCheck: CarrierCallingFirstPartyInternetState
     let cellularServices: [PublicCellularServiceSnapshot]
     let cellularPlanAuthorization: String
     let cellularPlanStatus: String
@@ -164,6 +165,7 @@ struct CarrierCallingObservationSnapshot: Codable, Equatable, Sendable {
 
     init(record: CarrierCallingDiagnosticRecord, systemDial: CarrierCallingSystemDialObservation? = nil) {
         network = record.network
+        firstPartyInternetCheck = record.firstPartyInternetCheck
         cellularServices = record.cellularServices.sorted { $0.id.uuidString < $1.id.uuidString }
         cellularPlanAuthorization = record.cellularPlanAuthorization
         cellularPlanStatus = record.cellularPlanStatus
@@ -185,6 +187,7 @@ struct CarrierCallingObservationSnapshot: Codable, Equatable, Sendable {
         if network.interfaces != before.network.interfaces { fields.append("network.interfaces") }
         if network.isExpensive != before.network.isExpensive { fields.append("network.expensive") }
         if network.isConstrained != before.network.isConstrained { fields.append("network.constrained") }
+        if firstPartyInternetCheck != before.firstPartyInternetCheck { fields.append("firstPartyInternet") }
         if cellularServices != before.cellularServices { fields.append("cellularServices") }
         if cellularPlanAuthorization != before.cellularPlanAuthorization { fields.append("cellularPlan.authorization") }
         if cellularPlanStatus != before.cellularPlanStatus { fields.append("cellularPlan.status") }
@@ -204,7 +207,8 @@ struct CarrierCallingObservationSnapshot: Codable, Equatable, Sendable {
     var conciseDescription: String {
         let services = cellularServices.map { "\($0.label)[\($0.id.uuidString)]" }.joined(separator: ",")
         return [
-            "network=\(network.status)/\(network.interfaces.joined(separator: ","))",
+            "nwpath=\(network.status)/\(network.interfaces.joined(separator: ","))",
+            "firstPartyInternet=\(firstPartyInternetCheck.rawValue)",
             "services=\(cellularServices.count):\(services)",
             "planAuth=\(cellularPlanAuthorization)",
             "planStatus=\(cellularPlanStatus)",
@@ -253,6 +257,7 @@ final class CarrierCallingObservationStore: ObservableObject {
 struct CarrierCallingDiagnosticRecord: Codable, Equatable, Sendable {
     let platform: CarrierCallingPlatform
     var network: CarrierCallingNetworkSnapshot
+    var firstPartyInternetCheck: CarrierCallingFirstPartyInternetState
     var telephonyConversationManager: String
     var cellularServices: [PublicCellularServiceSnapshot]
     var selectedCellularService: String
@@ -280,6 +285,7 @@ struct CarrierCallingDiagnosticRecord: Codable, Equatable, Sendable {
         CarrierCallingDiagnosticRecord(
             platform: platform,
             network: .unknown,
+            firstPartyInternetCheck: .notChecked,
             telephonyConversationManager: platform == .watchOS ? "UNAVAILABLE_ON_WATCHOS" : "REQUIRES_IOS_26",
             cellularServices: [],
             selectedCellularService: PublicCarrierCallingState.unknownPublicAPINotExposed.rawValue,

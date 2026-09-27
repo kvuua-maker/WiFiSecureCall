@@ -8,6 +8,7 @@ struct WatchRootView: View {
     @State private var showCallUser = false
     @State private var showSystemDialer = false
     @State private var showCarrierCallingProbe = false
+    @State private var showRemoteCellularControl = false
     var body: some View {
         VStack(spacing: 8) {
             Text("WiFi Secure Call").font(.headline)
@@ -30,6 +31,7 @@ struct WatchRootView: View {
         .sheet(isPresented: $showCallUser) { CallUserView(store: accountStore) }
         .sheet(isPresented: $showSystemDialer) { WatchSystemDialerView() }
         .sheet(isPresented: $showCarrierCallingProbe) { WatchCarrierCallingDiagnosticView() }
+        .sheet(isPresented: $showRemoteCellularControl) { WatchRemoteCellularControlView() }
     }
     private var status: String {
         switch session.state {
@@ -52,6 +54,8 @@ struct WatchRootView: View {
                 Button("Call user") { if accountStore.callableAccounts.isEmpty { showAccount = true } else { showCallUser = true } }
                 Button("Mobile Call") { showSystemDialer = true }
                 Button("Carrier probe") { showCarrierCallingProbe = true }
+                    .font(.caption2)
+                Button("Remote cellular probe") { showRemoteCellularControl = true }
                     .font(.caption2)
                 Button(accountStore.accounts.isEmpty ? "Link Account" : "Account") { showAccount = true }
                     .font(.caption2)

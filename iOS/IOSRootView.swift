@@ -3,11 +3,13 @@ import SwiftUI
 struct IOSRootView: View {
     @ObservedObject var session: CallSession
     @StateObject private var accountStore = AccountSessionStore.shared
+    @ObservedObject private var remoteCellular = IOSRemoteCellularControlCoordinator.shared
     @State private var showAccount = false
     @State private var showAccountPicker = false
     @State private var showCallUser = false
     @State private var showDialDiagnostics = false
     @State private var showCarrierCallingProbe = false
+    @State private var showRemoteCellularControl = false
 
     var body: some View {
         VStack(spacing: 24) {
@@ -31,6 +33,12 @@ struct IOSRootView: View {
         .sheet(isPresented: $showCallUser) { CallUserView(store: accountStore) }
         .sheet(isPresented: $showDialDiagnostics) { SystemDialDiagnosticsView() }
         .sheet(isPresented: $showCarrierCallingProbe) { CarrierCallingDiagnosticView() }
+        .sheet(isPresented: $showRemoteCellularControl, onDismiss: { remoteCellular.dismissPresentation() }) {
+            IOSRemoteCellularControlView(coordinator: remoteCellular)
+        }
+        .onChange(of: remoteCellular.presentationRequested) { requested in
+            if requested { showRemoteCellularControl = true }
+        }
     }
 
     private var status: String {
@@ -56,6 +64,7 @@ struct IOSRootView: View {
                 Button(accountStore.activeAccount?.displayLabel ?? "Account") { showAccount = true }.font(.footnote)
                 Button("Dial diagnostics") { showDialDiagnostics = true }.font(.footnote)
                 Button("Carrier calling probe") { showCarrierCallingProbe = true }.font(.footnote)
+                Button("Remote cellular probe") { showRemoteCellularControl = true }.font(.footnote)
             }
         case .outgoingRinging:
             Button("Cancel", role: .destructive) { Task { await session.cancel() } }

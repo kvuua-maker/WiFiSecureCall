@@ -63,10 +63,12 @@ final class IOSCarrierCallingDiagnosticProbe: ObservableObject {
     func refresh(network: CarrierCallingNetworkSnapshot) {
         let savedPlanAuthorization = record.cellularPlanAuthorization
         let savedPlanStatus = record.cellularPlanStatus
+        let savedInternetCheck = record.firstPartyInternetCheck
         var next = CarrierCallingDiagnosticRecord.baseline(platform: .iOS)
         next.network = network
         next.cellularPlanAuthorization = savedPlanAuthorization
         next.cellularPlanStatus = savedPlanStatus
+        next.firstPartyInternetCheck = savedInternetCheck
 
         if #available(iOS 26.0, *) {
             let services = TelephonyConversationManager.sharedInstance.cellularServices
@@ -103,6 +105,11 @@ final class IOSCarrierCallingDiagnosticProbe: ObservableObject {
             next.watchConnectivityState = "unsupported"
         }
         record = next
+    }
+
+    func checkFirstPartyInternet() async {
+        record.firstPartyInternetCheck = .checking
+        record.firstPartyInternetCheck = await CarrierCallingFirstPartyInternetCheck.run()
     }
 
     func checkCellularPlanStatus(
@@ -193,6 +200,7 @@ struct CarrierCallingDiagnosticView: View {
     @ObservedObject private var observations = CarrierCallingObservationStore.shared
     @State private var e164Input = ""
     @State private var planCheckInProgress = false
+    @State private var internetCheckTask: Task<Void, Never>?
 
     var body: some View {
         NavigationView {
@@ -218,14 +226,20 @@ struct CarrierCallingDiagnosticView: View {
         .onChange(of: network.snapshot) { value in probe.refresh(network: value) }
         .onDisappear {
             e164Input.removeAll(keepingCapacity: false)
+            internetCheckTask?.cancel()
             network.stop()
         }
     }
 
     private var networkSection: some View {
         Section("IPHONE NETWORK") {
-            line("Status", probe.record.network.status)
-            line("Interfaces", list(probe.record.network.interfaces))
+            line("NWPath monitor status", probe.record.network.status)
+            line("NWPath interfaces", list(probe.record.network.interfaces))
+            line("First-party Internet check", probe.record.firstPartyInternetCheck.rawValue)
+            Button("Check first-party Internet") {
+                internetCheckTask?.cancel()
+                internetCheckTask = Task { await probe.checkFirstPartyInternet() }
+            }
             line("Expensive", optionalYesNo(probe.record.network.isExpensive))
             line("Constrained", optionalYesNo(probe.record.network.isConstrained))
         }
