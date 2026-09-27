@@ -3928,6 +3928,8 @@ final class RemoteCellularControlTests: XCTestCase {
         XCTAssertEqual(firstCounts.completion, 1)
         let attemptCountsAtPublicCall = await api.starterAttemptObservations()
         XCTAssertEqual(attemptCountsAtPublicCall, [0])
+        let claimCountsAtPublicCall = await api.starterClaimObservations()
+        XCTAssertEqual(claimCountsAtPublicCall, [1])
         XCTAssertTrue(coordinator.diagnostic?.startClaimObtained == true)
         XCTAssertTrue(coordinator.diagnostic?.systemStartAttempted == true)
         XCTAssertEqual(coordinator.diagnostic?.publicStartReturnedSuccess, true)
@@ -4141,6 +4143,270 @@ final class RemoteCellularControlTests: XCTestCase {
             .values.compactMap { $0 as? String }
         XCTAssertEqual(persisted, [selectedID.uuidString.lowercased()])
         XCTAssertFalse(persisted.joined().contains("+380"))
+    }
+
+    func testExecutionModeMigrationDefaultsToStrictAndOptInIsAccountScoped() throws {
+        let firstAccount = UUID(), secondAccount = UUID()
+        let suite = "RemoteCellularModePersistence.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defaults.removePersistentDomain(forName: suite)
+        let store = RemoteCellularExecutionModeStore(defaults: defaults)
+
+        XCTAssertEqual(store.mode(for: firstAccount), .strictExplicitSIM)
+        XCTAssertEqual(store.mode(for: secondAccount), .strictExplicitSIM)
+
+        store.setMode(.systemManagedDiagnostic, for: firstAccount)
+        let reopened = RemoteCellularExecutionModeStore(defaults: defaults)
+        XCTAssertEqual(reopened.mode(for: firstAccount), .systemManagedDiagnostic)
+        XCTAssertEqual(reopened.mode(for: secondAccount), .strictExplicitSIM)
+        XCTAssertFalse(defaults.dictionaryRepresentation().values.contains { value in
+            String(describing: value).contains("+380")
+        })
+    }
+
+    func testStrictEmptyCatalogCannotClaimOrUseSystemManagedStarter() async throws {
+        let accountID = UUID(), requestID = UUID(), missingServiceID = UUID()
+        let accountStore = try Self.accountStore(accountID: accountID)
+        let api = RemoteControlAPIStub(
+            view: Self.view(requestID: requestID, state: .iPhoneBackgroundReceived, receiptContext: .background),
+            grant: RemoteCellularControlStartGrant(
+                control: Self.view(requestID: requestID, state: .iPhoneStartAuthorized),
+                startGranted: true,
+                phoneNumber: "+380501234567"
+            )
+        )
+        let starter = RemoteCellularStarterSpy(services: [])
+        let selection = Self.lineSelectionStore()
+        selection.setSelectedServiceID(missingServiceID, for: accountID)
+        let coordinator = IOSRemoteCellularControlCoordinator(
+            api: api,
+            accountStore: accountStore,
+            starter: starter,
+            lineSelectionStore: selection,
+            executionModeStore: Self.executionModeStore()
+        )
+
+        await coordinator.receive(
+            .init(requestID: requestID, accountID: accountID),
+            context: .background,
+            applicationState: .background
+        )
+
+        XCTAssertEqual(coordinator.executionModeSnapshot, .strictExplicitSIM)
+        XCTAssertEqual(coordinator.diagnostic?.safeResult, "SELECTED_CELLULAR_SERVICE_UNAVAILABLE")
+        XCTAssertEqual(starter.preparedSystemManagedCount, 0)
+        XCTAssertTrue(starter.startedModes.isEmpty)
+        XCTAssertTrue(starter.numbers.isEmpty)
+        let counts = await api.counts()
+        XCTAssertEqual(counts.claim, 0)
+        XCTAssertEqual(counts.attempt, 0)
+    }
+
+    func testExplicitSystemManagedOptInCanStartWithEmptyCatalogOnlyAfterClaim() async throws {
+        let accountID = UUID(), requestID = UUID()
+        let accountStore = try Self.accountStore(accountID: accountID)
+        let api = RemoteControlAPIStub(
+            view: Self.view(requestID: requestID, state: .iPhoneBackgroundReceived, receiptContext: .background),
+            grant: RemoteCellularControlStartGrant(
+                control: Self.view(requestID: requestID, state: .iPhoneStartAuthorized),
+                startGranted: true,
+                phoneNumber: "+380501234567"
+            )
+        )
+        let starter = RemoteCellularStarterSpy(
+            services: [],
+            beforeStart: { await api.observeStarterInvocation() }
+        )
+        let modeStore = Self.executionModeStore()
+        let coordinator = IOSRemoteCellularControlCoordinator(
+            api: api,
+            accountStore: accountStore,
+            starter: starter,
+            lineSelectionStore: Self.lineSelectionStore(),
+            executionModeStore: modeStore
+        )
+        XCTAssertEqual(coordinator.executionMode, .strictExplicitSIM)
+        coordinator.confirmSystemManagedDiagnosticOptIn()
+        XCTAssertEqual(coordinator.executionMode, .systemManagedDiagnostic)
+
+        await coordinator.receive(
+            .init(requestID: requestID, accountID: accountID),
+            context: .background,
+            applicationState: .background
+        )
+
+        XCTAssertEqual(coordinator.executionModeSnapshot, .systemManagedDiagnostic)
+        XCTAssertEqual(starter.preparedSystemManagedCount, 1)
+        XCTAssertTrue(starter.preparedServiceIDs.isEmpty)
+        XCTAssertEqual(starter.startedModes, [.systemManagedDiagnostic])
+        XCTAssertEqual(starter.numbers, ["+380501234567"])
+        XCTAssertFalse(coordinator.explicitCellularServicePassed)
+        XCTAssertTrue(coordinator.systemManagedPublicStartUsed)
+        XCTAssertEqual(coordinator.diagnostic?.safeResult, "SYSTEM_START_ACCEPTED")
+        let counts = await api.counts()
+        XCTAssertEqual(counts.claim, 1)
+        XCTAssertEqual(counts.attempt, 1)
+        XCTAssertEqual(counts.completion, 1)
+        let attemptCountsAtPublicCall = await api.starterAttemptObservations()
+        XCTAssertEqual(attemptCountsAtPublicCall, [0])
+        let claimCountsAtPublicCall = await api.starterClaimObservations()
+        XCTAssertEqual(claimCountsAtPublicCall, [1])
+        let labels = Set(Mirror(reflecting: try XCTUnwrap(coordinator.diagnostic)).children.compactMap(\.label))
+        XCTAssertFalse(labels.contains("connected"))
+        XCTAssertFalse(labels.contains("simPickerSuppressed"))
+        XCTAssertFalse(labels.contains("watchAudio"))
+    }
+
+    func testExecutionModeIsSnapshottedBeforePreparationAndClaim() async throws {
+        let accountID = UUID(), requestID = UUID()
+        let accountStore = try Self.accountStore(accountID: accountID)
+        let modeStore = Self.executionModeStore()
+        modeStore.setMode(.systemManagedDiagnostic, for: accountID)
+        let api = RemoteControlAPIStub(
+            view: Self.view(requestID: requestID, state: .iPhoneBackgroundReceived, receiptContext: .background),
+            grant: RemoteCellularControlStartGrant(
+                control: Self.view(requestID: requestID, state: .iPhoneStartAuthorized),
+                startGranted: true,
+                phoneNumber: "+380501234567"
+            )
+        )
+        let starter = RemoteCellularStarterSpy(
+            services: [],
+            beforePrepareSystemManaged: {
+                modeStore.setMode(.strictExplicitSIM, for: accountID)
+            }
+        )
+        let coordinator = IOSRemoteCellularControlCoordinator(
+            api: api,
+            accountStore: accountStore,
+            starter: starter,
+            lineSelectionStore: Self.lineSelectionStore(),
+            executionModeStore: modeStore
+        )
+
+        await coordinator.receive(
+            .init(requestID: requestID, accountID: accountID),
+            context: .background,
+            applicationState: .background
+        )
+
+        XCTAssertEqual(modeStore.mode(for: accountID), .strictExplicitSIM)
+        XCTAssertEqual(coordinator.executionModeSnapshot, .systemManagedDiagnostic)
+        XCTAssertEqual(starter.startedModes, [.systemManagedDiagnostic])
+        XCTAssertEqual(starter.numbers, ["+380501234567"])
+        let counts = await api.counts()
+        XCTAssertEqual(counts.claim, 1)
+    }
+
+    func testSystemManagedModeCannotInvokeStarterWithoutOneTimeGrant() async throws {
+        let accountID = UUID(), requestID = UUID()
+        let accountStore = try Self.accountStore(accountID: accountID)
+        let modeStore = Self.executionModeStore()
+        modeStore.setMode(.systemManagedDiagnostic, for: accountID)
+        let rejectedGrantView = Self.view(requestID: requestID, state: .iPhoneBackgroundReceived)
+        let api = RemoteControlAPIStub(
+            view: Self.view(requestID: requestID, state: .iPhoneBackgroundReceived, receiptContext: .background),
+            grant: RemoteCellularControlStartGrant(
+                control: rejectedGrantView,
+                startGranted: false,
+                phoneNumber: nil
+            )
+        )
+        let starter = RemoteCellularStarterSpy(services: [])
+        let coordinator = IOSRemoteCellularControlCoordinator(
+            api: api,
+            accountStore: accountStore,
+            starter: starter,
+            lineSelectionStore: Self.lineSelectionStore(),
+            executionModeStore: modeStore
+        )
+
+        await coordinator.receive(
+            .init(requestID: requestID, accountID: accountID),
+            context: .background,
+            applicationState: .background
+        )
+
+        XCTAssertEqual(starter.preparedSystemManagedCount, 1)
+        XCTAssertTrue(starter.startedModes.isEmpty)
+        XCTAssertTrue(starter.numbers.isEmpty)
+        XCTAssertFalse(coordinator.systemManagedPublicStartUsed)
+        XCTAssertEqual(coordinator.diagnostic?.safeResult, "START_NOT_GRANTED")
+        let counts = await api.counts()
+        XCTAssertEqual(counts.claim, 1)
+        XCTAssertEqual(counts.attempt, 0)
+        XCTAssertEqual(counts.completion, 0)
+    }
+
+    func testSystemManagedFailureCannotRetrySameRequest() async throws {
+        let accountID = UUID(), requestID = UUID()
+        let accountStore = try Self.accountStore(accountID: accountID)
+        let modeStore = Self.executionModeStore()
+        modeStore.setMode(.systemManagedDiagnostic, for: accountID)
+        let api = RemoteControlAPIStub(
+            view: Self.view(requestID: requestID, state: .iPhoneBackgroundReceived, receiptContext: .background),
+            grant: RemoteCellularControlStartGrant(
+                control: Self.view(requestID: requestID, state: .iPhoneStartAuthorized),
+                startGranted: true,
+                phoneNumber: "+380501234567"
+            )
+        )
+        let starter = RemoteCellularStarterSpy(
+            services: [],
+            error: NSError(domain: "SystemManagedPublicAPI", code: 19)
+        )
+        let coordinator = IOSRemoteCellularControlCoordinator(
+            api: api,
+            accountStore: accountStore,
+            starter: starter,
+            lineSelectionStore: Self.lineSelectionStore(),
+            executionModeStore: modeStore
+        )
+
+        let envelope = RemoteCellularControlPushEnvelope(requestID: requestID, accountID: accountID)
+        await coordinator.receive(envelope, context: .background, applicationState: .background)
+        await coordinator.receive(envelope, context: .background, applicationState: .background)
+        await coordinator.startPendingControl()
+
+        XCTAssertEqual(starter.startedModes, [.systemManagedDiagnostic])
+        XCTAssertEqual(starter.numbers.count, 1)
+        XCTAssertEqual(coordinator.diagnostic?.state, .publicStartError)
+        let counts = await api.counts()
+        XCTAssertEqual(counts.claim, 1)
+        XCTAssertEqual(counts.completion, 1)
+    }
+
+    func testCoordinatorReloadsAccountScopedModeWithoutInheritance() throws {
+        let firstAccount = UUID(), secondAccount = UUID()
+        let accountStore = try Self.accountStore(accountID: firstAccount)
+        try accountStore.addLinkedAccount(
+            accountID: secondAccount,
+            userID: UUID(),
+            phoneNumber: nil,
+            displayLabel: "Second account",
+            tokens: AccountTokens(
+                accessToken: "second-access", accessExpiresAt: .distantFuture,
+                refreshToken: "second-refresh", refreshExpiresAt: .distantFuture
+            )
+        )
+        let modeStore = Self.executionModeStore()
+        modeStore.setMode(.systemManagedDiagnostic, for: firstAccount)
+        accountStore.switchAccount(to: secondAccount)
+        let coordinator = IOSRemoteCellularControlCoordinator(
+            api: Self.unusedRemoteControlAPI(),
+            accountStore: accountStore,
+            starter: RemoteCellularStarterSpy(services: []),
+            lineSelectionStore: Self.lineSelectionStore(),
+            executionModeStore: modeStore
+        )
+
+        XCTAssertEqual(coordinator.executionMode, .strictExplicitSIM)
+        accountStore.switchAccount(to: firstAccount)
+        coordinator.activeAccountDidChange()
+        XCTAssertEqual(coordinator.executionMode, .systemManagedDiagnostic)
+        accountStore.switchAccount(to: secondAccount)
+        coordinator.activeAccountDidChange()
+        XCTAssertEqual(coordinator.executionMode, .strictExplicitSIM)
     }
 
     func testCellularServiceCatalogReportsLoadingThenEmptyWithUnknownCause() throws {
@@ -4377,6 +4643,7 @@ final class RemoteCellularControlTests: XCTestCase {
             contentsOf: root.appendingPathComponent("iOS/IOSNotificationController.swift"), encoding: .utf8
         )
         XCTAssertTrue(iOSSource.contains("StartCellularConversationAction(handle, cellularService: selectedService)"))
+        XCTAssertTrue(iOSSource.contains("StartCellularConversationAction(handle)"))
         XCTAssertTrue(iOSSource.contains("TelephonyConversationManager.sharedInstance.startCellularConversation(action)"))
         XCTAssertTrue(iOSSource.contains("TelephonyConversationManager.sharedInstance.cellularServices"))
         XCTAssertTrue(iOSSource.contains("UNKNOWN_PUBLIC_API_NOT_EXPOSED"))
@@ -4385,8 +4652,10 @@ final class RemoteCellularControlTests: XCTestCase {
         XCTAssertFalse(iOSSource.contains("UIApplication.shared.applicationState == .active"))
         XCTAssertFalse(iOSSource.contains("foregroundRequired"))
         XCTAssertFalse(iOSSource.contains("PushKit"))
-        XCTAssertFalse(iOSSource.contains("StartCellularConversationAction(handle)"))
         XCTAssertFalse(iOSSource.contains("cellularServices.first"))
+        XCTAssertFalse(iOSSource.contains("UIApplication.shared.open"))
+        XCTAssertFalse(iOSSource.contains("\"tel:"))
+        XCTAssertFalse(iOSSource.contains("CellularService(id: UUID("))
         for source in [watchSource, notificationSource] {
             XCTAssertFalse(source.contains("StartCellularConversationAction"))
             XCTAssertFalse(source.contains("startCellularConversation("))
@@ -4404,13 +4673,16 @@ final class RemoteCellularControlTests: XCTestCase {
         XCTAssertTrue(iOSSource.contains("Request within TTL now"))
         XCTAssertTrue(iOSSource.contains("App confirmation required"))
         XCTAssertTrue(iOSSource.contains("Explicit cellular service passed"))
+        XCTAssertTrue(iOSSource.contains("System-managed public start used"))
+        XCTAssertTrue(iOSSource.contains("Підтверджую контрольний режим"))
+        XCTAssertTrue(iOSSource.contains("реальний мобільний виклик"))
         XCTAssertFalse(iOSSource.contains("Server verified fresh"))
         XCTAssertFalse(iOSSource.contains("User action required"))
         XCTAssertFalse(iOSSource.contains("SIM picker absent"))
         XCTAssertFalse(iOSSource.contains("CONNECTED"))
 
         let publicStart = try XCTUnwrap(
-            iOSSource.range(of: "try await starter.startCellularConversation(to: transientNumber, using: preparedService)")
+            iOSSource.range(of: "try await starter.startCellularConversation(to: transientNumber, using: preparedStart)")
         )
         let immediateClear = try XCTUnwrap(
             iOSSource.range(of: "transientNumber.removeAll(keepingCapacity: false)", range: publicStart.upperBound..<iOSSource.endIndex)
@@ -4535,6 +4807,13 @@ final class RemoteCellularControlTests: XCTestCase {
         return RemoteCellularLineSelectionStore(defaults: defaults)
     }
 
+    private static func executionModeStore() -> RemoteCellularExecutionModeStore {
+        let suite = "RemoteCellularExecutionMode.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        defaults.removePersistentDomain(forName: suite)
+        return RemoteCellularExecutionModeStore(defaults: defaults)
+    }
+
     private static func view(
         requestID: UUID,
         state: RemoteCellularControlState,
@@ -4584,7 +4863,8 @@ final class RemoteCellularControlTests: XCTestCase {
             api: api,
             accountStore: accountStore,
             starter: starter,
-            lineSelectionStore: selectionStore
+            lineSelectionStore: selectionStore,
+            executionModeStore: Self.executionModeStore()
         )
     }
 }
@@ -4596,17 +4876,21 @@ private final class RemoteCellularStarterSpy: CellularConversationStarting {
     private(set) var numbers: [String] = []
     private(set) var preparedServiceIDs: [UUID] = []
     private(set) var startedServiceIDs: [UUID] = []
+    private(set) var preparedSystemManagedCount = 0
+    private(set) var startedModes: [RemoteCellularExecutionMode] = []
     private(set) var availableServicesReadCount = 0
     var services: [RemoteCellularServiceOption]
     private let error: Error?
     private let availableServicesError: Error?
     private let beforeStart: (() async -> Void)?
+    private let beforePrepareSystemManaged: (() -> Void)?
     var beforeAvailableServices: (() -> Void)?
 
     init(
         services: [RemoteCellularServiceOption]? = nil,
         error: Error? = nil,
         availableServicesError: Error? = nil,
+        beforePrepareSystemManaged: (() -> Void)? = nil,
         beforeStart: (() async -> Void)? = nil
     ) {
         self.services = services ?? [
@@ -4614,6 +4898,7 @@ private final class RemoteCellularStarterSpy: CellularConversationStarting {
         ]
         self.error = error
         self.availableServicesError = availableServicesError
+        self.beforePrepareSystemManaged = beforePrepareSystemManaged
         self.beforeStart = beforeStart
     }
 
@@ -4624,19 +4909,32 @@ private final class RemoteCellularStarterSpy: CellularConversationStarting {
         return services
     }
 
-    func prepareCellularService(id: UUID) throws -> RemoteCellularPreparedService {
+    func prepareCellularService(id: UUID) throws -> RemoteCellularPreparedStart {
         let matches = services.filter { $0.id == id }
         guard !matches.isEmpty else { throw RemoteCellularLocalError.selectedLineUnavailable }
         guard matches.count == 1, let selected = matches.first else {
             throw RemoteCellularLocalError.ambiguousLine
         }
         preparedServiceIDs.append(id)
-        return RemoteCellularPreparedService(id: selected.id, label: selected.label) { _ in }
+        return RemoteCellularPreparedStart(
+            mode: .strictExplicitSIM,
+            explicitServiceID: selected.id,
+            explicitServiceLabel: selected.label
+        ) { _ in }
     }
 
-    func startCellularConversation(to e164: String, using service: RemoteCellularPreparedService) async throws {
+    func prepareSystemManagedStart() throws -> RemoteCellularPreparedStart {
+        beforePrepareSystemManaged?()
+        preparedSystemManagedCount += 1
+        return RemoteCellularPreparedStart(mode: .systemManagedDiagnostic) { _ in }
+    }
+
+    func startCellularConversation(to e164: String, using preparedStart: RemoteCellularPreparedStart) async throws {
         numbers.append(e164)
-        startedServiceIDs.append(service.id)
+        startedModes.append(preparedStart.mode)
+        if let serviceID = preparedStart.explicitServiceID {
+            startedServiceIDs.append(serviceID)
+        }
         await beforeStart?()
         if let error { throw error }
     }
@@ -4652,6 +4950,7 @@ private actor RemoteControlAPIStub: RemoteCellularControlAPI {
     private var completionValues: [RemoteCellularStartResult] = []
     private var completionErrorDomains: [String] = []
     private var attemptCountsAtStarterInvocation: [Int] = []
+    private var claimCountsAtStarterInvocation: [Int] = []
     private var receiptContext: RemoteCellularReceiptContext?
 
     init(view: RemoteCellularControlView, grant: RemoteCellularControlStartGrant) {
@@ -4712,8 +5011,12 @@ private actor RemoteControlAPIStub: RemoteCellularControlAPI {
     }
     func results() -> [RemoteCellularStartResult] { completionValues }
     func errorDomains() -> [String] { completionErrorDomains }
-    func observeStarterInvocation() { attemptCountsAtStarterInvocation.append(attemptCount) }
+    func observeStarterInvocation() {
+        attemptCountsAtStarterInvocation.append(attemptCount)
+        claimCountsAtStarterInvocation.append(claimCount)
+    }
     func starterAttemptObservations() -> [Int] { attemptCountsAtStarterInvocation }
+    func starterClaimObservations() -> [Int] { claimCountsAtStarterInvocation }
 
     private func replacing(
         state: RemoteCellularControlState,

@@ -255,6 +255,9 @@ struct WatchRemoteCellularControlView: View {
                 Task { await probe.submit(transientE164: transientNumber) }
             }
             .disabled(probe.state == .requesting || e164.isEmpty)
+            Text("Source-line mode is configured locally on iPhone. SYSTEM_START_ACCEPTED means API acceptance only—not a connected call, hidden SIM picker, or Watch audio.")
+                .font(.caption2)
+                .foregroundStyle(.secondary)
             line("State", probe.state.rawValue)
             line("Request", probe.requestID?.uuidString.lowercased() ?? "none")
             line("APNs", probe.deliveryStatus)

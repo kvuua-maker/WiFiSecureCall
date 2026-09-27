@@ -22,8 +22,9 @@ final class RemoteCellularExactlyOnceCompletion<Result> {
 @MainActor
 protocol CellularConversationStarting: AnyObject {
     func availableCellularServices() throws -> [RemoteCellularServiceOption]
-    func prepareCellularService(id: UUID) throws -> RemoteCellularPreparedService
-    func startCellularConversation(to e164: String, using service: RemoteCellularPreparedService) async throws
+    func prepareCellularService(id: UUID) throws -> RemoteCellularPreparedStart
+    func prepareSystemManagedStart() throws -> RemoteCellularPreparedStart
+    func startCellularConversation(to e164: String, using preparedStart: RemoteCellularPreparedStart) async throws
 }
 
 enum RemoteCellularLocalError: String, Error {
@@ -33,11 +34,17 @@ enum RemoteCellularLocalError: String, Error {
     case ownerLineMappingRequired = "OWNER_LINE_MAPPING_REQUIRED"
     case selectedLineUnavailable = "SELECTED_CELLULAR_SERVICE_UNAVAILABLE"
     case ambiguousLine = "AMBIGUOUS_CELLULAR_SERVICE_ID"
+    case startModeMismatch = "CELLULAR_START_MODE_MISMATCH"
 }
 
 struct RemoteCellularServiceOption: Identifiable, Equatable, Sendable {
     let id: UUID
     let label: String
+}
+
+enum RemoteCellularExecutionMode: String, Equatable, Sendable {
+    case strictExplicitSIM = "STRICT_EXPLICIT_SIM"
+    case systemManagedDiagnostic = "SYSTEM_MANAGED_DIAGNOSTIC"
 }
 
 enum RemoteCellularServiceCatalogState: String, Equatable, Sendable {
@@ -54,18 +61,21 @@ enum RemoteCellularDefaultCallingRoleStatus: String, Equatable, Sendable {
 }
 
 @MainActor
-struct RemoteCellularPreparedService {
-    let id: UUID
-    let label: String
+struct RemoteCellularPreparedStart {
+    let mode: RemoteCellularExecutionMode
+    let explicitServiceID: UUID?
+    let explicitServiceLabel: String?
     private let operation: @MainActor (String) async throws -> Void
 
     init(
-        id: UUID,
-        label: String,
+        mode: RemoteCellularExecutionMode,
+        explicitServiceID: UUID? = nil,
+        explicitServiceLabel: String? = nil,
         operation: @escaping @MainActor (String) async throws -> Void
     ) {
-        self.id = id
-        self.label = label
+        self.mode = mode
+        self.explicitServiceID = explicitServiceID
+        self.explicitServiceLabel = explicitServiceLabel
         self.operation = operation
     }
 
@@ -95,6 +105,31 @@ final class RemoteCellularLineSelectionStore {
     }
 }
 
+final class RemoteCellularExecutionModeStore {
+    private let defaults: UserDefaults
+    private let keyPrefix = "WiFiSecureCall.remoteCellular.executionMode.v1."
+
+    init(defaults: UserDefaults = .standard) {
+        self.defaults = defaults
+    }
+
+    func mode(for accountID: UUID) -> RemoteCellularExecutionMode {
+        guard let rawValue = defaults.string(forKey: key(for: accountID)),
+              let mode = RemoteCellularExecutionMode(rawValue: rawValue) else {
+            return .strictExplicitSIM
+        }
+        return mode
+    }
+
+    func setMode(_ mode: RemoteCellularExecutionMode, for accountID: UUID) {
+        defaults.set(mode.rawValue, forKey: key(for: accountID))
+    }
+
+    private func key(for accountID: UUID) -> String {
+        keyPrefix + accountID.uuidString.lowercased()
+    }
+}
+
 @MainActor
 final class IOSPublicCellularConversationStarter: CellularConversationStarting {
     func availableCellularServices() throws -> [RemoteCellularServiceOption] {
@@ -106,7 +141,7 @@ final class IOSPublicCellularConversationStarter: CellularConversationStarting {
         }
     }
 
-    func prepareCellularService(id: UUID) throws -> RemoteCellularPreparedService {
+    func prepareCellularService(id: UUID) throws -> RemoteCellularPreparedStart {
         guard #available(iOS 26.0, *) else {
             throw RemoteCellularLocalError.unsupportedOS
         }
@@ -115,18 +150,33 @@ final class IOSPublicCellularConversationStarter: CellularConversationStarting {
         guard matches.count == 1, let selectedService = matches.first else {
             throw RemoteCellularLocalError.ambiguousLine
         }
-        return RemoteCellularPreparedService(id: selectedService.id, label: selectedService.label) { number in
+        return RemoteCellularPreparedStart(
+            mode: .strictExplicitSIM,
+            explicitServiceID: selectedService.id,
+            explicitServiceLabel: selectedService.label
+        ) { number in
             let handle = Handle(type: .phoneNumber, value: number)
             let action = StartCellularConversationAction(handle, cellularService: selectedService)
             try await TelephonyConversationManager.sharedInstance.startCellularConversation(action)
         }
     }
 
-    func startCellularConversation(to e164: String, using service: RemoteCellularPreparedService) async throws {
+    func prepareSystemManagedStart() throws -> RemoteCellularPreparedStart {
+        guard #available(iOS 26.0, *) else {
+            throw RemoteCellularLocalError.unsupportedOS
+        }
+        return RemoteCellularPreparedStart(mode: .systemManagedDiagnostic) { number in
+            let handle = Handle(type: .phoneNumber, value: number)
+            let action = StartCellularConversationAction(handle)
+            try await TelephonyConversationManager.sharedInstance.startCellularConversation(action)
+        }
+    }
+
+    func startCellularConversation(to e164: String, using preparedStart: RemoteCellularPreparedStart) async throws {
         guard let number = RemoteCellularControlPolicy.normalizedE164(e164) else {
             throw RemoteCellularLocalError.invalidNumber
         }
-        try await service.start(number)
+        try await preparedStart.start(number)
     }
 }
 
@@ -142,6 +192,9 @@ final class IOSRemoteCellularControlCoordinator: ObservableObject {
     @Published private(set) var selectedCellularServiceLabel: String?
     @Published private(set) var cellularLineSelectionState = "OWNER_LINE_MAPPING_REQUIRED"
     @Published private(set) var explicitCellularServicePassed = false
+    @Published private(set) var systemManagedPublicStartUsed = false
+    @Published private(set) var executionMode: RemoteCellularExecutionMode = .strictExplicitSIM
+    @Published private(set) var executionModeSnapshot: RemoteCellularExecutionMode?
     @Published private(set) var cellularServiceCatalogState: RemoteCellularServiceCatalogState = .notChecked
     @Published private(set) var cellularServiceCatalogCount = 0
     @Published private(set) var cellularServiceCatalogReadAt: Date?
@@ -155,6 +208,7 @@ final class IOSRemoteCellularControlCoordinator: ObservableObject {
     private let accountStore: AccountSessionStore
     private let starter: any CellularConversationStarting
     private let lineSelectionStore: RemoteCellularLineSelectionStore
+    private let executionModeStore: RemoteCellularExecutionModeStore
     private var claimMutationIDs: [UUID: UUID] = [:]
     private var startAttemptMutationIDs: [UUID: UUID] = [:]
     private var completionMutationIDs: [UUID: UUID] = [:]
@@ -166,7 +220,8 @@ final class IOSRemoteCellularControlCoordinator: ObservableObject {
             api: runtime.accountAPI,
             accountStore: runtime.accountStore,
             starter: IOSPublicCellularConversationStarter(),
-            lineSelectionStore: RemoteCellularLineSelectionStore()
+            lineSelectionStore: RemoteCellularLineSelectionStore(),
+            executionModeStore: RemoteCellularExecutionModeStore()
         )
     }
 
@@ -174,12 +229,15 @@ final class IOSRemoteCellularControlCoordinator: ObservableObject {
         api: any RemoteCellularControlAPI,
         accountStore: AccountSessionStore,
         starter: any CellularConversationStarting,
-        lineSelectionStore: RemoteCellularLineSelectionStore = RemoteCellularLineSelectionStore()
+        lineSelectionStore: RemoteCellularLineSelectionStore = RemoteCellularLineSelectionStore(),
+        executionModeStore: RemoteCellularExecutionModeStore = RemoteCellularExecutionModeStore()
     ) {
         self.api = api
         self.accountStore = accountStore
         self.starter = starter
         self.lineSelectionStore = lineSelectionStore
+        self.executionModeStore = executionModeStore
+        executionMode = accountStore.activeAccountID.map(executionModeStore.mode(for:)) ?? .strictExplicitSIM
     }
 
     func refreshCellularLines() {
@@ -207,7 +265,20 @@ final class IOSRemoteCellularControlCoordinator: ObservableObject {
     }
 
     func activeAccountDidChange() {
+        executionMode = accountStore.activeAccountID.map(executionModeStore.mode(for:)) ?? .strictExplicitSIM
         refreshCellularLines()
+    }
+
+    func useStrictExplicitSIMMode() {
+        guard let accountID = accountStore.activeAccountID else { return }
+        executionModeStore.setMode(.strictExplicitSIM, for: accountID)
+        executionMode = .strictExplicitSIM
+    }
+
+    func confirmSystemManagedDiagnosticOptIn() {
+        guard let accountID = accountStore.activeAccountID else { return }
+        executionModeStore.setMode(.systemManagedDiagnostic, for: accountID)
+        executionMode = .systemManagedDiagnostic
     }
 
     func selectCellularLine(_ serviceID: UUID) {
@@ -289,6 +360,8 @@ final class IOSRemoteCellularControlCoordinator: ObservableObject {
     ) async {
         if diagnostic?.requestID != envelope.requestID {
             explicitCellularServicePassed = false
+            systemManagedPublicStartUsed = false
+            executionModeSnapshot = nil
         }
         let automaticBackgroundAttempt = context == .background || context == .inactive
         guard accountStore.accounts.contains(where: { $0.accountID == envelope.accountID }) else {
@@ -371,19 +444,35 @@ final class IOSRemoteCellularControlCoordinator: ObservableObject {
             return
         }
 
-        let preparedService: RemoteCellularPreparedService
+        let modeSnapshot = executionModeStore.mode(for: current.accountID)
+        executionModeSnapshot = modeSnapshot
+        let preparedStart: RemoteCellularPreparedStart
         do {
-            guard let selectedID = lineSelectionStore.selectedServiceID(for: current.accountID) else {
-                throw RemoteCellularLocalError.ownerLineMappingRequired
+            switch modeSnapshot {
+            case .strictExplicitSIM:
+                guard let selectedID = lineSelectionStore.selectedServiceID(for: current.accountID) else {
+                    throw RemoteCellularLocalError.ownerLineMappingRequired
+                }
+                preparedStart = try starter.prepareCellularService(id: selectedID)
+                guard preparedStart.mode == .strictExplicitSIM,
+                      preparedStart.explicitServiceID == selectedID else {
+                    throw RemoteCellularLocalError.startModeMismatch
+                }
+                selectedCellularServiceID = preparedStart.explicitServiceID
+                selectedCellularServiceLabel = preparedStart.explicitServiceLabel
+                storedCellularServiceIDPresent = true
+                storedCellularServiceIDMatchesCatalog = true
+                cellularLineSelectionState = "EXPLICIT_CELLULAR_SERVICE_SELECTED"
+            case .systemManagedDiagnostic:
+                preparedStart = try starter.prepareSystemManagedStart()
+                guard preparedStart.mode == .systemManagedDiagnostic,
+                      preparedStart.explicitServiceID == nil else {
+                    throw RemoteCellularLocalError.startModeMismatch
+                }
             }
-            preparedService = try starter.prepareCellularService(id: selectedID)
-            selectedCellularServiceID = preparedService.id
-            selectedCellularServiceLabel = preparedService.label
-            storedCellularServiceIDPresent = true
-            storedCellularServiceIDMatchesCatalog = true
-            cellularLineSelectionState = "EXPLICIT_CELLULAR_SERVICE_SELECTED"
         } catch {
             explicitCellularServicePassed = false
+            systemManagedPublicStartUsed = false
             updatePreStartFailure(Self.safeError(error))
             return
         }
@@ -391,6 +480,7 @@ final class IOSRemoteCellularControlCoordinator: ObservableObject {
         isStarting = true
         locallyConsumed.insert(current.requestID)
         explicitCellularServicePassed = false
+        systemManagedPublicStartUsed = false
         defer { isStarting = false }
         let claimID = claimMutationIDs[current.requestID] ?? UUID()
         claimMutationIDs[current.requestID] = claimID
@@ -424,8 +514,9 @@ final class IOSRemoteCellularControlCoordinator: ObservableObject {
 
             let publicStartError: Error?
             do {
-                explicitCellularServicePassed = true
-                try await starter.startCellularConversation(to: transientNumber, using: preparedService)
+                explicitCellularServicePassed = modeSnapshot == .strictExplicitSIM
+                systemManagedPublicStartUsed = modeSnapshot == .systemManagedDiagnostic
+                try await starter.startCellularConversation(to: transientNumber, using: preparedStart)
                 publicStartError = nil
             } catch {
                 publicStartError = error
@@ -621,6 +712,7 @@ struct IOSRemoteCellularControlView: View {
     @Environment(\.dismiss) private var dismiss
     @ObservedObject var coordinator: IOSRemoteCellularControlCoordinator
     @ObservedObject private var accountStore: AccountSessionStore
+    @State private var showSystemManagedConfirmation = false
 
     init(
         coordinator: IOSRemoteCellularControlCoordinator = .shared,
@@ -633,6 +725,25 @@ struct IOSRemoteCellularControlView: View {
     var body: some View {
         NavigationView {
             List {
+                Section("Режим контрольного запуску") {
+                    line("Поточний локальний режим", coordinator.executionMode.rawValue)
+                    if coordinator.executionMode == .strictExplicitSIM {
+                        Text("Explicit selected SIM: суворий стандартний режим. Запуск можливий лише з реально вибраною системною лінією.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                        Button("Увімкнути System-managed diagnostic") {
+                            showSystemManagedConfirmation = true
+                        }
+                        .disabled(accountStore.activeAccountID == nil)
+                    } else {
+                        Text("System-managed diagnostic: застосунок не примушує збережену SIM. iOS визначає лінію та може показати системний вибір або підтвердження; це не гарантовано.")
+                            .font(.caption)
+                            .foregroundStyle(.orange)
+                        Button("Повернути суворий Explicit selected SIM") {
+                            coordinator.useStrictExplicitSIMMode()
+                        }
+                    }
+                }
                 Section("Outgoing cellular line") {
                     if coordinator.cellularServiceCatalogState == .loading {
                         ProgressView("Reading public cellular services")
@@ -687,10 +798,15 @@ struct IOSRemoteCellularControlView: View {
                     line("State", value.state.rawValue)
                     line("App confirmation required", value.appConfirmationRequired ? "YES" : "NO")
                     line("Start claim obtained", value.startClaimObtained ? "YES" : "NO")
+                    line("iPhone mode snapshot", coordinator.executionModeSnapshot?.rawValue ?? "none")
                     line("Explicit cellular service passed", coordinator.explicitCellularServicePassed ? "YES" : "NO")
+                    line("System-managed public start used", coordinator.systemManagedPublicStartUsed ? "YES" : "NO")
                     line("System start attempted", value.systemStartAttempted ? "YES" : "NO")
                     line("Public start returned", value.publicStartReturnedSuccess.map { $0 ? "SUCCESS" : "ERROR" } ?? "NOT_RETURNED")
                     line("Result", value.safeResult)
+                    Text("SYSTEM_START_ACCEPTED означає лише прийняття запиту публічним API — не з’єднаний виклик, не відсутність системного вибору SIM і не звук на Watch.")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
                     if value.appConfirmationRequired && value.sameOwnerAuthorized {
                         Button("Start cellular conversation") {
                             Task { await coordinator.startPendingControl() }
@@ -703,8 +819,20 @@ struct IOSRemoteCellularControlView: View {
             }
             .navigationTitle("Remote cellular probe")
             .toolbar { ToolbarItem(placement: .cancellationAction) { Button("Close") { dismiss() } } }
-            .onAppear { coordinator.refreshCellularLines() }
+            .onAppear { coordinator.activeAccountDidChange() }
             .onChange(of: accountStore.activeAccountID) { _ in coordinator.activeAccountDidChange() }
+            .confirmationDialog(
+                "Увімкнути System-managed diagnostic?",
+                isPresented: $showSystemManagedConfirmation,
+                titleVisibility: .visible
+            ) {
+                Button("Підтверджую контрольний режим", role: .destructive) {
+                    coordinator.confirmSystemManagedDiagnosticOptIn()
+                }
+                Button("Скасувати", role: .cancel) {}
+            } message: {
+                Text("Цей режим не забезпечує збережену SIM. iOS може показати вибір або підтвердження, але це не гарантовано. Після явного натискання кнопки на Watch може початися реальний мобільний виклик. Це контрольний тест, не автоматичний production-виклик.")
+            }
         }
     }
 
