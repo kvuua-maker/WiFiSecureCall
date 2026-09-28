@@ -10,6 +10,7 @@ struct IOSRootView: View {
     @State private var showDialDiagnostics = false
     @State private var showCarrierCallingProbe = false
     @State private var showRemoteCellularControl = false
+    @State private var showShortcutExecutionProbe = false
 
     var body: some View {
         VStack(spacing: 24) {
@@ -35,6 +36,9 @@ struct IOSRootView: View {
         .sheet(isPresented: $showCarrierCallingProbe) { CarrierCallingDiagnosticView() }
         .sheet(isPresented: $showRemoteCellularControl, onDismiss: { remoteCellular.dismissPresentation() }) {
             IOSRemoteCellularControlView(coordinator: remoteCellular)
+        }
+        .sheet(isPresented: $showShortcutExecutionProbe) {
+            WatchRemoteExecutionProbeSetupView()
         }
         .onChange(of: remoteCellular.presentationRequested) { requested in
             if requested { showRemoteCellularControl = true }
@@ -65,6 +69,7 @@ struct IOSRootView: View {
                 Button("Dial diagnostics") { showDialDiagnostics = true }.font(.footnote)
                 Button("Carrier calling probe") { showCarrierCallingProbe = true }.font(.footnote)
                 Button("Remote cellular probe") { showRemoteCellularControl = true }.font(.footnote)
+                Button("Shortcut execution probe") { showShortcutExecutionProbe = true }.font(.footnote)
             }
         case .outgoingRinging:
             Button("Cancel", role: .destructive) { Task { await session.cancel() } }
