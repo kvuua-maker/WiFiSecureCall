@@ -101,12 +101,28 @@ final class WatchNotificationController: NSObject, WKApplicationDelegate, UNUser
     private static func authorizationStatus(_ status: UNAuthorizationStatus, error: Error?) -> String { if error != nil { return "error" }; switch status { case .notDetermined: return "notDetermined"; case .denied: return "denied"; case .authorized: return "authorized"; case .provisional: return "provisional"; case .ephemeral: return "ephemeral"; @unknown default: return "unknown" } }
 
     nonisolated func userNotificationCenter(_ center: UNUserNotificationCenter, willPresent notification: UNNotification, withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void) {
+        if let envelope = SecureMessagePushEnvelope.parse(notification.request.content.userInfo) {
+            Task { @MainActor in
+                if NotificationRuntime.shared.accountStore.accounts.contains(where: { $0.accountID == envelope.accountID }) {
+                    await SecureMessageStore.shared.loadMessages(conversationID: envelope.conversationID, accountID: envelope.accountID)
+                }
+            }
+            completionHandler([.banner, .sound])
+            return
+        }
         guard let envelope = ForegroundIncomingNotification.envelope(from: notification.request.content.userInfo) else { completionHandler([.banner, .sound]); return }
         Task { @MainActor in await self.handle(envelope, voip: false, requestAnswer: false) }
         completionHandler([])
     }
 
     nonisolated func userNotificationCenter(_ center: UNUserNotificationCenter, didReceive response: UNNotificationResponse) async {
+        if let envelope = SecureMessagePushEnvelope.parse(response.notification.request.content.userInfo) {
+            await MainActor.run {
+                guard NotificationRuntime.shared.accountStore.accounts.contains(where: { $0.accountID == envelope.accountID }) else { return }
+                Task { await SecureMessageStore.shared.loadMessages(conversationID: envelope.conversationID, accountID: envelope.accountID) }
+            }
+            return
+        }
         guard let envelope = IncomingNotificationEnvelope.parse(response.notification.request.content.userInfo) else { return }
         let callID: UUID
         switch envelope { case let .legacy(value): callID = value; case let .account(value, _): callID = value; case let .user(value, _, _): callID = value }
