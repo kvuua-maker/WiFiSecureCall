@@ -20,6 +20,12 @@ final class IOSNotificationController: NSObject, UIApplicationDelegate, UNUserNo
             UNNotificationAction(identifier: "REJECT", title: "Reject")
         ], intentIdentifiers: []), UNNotificationCategory(identifier: "REMOTE_CELLULAR_CONTROL", actions: [
             UNNotificationAction(identifier: "OPEN_REMOTE_CELLULAR_CONTROL", title: "Review", options: .foreground)
+        ], intentIdentifiers: []), UNNotificationCategory(identifier: RemoteCellularNotificationActionPolicy.categoryIdentifier, actions: [
+            UNNotificationAction(
+                identifier: RemoteCellularNotificationActionPolicy.actionIdentifier,
+                title: "Запустити на iPhone",
+                options: []
+            )
         ], intentIdentifiers: [])])
         application.registerForRemoteNotifications(); configureVoIPPushes()
         Task { await NotificationRuntime.shared.api.reportNotificationDiagnostic(event: "apns_registration_started", status: "started") }
@@ -99,7 +105,8 @@ final class IOSNotificationController: NSObject, UIApplicationDelegate, UNUserNo
         didReceiveRemoteNotification userInfo: [AnyHashable: Any],
         fetchCompletionHandler completionHandler: @escaping (UIBackgroundFetchResult) -> Void
     ) {
-        guard let envelope = RemoteCellularControlPushEnvelope.parse(userInfo) else {
+        guard let envelope = RemoteCellularControlPushEnvelope.parse(userInfo),
+              envelope.event == .silentBackground else {
             completionHandler(.noData)
             return
         }
@@ -127,6 +134,10 @@ final class IOSNotificationController: NSObject, UIApplicationDelegate, UNUserNo
 
     nonisolated func userNotificationCenter(_ center: UNUserNotificationCenter, willPresent notification: UNNotification, withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void) {
         if let envelope = RemoteCellularControlPushEnvelope.parse(notification.request.content.userInfo) {
+            guard envelope.event == .silentBackground else {
+                completionHandler([.banner, .sound])
+                return
+            }
             Task { @MainActor in
                 await IOSRemoteCellularControlCoordinator.shared.receive(
                     envelope,
@@ -147,11 +158,23 @@ final class IOSNotificationController: NSObject, UIApplicationDelegate, UNUserNo
             let applicationState = await MainActor.run {
                 Self.remoteApplicationState(UIApplication.shared.applicationState)
             }
-            await IOSRemoteCellularControlCoordinator.shared.receive(
-                envelope,
-                context: .openedFromNotification,
-                applicationState: applicationState
-            )
+            if envelope.event == .notificationAction {
+                guard RemoteCellularNotificationActionPolicy.accepts(
+                    envelope: envelope,
+                    categoryIdentifier: response.notification.request.content.categoryIdentifier,
+                    actionIdentifier: response.actionIdentifier
+                ) else { return }
+                await IOSRemoteCellularControlCoordinator.shared.receiveNotificationAction(
+                    envelope,
+                    applicationState: applicationState
+                )
+            } else {
+                await IOSRemoteCellularControlCoordinator.shared.receive(
+                    envelope,
+                    context: .openedFromNotification,
+                    applicationState: applicationState
+                )
+            }
             return
         }
         guard let envelope = IncomingNotificationEnvelope.parse(response.notification.request.content.userInfo) else { return }

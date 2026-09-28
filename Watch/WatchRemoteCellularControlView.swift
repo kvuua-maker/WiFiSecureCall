@@ -12,13 +12,16 @@ final class WatchRemoteCellularControlProbe: ObservableObject {
         case serverAccepted = "SERVER_ACCEPTED"
         case iPhoneDeliveryPending = "IPHONE_DELIVERY_PENDING"
         case iPhoneBackgroundReceived = "IPHONE_BACKGROUND_RECEIVED"
+        case iPhoneNotificationActionReceived = "IPHONE_NOTIFICATION_ACTION_RECEIVED"
         case iPhoneActionRequired = "IPHONE_ACTION_REQUIRED"
         case iPhoneStartAuthorized = "IPHONE_START_AUTHORIZED"
         case iPhoneBackgroundStartAttempted = "IPHONE_BACKGROUND_START_ATTEMPTED"
         case iPhoneForegroundStartAttempted = "IPHONE_FOREGROUND_START_ATTEMPTED"
+        case iPhoneNotificationActionStartAttempted = "IPHONE_NOTIFICATION_ACTION_START_ATTEMPTED"
         case systemStartAccepted = "SYSTEM_START_ACCEPTED"
         case publicStartError = "PUBLIC_START_ERROR"
         case backgroundExecutionNotObserved = "BACKGROUND_EXECUTION_NOT_OBSERVED"
+        case notificationActionNotObserved = "NOTIFICATION_ACTION_NOT_OBSERVED"
         case failedSafe = "FAILED_SAFE"
         case expired = "EXPIRED"
         case cancelled = "CANCELLED"
@@ -32,6 +35,13 @@ final class WatchRemoteCellularControlProbe: ObservableObject {
     @Published private(set) var startAttempted = false
     @Published private(set) var safeResult = "NOT_STARTED"
     @Published private(set) var submissionResult = "READY"
+    @Published var selectedDeliveryMode: RemoteCellularDeliveryMode = .silentBackground
+    @Published private(set) var requestDeliveryMode: RemoteCellularDeliveryMode?
+    @Published private(set) var ordinaryReceiptObserved = false
+    @Published private(set) var notificationActionReceived = false
+    @Published private(set) var ordinaryReceivedAt: Date?
+    @Published private(set) var notificationActionReceivedAt: Date?
+    @Published private(set) var iPhoneApplicationState: RemoteCellularApplicationState?
 
     private let api: any RemoteCellularControlAPI
     private let accountStore: AccountSessionStore
@@ -53,7 +63,8 @@ final class WatchRemoteCellularControlProbe: ObservableObject {
     var canCancel: Bool {
         switch state {
         case .requesting, .serverAccepted, .iPhoneDeliveryPending,
-             .iPhoneBackgroundReceived, .iPhoneActionRequired:
+             .iPhoneBackgroundReceived, .iPhoneNotificationActionReceived,
+             .iPhoneActionRequired:
             return requestID != nil
         default:
             return false
@@ -94,20 +105,40 @@ final class WatchRemoteCellularControlProbe: ObservableObject {
         pollTask?.cancel()
         pollTask = nil
         requestID = controlID
+        let deliveryModeSnapshot = selectedDeliveryMode
+        requestDeliveryMode = deliveryModeSnapshot
         controlAccountID = accountID
         cancelMutationID = UUID()
         deliveryStatus = "NOT_SUBMITTED"
         iPhoneReceived = false
+        ordinaryReceiptObserved = false
+        notificationActionReceived = false
+        ordinaryReceivedAt = nil
+        notificationActionReceivedAt = nil
+        iPhoneApplicationState = nil
         startAttempted = false
         state = .requesting
         safeResult = "REQUESTING"
         submissionResult = "REQUEST_ACCEPTED_LOCALLY"
         do {
-            let result = try await api.createRemoteCellularControl(
-                accountID: accountID,
-                requestID: controlID,
-                phoneNumber: number
-            )
+            let result: RemoteCellularControlView
+            switch deliveryModeSnapshot {
+            case .silentBackground:
+                result = try await api.createRemoteCellularControl(
+                    accountID: accountID,
+                    requestID: controlID,
+                    phoneNumber: number
+                )
+            case .notificationAction:
+                result = try await api.createRemoteCellularNotificationActionControl(
+                    accountID: accountID,
+                    requestID: controlID,
+                    phoneNumber: number
+                )
+            }
+            guard result.effectiveDeliveryMode == deliveryModeSnapshot else {
+                throw AccountAPIError.status(409, AccountAPIErrorResponse(error: "delivery_mode_mismatch", retryAt: nil))
+            }
             apply(result)
             if liveRequestGate.isLive {
                 beginPolling(accountID: accountID, requestID: controlID, expiresAt: result.expiresAt)
@@ -182,8 +213,21 @@ final class WatchRemoteCellularControlProbe: ObservableObject {
     private func apply(_ value: RemoteCellularControlView) {
         guard liveRequestGate.owns(value.requestID), requestID == value.requestID else { return }
         expiresAt = value.expiresAt
+        guard requestDeliveryMode == value.effectiveDeliveryMode else {
+            state = .failedSafe
+            safeResult = "DELIVERY_MODE_MISMATCH"
+            finishLiveRequest(value.requestID)
+            return
+        }
         deliveryStatus = (value.deliveryStatus ?? "unknown").uppercased()
         iPhoneReceived = iPhoneReceived || value.receivedAt != nil
+        ordinaryReceiptObserved = ordinaryReceiptObserved || value.ordinaryReceivedAt != nil
+        notificationActionReceived = notificationActionReceived || value.notificationActionReceivedAt != nil
+        ordinaryReceivedAt = ordinaryReceivedAt ?? value.ordinaryReceivedAt
+        notificationActionReceivedAt = notificationActionReceivedAt ?? value.notificationActionReceivedAt
+        if value.applicationState != nil {
+            iPhoneApplicationState = value.applicationState
+        }
         startAttempted = startAttempted || value.startAttemptedAt != nil
         switch value.state {
         case .deliveryPending:
@@ -195,6 +239,9 @@ final class WatchRemoteCellularControlProbe: ObservableObject {
         case .iPhoneBackgroundReceived:
             state = .iPhoneBackgroundReceived
             safeResult = "IPHONE_BACKGROUND_RECEIVED"
+        case .iPhoneNotificationActionReceived:
+            state = .iPhoneNotificationActionReceived
+            safeResult = "IPHONE_NOTIFICATION_ACTION_RECEIVED"
         case .iPhoneStartAuthorized:
             state = .iPhoneStartAuthorized
             safeResult = "IPHONE_START_AUTHORIZED"
@@ -204,6 +251,9 @@ final class WatchRemoteCellularControlProbe: ObservableObject {
         case .iPhoneForegroundStartAttempted:
             state = .iPhoneForegroundStartAttempted
             safeResult = "IPHONE_FOREGROUND_START_ATTEMPTED"
+        case .iPhoneNotificationActionStartAttempted:
+            state = .iPhoneNotificationActionStartAttempted
+            safeResult = "IPHONE_NOTIFICATION_ACTION_START_ATTEMPTED"
         case .systemStartAccepted:
             state = .systemStartAccepted
             safeResult = "SYSTEM_START_ACCEPTED"
@@ -214,7 +264,10 @@ final class WatchRemoteCellularControlProbe: ObservableObject {
             state = .cancelled
             safeResult = "CANCELLED_BEFORE_SYSTEM_START"
         case .expired:
-            if value.terminalReason == "background_execution_not_observed" {
+            if value.terminalReason == "notification_action_not_observed" {
+                state = .notificationActionNotObserved
+                safeResult = "NOTIFICATION_ACTION_NOT_OBSERVED"
+            } else if value.terminalReason == "background_execution_not_observed" {
                 state = .backgroundExecutionNotObserved
                 safeResult = "BACKGROUND_EXECUTION_NOT_OBSERVED"
             } else {
@@ -232,7 +285,10 @@ final class WatchRemoteCellularControlProbe: ObservableObject {
 
     private func finishPollingDeadline(requestID: UUID) {
         guard liveRequestGate.owns(requestID) else { return }
-        if deliveryStatus == "SUBMISSION_ACCEPTED" && !iPhoneReceived {
+        if requestDeliveryMode == .notificationAction {
+            state = .notificationActionNotObserved
+            safeResult = "NOTIFICATION_ACTION_NOT_OBSERVED"
+        } else if deliveryStatus == "SUBMISSION_ACCEPTED" && !iPhoneReceived {
             state = .backgroundExecutionNotObserved
             safeResult = "BACKGROUND_EXECUTION_NOT_OBSERVED"
         } else {
@@ -330,6 +386,18 @@ struct WatchRemoteCellularControlView: View {
                     Color.clear.frame(minHeight: 24)
                 }
             }
+            Section("Delivery probe") {
+                Picker("Delivery", selection: $probe.selectedDeliveryMode) {
+                    Text("Silent (existing)").tag(RemoteCellularDeliveryMode.silentBackground)
+                    Text("Notification action (probe)").tag(RemoteCellularDeliveryMode.notificationAction)
+                }
+                .disabled(probe.hasLiveRequest)
+                if probe.selectedDeliveryMode == .notificationAction {
+                    Text("Потрібне додаткове натискання на пересланому сповіщенні Watch. Показ сповіщення не гарантовано; iPhone може показати системний вибір SIM.")
+                        .font(.caption2)
+                        .foregroundStyle(.orange)
+                }
+            }
             Button("Test cellular start on iPhone") {
                 let transientNumber = e164
                 Task {
@@ -345,7 +413,13 @@ struct WatchRemoteCellularControlView: View {
             line("State", probe.state.rawValue)
             line("Request", probe.requestID?.uuidString.lowercased() ?? "none")
             line("APNs", probe.deliveryStatus)
+            line("Delivery mode", probe.requestDeliveryMode?.rawValue ?? "none")
             line("iPhone received", probe.iPhoneReceived ? "YES" : "NO")
+            line("Ordinary receipt", probe.ordinaryReceiptObserved ? "YES" : "NO")
+            line("Ordinary receipt at", probe.ordinaryReceivedAt.map(Self.timestamp) ?? "none")
+            line("Notification action", probe.notificationActionReceived ? "YES" : "NO")
+            line("Notification action at", probe.notificationActionReceivedAt.map(Self.timestamp) ?? "none")
+            line("iPhone application state", probe.iPhoneApplicationState?.rawValue ?? "UNKNOWN")
             line("Start attempted", probe.startAttempted ? "YES" : "NO")
             line("Result", probe.safeResult)
             line("Submit", probe.submissionResult)
@@ -369,6 +443,10 @@ struct WatchRemoteCellularControlView: View {
             Text(title).font(.caption2)
             Text(value).font(.caption2.monospaced()).foregroundStyle(.secondary)
         }
+    }
+
+    private static func timestamp(_ date: Date) -> String {
+        ISO8601DateFormatter().string(from: date)
     }
 }
 #endif

@@ -204,6 +204,14 @@ actor AccountAPIClient {
         )
     }
 
+    func createRemoteCellularNotificationActionControl(accountID: UUID, requestID: UUID, phoneNumber: String) async throws -> RemoteCellularControlView {
+        try await authorizedV3(
+            "cellular-controls/notification-action",
+            accountID: accountID,
+            body: RemoteCellularControlCreateRequest(requestID: requestID, phoneNumber: phoneNumber)
+        )
+    }
+
     func remoteCellularControl(accountID: UUID, requestID: UUID) async throws -> RemoteCellularControlView {
         try await authorizedV3(
             "cellular-controls/\(requestID.uuidString.lowercased())",
@@ -213,11 +221,21 @@ actor AccountAPIClient {
         )
     }
 
-    func receiveRemoteCellularControl(accountID: UUID, requestID: UUID, mutationID: UUID = UUID(), context: RemoteCellularReceiptContext) async throws -> RemoteCellularControlView {
+    func receiveRemoteCellularControl(
+        accountID: UUID,
+        requestID: UUID,
+        mutationID: UUID = UUID(),
+        context: RemoteCellularReceiptContext,
+        applicationState: RemoteCellularApplicationState
+    ) async throws -> RemoteCellularControlView {
         try await authorizedV3(
             "cellular-controls/\(requestID.uuidString.lowercased())/receive",
             accountID: accountID,
-            body: RemoteCellularControlReceiptRequest(requestID: mutationID, receiptContext: context)
+            body: RemoteCellularControlReceiptRequest(
+                requestID: mutationID,
+                receiptContext: context,
+                applicationState: applicationState
+            )
         )
     }
 
