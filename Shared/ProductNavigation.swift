@@ -1,0 +1,23 @@
+import Foundation
+
+enum ProductSection: String, CaseIterable, Identifiable {
+    case chats = "Chats"
+    case calls = "Calls"
+    case contacts = "Contacts"
+    case settings = "Settings"
+    var id: String { rawValue }
+}
+
+enum ProductLoadingState: Equatable {
+    case idle
+    case loading
+    case ready
+    case failed(String)
+}
+
+enum ProductAccessibility {
+    static let mute = "Mute microphone transmission"
+    static let unmute = "Resume microphone transmission"
+    static let endCall = "End secure call"
+    static let sendMessage = "Send encrypted message"
+}

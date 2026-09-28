@@ -18,7 +18,7 @@ struct WiFiSecureCallWatchApp: App {
 
     var body: some Scene {
         WindowGroup {
-            WatchRootView(session: session)
+            WatchProductRootView(session: session)
                 .environmentObject(appleAuthentication)
         }
     }
