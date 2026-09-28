@@ -153,20 +153,53 @@ final class IOSNotificationController: NSObject, UIApplicationDelegate, UNUserNo
         completionHandler([])
     }
 
-    nonisolated func userNotificationCenter(_ center: UNUserNotificationCenter, didReceive response: UNNotificationResponse) async {
+    nonisolated func userNotificationCenter(
+        _ center: UNUserNotificationCenter,
+        didReceive response: UNNotificationResponse,
+        withCompletionHandler completionHandler: @escaping () -> Void
+    ) {
+        Task { @MainActor in
+            await self.handleNotificationResponse(response, completionHandler: completionHandler)
+        }
+    }
+
+    private func handleNotificationResponse(
+        _ response: UNNotificationResponse,
+        completionHandler: @escaping () -> Void
+    ) async {
         if let envelope = RemoteCellularControlPushEnvelope.parse(response.notification.request.content.userInfo) {
-            let applicationState = await MainActor.run {
-                Self.remoteApplicationState(UIApplication.shared.applicationState)
-            }
+            let applicationState = Self.remoteApplicationState(UIApplication.shared.applicationState)
             if envelope.event == .notificationAction {
                 guard RemoteCellularNotificationActionPolicy.accepts(
                     envelope: envelope,
                     categoryIdentifier: response.notification.request.content.categoryIdentifier,
                     actionIdentifier: response.actionIdentifier
-                ) else { return }
+                ) else {
+                    completionHandler()
+                    return
+                }
+                let completion = RemoteCellularExactlyOnceCompletion<Void> { _ in completionHandler() }
+                let permit = RemoteCellularNotificationActionExecutionPermit()
+                let deadline = Task { @MainActor in
+                    do {
+                        try await Task.sleep(
+                            nanoseconds: RemoteCellularControlPolicy.notificationActionExecutionBudgetNanoseconds
+                        )
+                    } catch {
+                        return
+                    }
+                    permit.close()
+                    completion.finish(())
+                }
+                defer {
+                    deadline.cancel()
+                    permit.close()
+                    completion.finish(())
+                }
                 await IOSRemoteCellularControlCoordinator.shared.receiveNotificationAction(
                     envelope,
-                    applicationState: applicationState
+                    applicationState: applicationState,
+                    executionPermit: permit
                 )
             } else {
                 await IOSRemoteCellularControlCoordinator.shared.receive(
@@ -174,14 +207,19 @@ final class IOSNotificationController: NSObject, UIApplicationDelegate, UNUserNo
                     context: .openedFromNotification,
                     applicationState: applicationState
                 )
+                completionHandler()
             }
             return
         }
-        guard let envelope = IncomingNotificationEnvelope.parse(response.notification.request.content.userInfo) else { return }
+        guard let envelope = IncomingNotificationEnvelope.parse(response.notification.request.content.userInfo) else {
+            completionHandler()
+            return
+        }
         await handle(envelope, voip: false, requestAnswer: false)
         let session = await MainActor.run { NotificationRuntime.shared.callSession }
         if response.actionIdentifier == "REJECT" { await session.reject() }
         else if response.actionIdentifier == "ACCEPT" { await session.accept() }
+        completionHandler()
     }
 
     private func handle(_ envelope: IncomingNotificationEnvelope, voip: Bool, requestAnswer: Bool) async {

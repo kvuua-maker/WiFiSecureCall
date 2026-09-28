@@ -525,6 +525,7 @@ enum RemoteCellularControlPolicy {
     static let requestTTL: TimeInterval = 120
     static let watchPollingGrace: TimeInterval = 10
     static let backgroundFetchCompletionDeadlineNanoseconds: UInt64 = 20_000_000_000
+    static let notificationActionExecutionBudgetNanoseconds: UInt64 = 20_000_000_000
 
     static func normalizedE164(_ value: String) -> String? {
         guard value == value.trimmingCharacters(in: .whitespacesAndNewlines),
@@ -534,6 +535,46 @@ enum RemoteCellularControlPolicy {
 
     static func watchPollingDeadline(expiresAt: Date?, startedAt: Date) -> Date {
         (expiresAt ?? startedAt.addingTimeInterval(requestTTL)).addingTimeInterval(watchPollingGrace)
+    }
+}
+
+enum RemoteCellularWatchDeadlineResult: String, Equatable, Sendable {
+    case notificationActionNotObserved = "NOTIFICATION_ACTION_NOT_OBSERVED"
+    case notificationActionObservedResultUnknown = "NOTIFICATION_ACTION_OBSERVED_RESULT_UNKNOWN"
+    case startAttemptAcknowledgedResultUnknown = "START_ATTEMPT_ACKNOWLEDGED_RESULT_UNKNOWN"
+}
+
+struct RemoteCellularWatchDeadlineClassification: Equatable, Sendable {
+    let result: RemoteCellularWatchDeadlineResult
+    let notificationActionReceivedAt: Date?
+    let startAttemptedAt: Date?
+}
+
+enum RemoteCellularWatchDeadlinePolicy {
+    static func classifyNotificationActionTimeout(
+        lastServerState: RemoteCellularControlState?,
+        notificationActionReceivedAt: Date?,
+        startAttemptedAt: Date?
+    ) -> RemoteCellularWatchDeadlineClassification? {
+        if let lastServerState, isTerminal(lastServerState) { return nil }
+        let result: RemoteCellularWatchDeadlineResult
+        if startAttemptedAt != nil {
+            result = .startAttemptAcknowledgedResultUnknown
+        } else if notificationActionReceivedAt != nil {
+            result = .notificationActionObservedResultUnknown
+        } else {
+            result = .notificationActionNotObserved
+        }
+        return RemoteCellularWatchDeadlineClassification(
+            result: result,
+            notificationActionReceivedAt: notificationActionReceivedAt,
+            startAttemptedAt: startAttemptedAt
+        )
+    }
+
+    private static func isTerminal(_ state: RemoteCellularControlState) -> Bool {
+        state == .systemStartAccepted || state == .publicStartError ||
+            state == .cancelled || state == .expired || state == .failedSafe
     }
 }
 

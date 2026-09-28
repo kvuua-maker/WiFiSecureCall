@@ -20,6 +20,43 @@ final class RemoteCellularExactlyOnceCompletion<Result> {
 }
 
 @MainActor
+final class RemoteCellularNotificationActionExecutionPermit {
+    private let deadlineUptimeNanoseconds: UInt64
+    private let monotonicNow: () -> UInt64
+    private(set) var isClosed = false
+    private(set) var publicStartEntered = false
+
+    init(
+        budgetNanoseconds: UInt64 = RemoteCellularControlPolicy.notificationActionExecutionBudgetNanoseconds,
+        monotonicNow: @escaping () -> UInt64 = { DispatchTime.now().uptimeNanoseconds }
+    ) {
+        self.monotonicNow = monotonicNow
+        let now = monotonicNow()
+        let (deadline, overflow) = now.addingReportingOverflow(budgetNanoseconds)
+        deadlineUptimeNanoseconds = overflow ? UInt64.max : deadline
+    }
+
+    func allowsProgress() -> Bool {
+        guard !isClosed, !publicStartEntered else { return false }
+        guard monotonicNow() < deadlineUptimeNanoseconds else {
+            isClosed = true
+            return false
+        }
+        return true
+    }
+
+    func authorizePublicStart() -> Bool {
+        guard allowsProgress() else { return false }
+        publicStartEntered = true
+        return true
+    }
+
+    func close() {
+        isClosed = true
+    }
+}
+
+@MainActor
 protocol CellularConversationStarting: AnyObject {
     func availableCellularServices() throws -> [RemoteCellularServiceOption]
     func prepareCellularService(id: UUID) throws -> RemoteCellularPreparedStart
@@ -38,6 +75,7 @@ enum RemoteCellularLocalError: String, Error {
     case claimAcknowledgementUnavailable = "SERVER_CLAIM_ACK_UNAVAILABLE"
     case startAttemptAcknowledgementUnavailable = "SERVER_START_ATTEMPT_ACK_UNAVAILABLE"
     case resultAcknowledgementUnavailable = "SERVER_RESULT_ACK_UNAVAILABLE"
+    case notificationActionExecutionClosed = "NOTIFICATION_ACTION_EXECUTION_BUDGET_EXPIRED"
 }
 
 struct RemoteCellularServiceOption: Identifiable, Equatable, Sendable {
@@ -489,14 +527,17 @@ final class IOSRemoteCellularControlCoordinator: ObservableObject {
 
     func receiveNotificationAction(
         _ envelope: RemoteCellularControlPushEnvelope,
-        applicationState: RemoteCellularApplicationState
+        applicationState: RemoteCellularApplicationState,
+        executionPermit suppliedPermit: RemoteCellularNotificationActionExecutionPermit? = nil
     ) async {
         guard envelope.event == .notificationAction else { return }
+        let executionPermit = suppliedPermit ?? RemoteCellularNotificationActionExecutionPermit()
         await processReceipt(
             envelope,
             context: .notificationAction,
             applicationState: applicationState,
-            operation: .notificationAction
+            operation: .notificationAction,
+            executionPermit: executionPermit
         )
     }
 
@@ -504,12 +545,18 @@ final class IOSRemoteCellularControlCoordinator: ObservableObject {
         _ envelope: RemoteCellularControlPushEnvelope,
         context: RemoteCellularReceiptContext,
         applicationState: RemoteCellularApplicationState,
-        operation: RemoteCellularReceiveOperation
+        operation: RemoteCellularReceiveOperation,
+        executionPermit: RemoteCellularNotificationActionExecutionPermit? = nil
     ) async {
         let key = RemoteCellularRequestKey(requestID: envelope.requestID, accountID: envelope.accountID)
         let automaticBackgroundAttempt = operation == .ordinary && (context == .background || context == .inactive)
         let shouldPresent = operation == .ordinary && !automaticBackgroundAttempt
         pruneTemporaryState()
+
+        guard actionExecutionMayProceed(operation: operation, permit: executionPermit) else {
+            closeActionExecution(key: key)
+            return
+        }
 
         if activeStartKey == key || isLocallyConsumed(key) {
             if displayedRequestKey == key {
@@ -524,7 +571,7 @@ final class IOSRemoteCellularControlCoordinator: ObservableObject {
                     manualActionResult = RemoteCellularManualActionAvailability.terminalError.rawValue
                 }
             }
-            presentationRequested = shouldPresent
+            if operation == .ordinary { presentationRequested = shouldPresent }
             return
         }
 
@@ -553,7 +600,7 @@ final class IOSRemoteCellularControlCoordinator: ObservableObject {
                 attempted: false,
                 result: "LOCAL_ACCOUNT_NOT_FOUND"
             ), for: key, manualResult: "LOCAL_ACCOUNT_NOT_FOUND")
-            presentationRequested = shouldPresent
+            if operation == .ordinary { presentationRequested = shouldPresent }
             return
         }
         do {
@@ -565,6 +612,10 @@ final class IOSRemoteCellularControlCoordinator: ObservableObject {
                 key: key,
                 expiresAt: diagnostic?.requestID == key.requestID ? diagnostic?.expiresAt : nil
             )
+            guard actionExecutionMayProceed(operation: operation, permit: executionPermit) else {
+                closeActionExecution(key: key)
+                return
+            }
             let control = try await api.receiveRemoteCellularControl(
                 accountID: envelope.accountID,
                 requestID: envelope.requestID,
@@ -572,6 +623,10 @@ final class IOSRemoteCellularControlCoordinator: ObservableObject {
                 context: context,
                 applicationState: applicationState
             )
+            guard actionExecutionMayProceed(operation: operation, permit: executionPermit) else {
+                closeActionExecution(key: key)
+                return
+            }
             guard isLatestReceive(generation, key: generationKey) else { return }
             guard control.requestID == envelope.requestID,
                   control.effectiveDeliveryMode == envelope.event.deliveryMode,
@@ -587,13 +642,15 @@ final class IOSRemoteCellularControlCoordinator: ObservableObject {
                     throw RemoteCellularLocalError.startNotGranted
                 }
             }
-            guard shouldAcceptReceivedRequest(key, createdAt: control.createdAt) else { return }
+            let shouldUpdateDisplay = shouldAcceptReceivedRequest(key, createdAt: control.createdAt)
+            if operation == .ordinary {
+                guard shouldUpdateDisplay else { return }
+            }
             if operation == .ordinary,
                displayedRequestKey == key,
                diagnostic?.receiptContext == .notificationAction {
                 return
             }
-            activateDisplayedRequest(key, createdAt: control.createdAt)
             let value = RemoteCellularControlDiagnostic(
                 requestID: control.requestID,
                 accountID: envelope.accountID,
@@ -614,14 +671,25 @@ final class IOSRemoteCellularControlCoordinator: ObservableObject {
             let manualResult = value.appConfirmationRequired
                 ? RemoteCellularManualActionAvailability.ready.rawValue
                 : value.safeResult
-            setVisibleDiagnostic(value, for: key, manualResult: manualResult)
-            presentationRequested = shouldPresent
+            if shouldUpdateDisplay {
+                activateDisplayedRequest(key, createdAt: control.createdAt)
+                setVisibleDiagnostic(value, for: key, manualResult: manualResult)
+            }
+            if operation == .ordinary { presentationRequested = shouldPresent }
             if automaticBackgroundAttempt && control.state == .iPhoneBackgroundReceived {
                 await attemptStart(value, origin: .automatic)
             } else if operation == .notificationAction && control.state == .iPhoneNotificationActionReceived {
-                await attemptStart(value, origin: .notificationAction)
+                guard actionExecutionMayProceed(operation: operation, permit: executionPermit) else {
+                    closeActionExecution(key: key)
+                    return
+                }
+                await attemptStart(value, origin: .notificationAction, executionPermit: executionPermit)
             }
         } catch {
+            guard actionExecutionMayProceed(operation: operation, permit: executionPermit) else {
+                closeActionExecution(key: key)
+                return
+            }
             guard isLatestReceive(generation, key: generationKey) else { return }
             guard displayedRequestKey == nil || displayedRequestKey == key else { return }
             activateDisplayedRequest(key, createdAt: nil)
@@ -635,7 +703,7 @@ final class IOSRemoteCellularControlCoordinator: ObservableObject {
                 attempted: false,
                 result: result
             ), for: key, manualResult: result)
-            presentationRequested = shouldPresent
+            if operation == .ordinary { presentationRequested = shouldPresent }
         }
     }
 
@@ -665,8 +733,16 @@ final class IOSRemoteCellularControlCoordinator: ObservableObject {
 
     private enum StartOrigin: Equatable { case automatic, manual, notificationAction }
 
-    private func attemptStart(_ current: RemoteCellularControlDiagnostic, origin: StartOrigin) async {
+    private func attemptStart(
+        _ current: RemoteCellularControlDiagnostic,
+        origin: StartOrigin,
+        executionPermit: RemoteCellularNotificationActionExecutionPermit? = nil
+    ) async {
         let key = RemoteCellularRequestKey(requestID: current.requestID, accountID: current.accountID)
+        guard actionStartMayProceed(origin: origin, permit: executionPermit) else {
+            closeActionExecution(key: key)
+            return
+        }
         guard current.deliveryMode != .notificationAction ||
                 (origin == .notificationAction && current.receiptContext == .notificationAction && current.state == .iPhoneNotificationActionReceived),
               current.deliveryMode != .silentBackground || origin != .notificationAction else {
@@ -674,6 +750,9 @@ final class IOSRemoteCellularControlCoordinator: ObservableObject {
             return
         }
         guard activeStartKey == nil else {
+            if origin == .notificationAction, activeStartKey != key {
+                markLocallyConsumed(key, expiresAt: current.expiresAt)
+            }
             if displayedRequestKey == key {
                 manualActionResult = activeStartKey == key
                     ? RemoteCellularManualActionAvailability.inProgress.rawValue
@@ -733,6 +812,11 @@ final class IOSRemoteCellularControlCoordinator: ObservableObject {
             return
         }
 
+        guard actionStartMayProceed(origin: origin, permit: executionPermit) else {
+            closeActionExecution(key: key)
+            return
+        }
+
         isStarting = true
         activeStartKey = key
         markLocallyConsumed(key, expiresAt: current.expiresAt)
@@ -750,12 +834,20 @@ final class IOSRemoteCellularControlCoordinator: ObservableObject {
         let claimID = mutationID(for: .claim, key: key, expiresAt: current.expiresAt)
         var transientNumber: String?
         do {
-            var grant = try await retryingAcknowledgement {
+            var grant = try await retryingAcknowledgement(while: {
+                self.actionStartMayProceed(origin: origin, permit: executionPermit)
+            }) {
                 try await self.api.claimRemoteCellularControlStart(
                     accountID: current.accountID,
                     requestID: current.requestID,
                     mutationID: claimID
                 )
+            }
+            guard actionStartMayProceed(origin: origin, permit: executionPermit) else {
+                grant.phoneNumber?.removeAll(keepingCapacity: false)
+                grant.phoneNumber = nil
+                closeActionExecution(key: key)
+                return
             }
             if grant.state == .iPhoneStartAuthorized && !grant.startGranted {
                 throw RemoteCellularLocalError.claimAcknowledgementUnavailable
@@ -784,6 +876,10 @@ final class IOSRemoteCellularControlCoordinator: ObservableObject {
         } catch {
             transientNumber?.removeAll(keepingCapacity: false)
             transientNumber = nil
+            guard actionStartMayProceed(origin: origin, permit: executionPermit) else {
+                closeActionExecution(key: key)
+                return
+            }
             updateClaimFailure(Self.safeError(error), current: current, key: key)
             return
         }
@@ -803,14 +899,29 @@ final class IOSRemoteCellularControlCoordinator: ObservableObject {
             return
         }
 
+        guard actionStartMayProceed(origin: origin, permit: executionPermit) else {
+            transientNumber?.removeAll(keepingCapacity: false)
+            transientNumber = nil
+            closeActionExecution(key: key)
+            return
+        }
+
         let attemptID = mutationID(for: .startAttempt, key: key, expiresAt: current.expiresAt)
         do {
-            let attemptedView = try await retryingAcknowledgement {
+            let attemptedView = try await retryingAcknowledgement(while: {
+                self.actionStartMayProceed(origin: origin, permit: executionPermit)
+            }) {
                 try await self.api.markRemoteCellularControlStartAttempted(
                     accountID: current.accountID,
                     requestID: current.requestID,
                     mutationID: attemptID
                 )
+            }
+            guard actionStartMayProceed(origin: origin, permit: executionPermit) else {
+                transientNumber?.removeAll(keepingCapacity: false)
+                transientNumber = nil
+                closeActionExecution(key: key)
+                return
             }
             guard attemptedView.requestID == current.requestID,
                   attemptedView.effectiveDeliveryMode == current.deliveryMode,
@@ -830,6 +941,10 @@ final class IOSRemoteCellularControlCoordinator: ObservableObject {
         } catch {
             transientNumber?.removeAll(keepingCapacity: false)
             transientNumber = nil
+            guard actionStartMayProceed(origin: origin, permit: executionPermit) else {
+                closeActionExecution(key: key)
+                return
+            }
             updateAcknowledgementFailure(
                 Self.safeError(error),
                 current: current,
@@ -866,6 +981,17 @@ final class IOSRemoteCellularControlCoordinator: ObservableObject {
                 publicStartReturnedSuccess: nil
             )
             return
+        }
+        if origin == .notificationAction {
+            guard !Self.currentTaskIsCancelled,
+                  let executionPermit,
+                  executionPermit.authorizePublicStart() else {
+                number.removeAll(keepingCapacity: false)
+                transientNumber?.removeAll(keepingCapacity: false)
+                transientNumber = nil
+                closeActionExecution(key: key)
+                return
+            }
         }
         if displayedRequestKey == key {
             explicitCellularServicePassed = modeSnapshot == .strictExplicitSIM
@@ -1097,10 +1223,14 @@ final class IOSRemoteCellularControlCoordinator: ObservableObject {
     }
 
     private func retryingAcknowledgement<Value>(
+        while shouldContinue: (() -> Bool)? = nil,
         _ operation: () async throws -> Value
     ) async throws -> Value {
         var lastError: Error?
         for index in mutationRetryDelaysNanoseconds.indices {
+            guard shouldContinue?() != false else {
+                throw RemoteCellularLocalError.notificationActionExecutionClosed
+            }
             do {
                 return try await operation()
             } catch {
@@ -1114,6 +1244,9 @@ final class IOSRemoteCellularControlCoordinator: ObservableObject {
                     try await Task.sleep(nanoseconds: delay)
                 } else {
                     await Task.yield()
+                }
+                guard shouldContinue?() != false else {
+                    throw RemoteCellularLocalError.notificationActionExecutionClosed
                 }
             }
         }
@@ -1142,6 +1275,54 @@ final class IOSRemoteCellularControlCoordinator: ObservableObject {
 
     private func isLatestReceive(_ generation: UInt64, key: RemoteCellularReceiveGenerationKey) -> Bool {
         latestReceiveGenerationByKey[key] == generation
+    }
+
+    private func actionExecutionMayProceed(
+        operation: RemoteCellularReceiveOperation,
+        permit: RemoteCellularNotificationActionExecutionPermit?
+    ) -> Bool {
+        guard operation == .notificationAction else { return true }
+        guard let permit else { return false }
+        if Self.currentTaskIsCancelled {
+            permit.close()
+            return false
+        }
+        return permit.allowsProgress()
+    }
+
+    private func actionStartMayProceed(
+        origin: StartOrigin,
+        permit: RemoteCellularNotificationActionExecutionPermit?
+    ) -> Bool {
+        guard origin == .notificationAction else { return true }
+        guard let permit else { return false }
+        if Self.currentTaskIsCancelled {
+            permit.close()
+            return false
+        }
+        return permit.allowsProgress()
+    }
+
+    private func closeActionExecution(key: RemoteCellularRequestKey) {
+        let expiresAt = displayedRequestKey == key ? diagnostic?.expiresAt : nil
+        markLocallyConsumed(key, expiresAt: expiresAt)
+        guard displayedRequestKey == key,
+              let current = diagnostic,
+              current.requestID == key.requestID,
+              current.accountID == key.accountID else { return }
+        setVisibleDiagnostic(Self.replacingDiagnostic(
+            current,
+            state: .failedSafe,
+            appConfirmationRequired: false,
+            startClaimObtained: current.startClaimObtained,
+            systemStartAttempted: current.systemStartAttempted,
+            publicStartReturnedSuccess: current.publicStartReturnedSuccess,
+            safeResult: RemoteCellularLocalError.notificationActionExecutionClosed.rawValue
+        ), for: key, manualResult: RemoteCellularLocalError.notificationActionExecutionClosed.rawValue)
+    }
+
+    private static var currentTaskIsCancelled: Bool {
+        withUnsafeCurrentTask { $0?.isCancelled ?? false }
     }
 
     private func shouldAcceptReceivedRequest(_ key: RemoteCellularRequestKey, createdAt: Date) -> Bool {

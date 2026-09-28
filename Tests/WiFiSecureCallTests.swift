@@ -4156,6 +4156,259 @@ final class RemoteCellularControlTests: XCTestCase {
         XCTAssertEqual(receipt.applicationStates, [.foreground])
     }
 
+    func testNotificationActionDeadlineDuringReceiptCompletesWithoutClaimOrLateStart() async throws {
+        let accountID = UUID(), requestID = UUID()
+        let accountStore = try Self.accountStore(accountID: accountID)
+        let modeStore = Self.executionModeStore()
+        modeStore.setMode(.systemManagedDiagnostic, for: accountID)
+        let gate = RemoteCellularTestGate()
+        let received = Self.view(
+            requestID: requestID, state: .iPhoneNotificationActionReceived,
+            deliveryMode: .notificationAction, receiptContext: .notificationAction,
+            applicationState: .background
+        )
+        let api = RemoteControlAPIStub(
+            view: received,
+            grant: .init(control: received, startGranted: false, phoneNumber: nil),
+            receiveGate: gate
+        )
+        let starter = RemoteCellularStarterSpy(services: [])
+        let coordinator = IOSRemoteCellularControlCoordinator(
+            api: api, accountStore: accountStore, starter: starter,
+            lineSelectionStore: Self.lineSelectionStore(), executionModeStore: modeStore
+        )
+        var monotonicNow: UInt64 = 100
+        let permit = RemoteCellularNotificationActionExecutionPermit(
+            budgetNanoseconds: 20,
+            monotonicNow: { monotonicNow }
+        )
+        let operation = Task { @MainActor in
+            await coordinator.receiveNotificationAction(
+                .init(requestID: requestID, accountID: accountID, event: .notificationAction),
+                applicationState: .background,
+                executionPermit: permit
+            )
+        }
+        await gate.waitUntilReached()
+        monotonicNow = 121
+        await gate.open()
+        await operation.value
+        await coordinator.receiveNotificationAction(
+            .init(requestID: requestID, accountID: accountID, event: .notificationAction),
+            applicationState: .background,
+            executionPermit: RemoteCellularNotificationActionExecutionPermit()
+        )
+
+        let counts = await api.counts()
+        XCTAssertEqual(counts.receive, 1)
+        XCTAssertEqual(counts.claim, 0)
+        XCTAssertEqual(counts.attempt, 0)
+        XCTAssertTrue(starter.numbers.isEmpty)
+        XCTAssertTrue(permit.isClosed)
+    }
+
+    func testNotificationActionDeadlineDuringClaimOrAttemptPreventsPublicStart() async throws {
+        for blockedStage in ["claim", "attempt"] {
+            let accountID = UUID(), requestID = UUID()
+            let accountStore = try Self.accountStore(accountID: accountID)
+            let modeStore = Self.executionModeStore()
+            modeStore.setMode(.systemManagedDiagnostic, for: accountID)
+            let gate = RemoteCellularTestGate()
+            let received = Self.view(
+                requestID: requestID, state: .iPhoneNotificationActionReceived,
+                deliveryMode: .notificationAction, receiptContext: .notificationAction,
+                applicationState: .background
+            )
+            let grantView = Self.view(
+                requestID: requestID, state: .iPhoneStartAuthorized,
+                deliveryMode: .notificationAction, receiptContext: .notificationAction,
+                applicationState: .background
+            )
+            let api = RemoteControlAPIStub(
+                view: received,
+                grant: .init(control: grantView, startGranted: true, phoneNumber: "+380501234567"),
+                claimGate: blockedStage == "claim" ? gate : nil,
+                attemptGate: blockedStage == "attempt" ? gate : nil
+            )
+            let starter = RemoteCellularStarterSpy(services: [])
+            let coordinator = IOSRemoteCellularControlCoordinator(
+                api: api, accountStore: accountStore, starter: starter,
+                lineSelectionStore: Self.lineSelectionStore(), executionModeStore: modeStore
+            )
+            var monotonicNow: UInt64 = 1_000
+            let permit = RemoteCellularNotificationActionExecutionPermit(
+                budgetNanoseconds: 20,
+                monotonicNow: { monotonicNow }
+            )
+            let operation = Task { @MainActor in
+                await coordinator.receiveNotificationAction(
+                    .init(requestID: requestID, accountID: accountID, event: .notificationAction),
+                    applicationState: .background,
+                    executionPermit: permit
+                )
+            }
+            await gate.waitUntilReached()
+            monotonicNow = 1_021
+            await gate.open()
+            await operation.value
+
+            let counts = await api.counts()
+            XCTAssertEqual(counts.claim, 1, blockedStage)
+            XCTAssertEqual(counts.attempt, blockedStage == "attempt" ? 1 : 0, blockedStage)
+            XCTAssertEqual(counts.completion, 0, blockedStage)
+            XCTAssertTrue(starter.numbers.isEmpty, blockedStage)
+        }
+    }
+
+    func testNotificationActionTaskCancellationClosesPermitEvenWhenDependencyIgnoresCancellation() async throws {
+        let accountID = UUID(), requestID = UUID()
+        let accountStore = try Self.accountStore(accountID: accountID)
+        let modeStore = Self.executionModeStore()
+        modeStore.setMode(.systemManagedDiagnostic, for: accountID)
+        let gate = RemoteCellularTestGate()
+        let received = Self.view(
+            requestID: requestID, state: .iPhoneNotificationActionReceived,
+            deliveryMode: .notificationAction, receiptContext: .notificationAction,
+            applicationState: .inactive
+        )
+        let api = RemoteControlAPIStub(
+            view: received,
+            grant: .init(control: received, startGranted: false, phoneNumber: nil),
+            receiveGate: gate
+        )
+        let starter = RemoteCellularStarterSpy(services: [])
+        let coordinator = IOSRemoteCellularControlCoordinator(
+            api: api, accountStore: accountStore, starter: starter,
+            lineSelectionStore: Self.lineSelectionStore(), executionModeStore: modeStore
+        )
+        let permit = RemoteCellularNotificationActionExecutionPermit()
+        let operation = Task { @MainActor in
+            await coordinator.receiveNotificationAction(
+                .init(requestID: requestID, accountID: accountID, event: .notificationAction),
+                applicationState: .inactive,
+                executionPermit: permit
+            )
+        }
+        await gate.waitUntilReached()
+        operation.cancel()
+        await gate.open()
+        await operation.value
+
+        let counts = await api.counts()
+        XCTAssertEqual(counts.claim, 0)
+        XCTAssertEqual(counts.attempt, 0)
+        XCTAssertTrue(starter.numbers.isEmpty)
+        XCTAssertTrue(permit.isClosed)
+    }
+
+    func testNotificationActionDeadlineAfterStarterEntryNeverRetriesOrFakesCancellation() async throws {
+        let accountID = UUID(), requestID = UUID()
+        let accountStore = try Self.accountStore(accountID: accountID)
+        let modeStore = Self.executionModeStore()
+        modeStore.setMode(.systemManagedDiagnostic, for: accountID)
+        let starterGate = RemoteCellularTestGate()
+        let received = Self.view(
+            requestID: requestID, state: .iPhoneNotificationActionReceived,
+            deliveryMode: .notificationAction, receiptContext: .notificationAction,
+            applicationState: .background
+        )
+        let grantView = Self.view(
+            requestID: requestID, state: .iPhoneStartAuthorized,
+            deliveryMode: .notificationAction, receiptContext: .notificationAction,
+            applicationState: .background
+        )
+        let api = RemoteControlAPIStub(
+            view: received,
+            grant: .init(control: grantView, startGranted: true, phoneNumber: "+380501234567")
+        )
+        let starter = RemoteCellularStarterSpy(services: [], beforeStart: { await starterGate.wait() })
+        let coordinator = IOSRemoteCellularControlCoordinator(
+            api: api, accountStore: accountStore, starter: starter,
+            lineSelectionStore: Self.lineSelectionStore(), executionModeStore: modeStore
+        )
+        var monotonicNow: UInt64 = 500
+        let permit = RemoteCellularNotificationActionExecutionPermit(
+            budgetNanoseconds: 20,
+            monotonicNow: { monotonicNow }
+        )
+        let envelope = RemoteCellularControlPushEnvelope(
+            requestID: requestID, accountID: accountID, event: .notificationAction
+        )
+        let operation = Task { @MainActor in
+            await coordinator.receiveNotificationAction(
+                envelope, applicationState: .background, executionPermit: permit
+            )
+        }
+        await starterGate.waitUntilReached()
+        XCTAssertTrue(permit.publicStartEntered)
+        monotonicNow = 521
+        permit.close()
+        await starterGate.open()
+        await operation.value
+        await coordinator.receiveNotificationAction(
+            envelope,
+            applicationState: .background,
+            executionPermit: RemoteCellularNotificationActionExecutionPermit()
+        )
+
+        let counts = await api.counts()
+        XCTAssertEqual(starter.numbers, ["+380501234567"])
+        XCTAssertEqual(counts.claim, 1)
+        XCTAssertEqual(counts.attempt, 1)
+        XCTAssertEqual(counts.completion, 1)
+        XCTAssertEqual(coordinator.diagnostic?.safeResult, "SYSTEM_START_ACCEPTED")
+    }
+
+    func testNotificationActionCompletionRaceFinishesCallbackExactlyOnce() {
+        var completions = 0
+        let completion = RemoteCellularExactlyOnceCompletion<Void> { _ in completions += 1 }
+        completion.finish(())
+        completion.finish(())
+        XCTAssertEqual(completions, 1)
+        XCTAssertEqual(RemoteCellularControlPolicy.notificationActionExecutionBudgetNanoseconds, 20_000_000_000)
+    }
+
+    func testWatchNotificationActionDeadlineClassificationIsEvidenceBasedAndPreservesTimestamps() {
+        let actionAt = Date(timeIntervalSince1970: 1_000)
+        let attemptAt = Date(timeIntervalSince1970: 1_001)
+
+        let unobserved = RemoteCellularWatchDeadlinePolicy.classifyNotificationActionTimeout(
+            lastServerState: .deliveryPending,
+            notificationActionReceivedAt: nil,
+            startAttemptedAt: nil
+        )
+        XCTAssertEqual(unobserved?.result, .notificationActionNotObserved)
+
+        let observed = RemoteCellularWatchDeadlinePolicy.classifyNotificationActionTimeout(
+            lastServerState: .iPhoneNotificationActionReceived,
+            notificationActionReceivedAt: actionAt,
+            startAttemptedAt: nil
+        )
+        XCTAssertEqual(observed?.result, .notificationActionObservedResultUnknown)
+        XCTAssertEqual(observed?.notificationActionReceivedAt, actionAt)
+        XCTAssertNil(observed?.startAttemptedAt)
+
+        let attempted = RemoteCellularWatchDeadlinePolicy.classifyNotificationActionTimeout(
+            lastServerState: .iPhoneNotificationActionStartAttempted,
+            notificationActionReceivedAt: actionAt,
+            startAttemptedAt: attemptAt
+        )
+        XCTAssertEqual(attempted?.result, .startAttemptAcknowledgedResultUnknown)
+        XCTAssertEqual(attempted?.notificationActionReceivedAt, actionAt)
+        XCTAssertEqual(attempted?.startAttemptedAt, attemptAt)
+
+        for terminal in [
+            RemoteCellularControlState.systemStartAccepted,
+            .publicStartError, .cancelled, .expired, .failedSafe,
+        ] {
+            XCTAssertNil(RemoteCellularWatchDeadlinePolicy.classifyNotificationActionTimeout(
+                lastServerState: terminal,
+                notificationActionReceivedAt: actionAt,
+                startAttemptedAt: attemptAt
+            ))
+        }
+    }
+
     func testConcurrentDuplicateNotificationActionCannotReenterPublicStarter() async throws {
         let accountID = UUID(), requestID = UUID()
         let accountStore = try Self.accountStore(accountID: accountID)
@@ -4209,6 +4462,115 @@ final class RemoteCellularControlTests: XCTestCase {
         XCTAssertEqual(counts.attempt, 1)
         XCTAssertEqual(counts.completion, 1)
         XCTAssertEqual(starter.numbers.count, 1)
+    }
+
+    func testOlderValidActionExecutesWithoutReplacingNewerDisplayedRequest() async throws {
+        let accountID = UUID(), actionRequestID = UUID(), displayedRequestID = UUID()
+        let accountStore = try Self.accountStore(accountID: accountID)
+        let modeStore = Self.executionModeStore()
+        modeStore.setMode(.systemManagedDiagnostic, for: accountID)
+        let actionView = Self.view(
+            requestID: actionRequestID,
+            state: .iPhoneNotificationActionReceived,
+            deliveryMode: .notificationAction,
+            receiptContext: .notificationAction,
+            applicationState: .background,
+            createdAt: Date(timeIntervalSince1970: 1_000)
+        )
+        let displayedView = Self.view(
+            requestID: displayedRequestID,
+            state: .iPhoneActionRequired,
+            receiptContext: .foreground,
+            applicationState: .foreground,
+            createdAt: Date(timeIntervalSince1970: 2_000)
+        )
+        let api = RemoteCellularMultiRequestAPIStub(
+            views: [actionRequestID: actionView, displayedRequestID: displayedView],
+            phoneNumbers: [actionRequestID: "+380501234567"]
+        )
+        let starter = RemoteCellularStarterSpy(services: [])
+        let coordinator = IOSRemoteCellularControlCoordinator(
+            api: api, accountStore: accountStore, starter: starter,
+            lineSelectionStore: Self.lineSelectionStore(), executionModeStore: modeStore
+        )
+
+        await coordinator.receive(
+            .init(requestID: displayedRequestID, accountID: accountID),
+            context: .foreground,
+            applicationState: .foreground
+        )
+        XCTAssertEqual(coordinator.diagnostic?.requestID, displayedRequestID)
+        await coordinator.receiveNotificationAction(
+            .init(requestID: actionRequestID, accountID: accountID, event: .notificationAction),
+            applicationState: .background
+        )
+
+        XCTAssertEqual(starter.numbers, ["+380501234567"])
+        let claimed = await api.claimedRequestIDs()
+        let attempted = await api.attemptedRequestIDs()
+        XCTAssertEqual(claimed, [actionRequestID])
+        XCTAssertEqual(attempted, [actionRequestID])
+        XCTAssertEqual(coordinator.diagnostic?.requestID, displayedRequestID)
+        XCTAssertEqual(coordinator.diagnostic?.state, .iPhoneActionRequired)
+    }
+
+    func testOlderActionFailsClosedWhileNewerRequestIsActivelyStarting() async throws {
+        let accountID = UUID(), actionRequestID = UUID(), activeRequestID = UUID()
+        let accountStore = try Self.accountStore(accountID: accountID)
+        let modeStore = Self.executionModeStore()
+        modeStore.setMode(.systemManagedDiagnostic, for: accountID)
+        let actionView = Self.view(
+            requestID: actionRequestID,
+            state: .iPhoneNotificationActionReceived,
+            deliveryMode: .notificationAction,
+            receiptContext: .notificationAction,
+            applicationState: .background,
+            createdAt: Date(timeIntervalSince1970: 1_000)
+        )
+        let activeView = Self.view(
+            requestID: activeRequestID,
+            state: .iPhoneBackgroundReceived,
+            receiptContext: .background,
+            applicationState: .background,
+            createdAt: Date(timeIntervalSince1970: 2_000)
+        )
+        let api = RemoteCellularMultiRequestAPIStub(
+            views: [actionRequestID: actionView, activeRequestID: activeView],
+            phoneNumbers: [
+                actionRequestID: "+380501234567",
+                activeRequestID: "+380671234567",
+            ]
+        )
+        let starterGate = RemoteCellularTestGate()
+        let starter = RemoteCellularStarterSpy(services: [], beforeStart: { await starterGate.wait() })
+        let coordinator = IOSRemoteCellularControlCoordinator(
+            api: api, accountStore: accountStore, starter: starter,
+            lineSelectionStore: Self.lineSelectionStore(), executionModeStore: modeStore
+        )
+        let active = Task { @MainActor in
+            await coordinator.receive(
+                .init(requestID: activeRequestID, accountID: accountID),
+                context: .background,
+                applicationState: .background
+            )
+        }
+        await starterGate.waitUntilReached()
+        await coordinator.receiveNotificationAction(
+            .init(requestID: actionRequestID, accountID: accountID, event: .notificationAction),
+            applicationState: .background
+        )
+        XCTAssertEqual(starter.numbers, ["+380671234567"])
+        let claimed = await api.claimedRequestIDs()
+        XCTAssertEqual(claimed, [activeRequestID])
+        await starterGate.open()
+        await active.value
+        await coordinator.receiveNotificationAction(
+            .init(requestID: actionRequestID, accountID: accountID, event: .notificationAction),
+            applicationState: .background
+        )
+        XCTAssertEqual(starter.numbers, ["+380671234567"])
+        let claimedAfterDuplicate = await api.claimedRequestIDs()
+        XCTAssertEqual(claimedAfterDuplicate, [activeRequestID])
     }
 
     func testNotificationActionStrictModeUsesExactSelectedServiceWithoutFallback() async throws {
@@ -6130,6 +6492,7 @@ private actor RemoteControlAPIStub: RemoteCellularControlAPI {
     private let receiveGate: RemoteCellularTestGate?
     private let receiveError: Error?
     private let claimGate: RemoteCellularTestGate?
+    private let attemptGate: RemoteCellularTestGate?
     private let completionGate: RemoteCellularTestGate?
     private let claimError: Error?
     private let loseFirstClaimResponse: Bool
@@ -6156,6 +6519,7 @@ private actor RemoteControlAPIStub: RemoteCellularControlAPI {
         receiveGate: RemoteCellularTestGate? = nil,
         receiveError: Error? = nil,
         claimGate: RemoteCellularTestGate? = nil,
+        attemptGate: RemoteCellularTestGate? = nil,
         completionGate: RemoteCellularTestGate? = nil,
         claimError: Error? = nil,
         loseFirstClaimResponse: Bool = false,
@@ -6167,6 +6531,7 @@ private actor RemoteControlAPIStub: RemoteCellularControlAPI {
         self.receiveGate = receiveGate
         self.receiveError = receiveError
         self.claimGate = claimGate
+        self.attemptGate = attemptGate
         self.completionGate = completionGate
         self.claimError = claimError
         self.loseFirstClaimResponse = loseFirstClaimResponse
@@ -6203,6 +6568,7 @@ private actor RemoteControlAPIStub: RemoteCellularControlAPI {
     func markRemoteCellularControlStartAttempted(accountID: UUID, requestID: UUID, mutationID: UUID) async throws -> RemoteCellularControlView {
         attemptCount += 1
         attemptMutationValues.append(mutationID)
+        await attemptGate?.wait()
         let attemptedState: RemoteCellularControlState
         if receiptContext == .notificationAction {
             attemptedState = .iPhoneNotificationActionStartAttempted
@@ -6330,6 +6696,141 @@ private actor RemoteCellularTestGate {
         isOpen = true
         waitContinuation?.resume()
         waitContinuation = nil
+    }
+}
+
+private actor RemoteCellularMultiRequestAPIStub: RemoteCellularControlAPI {
+    private let views: [UUID: RemoteCellularControlView]
+    private let phoneNumbers: [UUID: String]
+    private var claimed: [UUID] = []
+    private var attempted: [UUID] = []
+
+    init(views: [UUID: RemoteCellularControlView], phoneNumbers: [UUID: String]) {
+        self.views = views
+        self.phoneNumbers = phoneNumbers
+    }
+
+    func createRemoteCellularControl(accountID: UUID, requestID: UUID, phoneNumber: String) async throws -> RemoteCellularControlView {
+        try baseView(requestID)
+    }
+
+    func createRemoteCellularNotificationActionControl(accountID: UUID, requestID: UUID, phoneNumber: String) async throws -> RemoteCellularControlView {
+        try baseView(requestID)
+    }
+
+    func remoteCellularControl(accountID: UUID, requestID: UUID) async throws -> RemoteCellularControlView {
+        try baseView(requestID)
+    }
+
+    func receiveRemoteCellularControl(
+        accountID: UUID,
+        requestID: UUID,
+        mutationID: UUID,
+        context: RemoteCellularReceiptContext,
+        applicationState: RemoteCellularApplicationState
+    ) async throws -> RemoteCellularControlView {
+        try baseView(requestID)
+    }
+
+    func claimRemoteCellularControlStart(
+        accountID: UUID,
+        requestID: UUID,
+        mutationID: UUID
+    ) async throws -> RemoteCellularControlStartGrant {
+        let base = try baseView(requestID)
+        claimed.append(requestID)
+        let control = replacing(base, state: .iPhoneStartAuthorized)
+        return RemoteCellularControlStartGrant(
+            control: control,
+            startGranted: true,
+            phoneNumber: phoneNumbers[requestID]
+        )
+    }
+
+    func markRemoteCellularControlStartAttempted(
+        accountID: UUID,
+        requestID: UUID,
+        mutationID: UUID
+    ) async throws -> RemoteCellularControlView {
+        let base = try baseView(requestID)
+        attempted.append(requestID)
+        let state: RemoteCellularControlState
+        if base.effectiveDeliveryMode == .notificationAction {
+            state = .iPhoneNotificationActionStartAttempted
+        } else if base.receiptContext == .background || base.receiptContext == .inactive {
+            state = .iPhoneBackgroundStartAttempted
+        } else {
+            state = .iPhoneForegroundStartAttempted
+        }
+        return replacing(base, state: state, startAttemptedAt: Date())
+    }
+
+    func completeRemoteCellularControlStart(
+        accountID: UUID,
+        requestID: UUID,
+        mutationID: UUID,
+        result: RemoteCellularStartResult,
+        errorDomain: String?,
+        errorCode: Int?
+    ) async throws -> RemoteCellularControlView {
+        let base = try baseView(requestID)
+        return replacing(
+            base,
+            state: result == .accepted ? .systemStartAccepted : .publicStartError,
+            startAttemptedAt: Date(),
+            startResultAt: Date(),
+            startResult: result,
+            safeErrorDomain: errorDomain,
+            safeErrorCode: errorCode
+        )
+    }
+
+    func cancelRemoteCellularControl(accountID: UUID, requestID: UUID, mutationID: UUID) async throws -> RemoteCellularControlView {
+        replacing(try baseView(requestID), state: .cancelled)
+    }
+
+    func claimedRequestIDs() -> [UUID] { claimed }
+    func attemptedRequestIDs() -> [UUID] { attempted }
+
+    private func baseView(_ requestID: UUID) throws -> RemoteCellularControlView {
+        guard let value = views[requestID] else {
+            throw NSError(domain: "RemoteCellularMultiRequestAPIStub", code: 404)
+        }
+        return value
+    }
+
+    private func replacing(
+        _ base: RemoteCellularControlView,
+        state: RemoteCellularControlState,
+        startAttemptedAt: Date? = nil,
+        startResultAt: Date? = nil,
+        startResult: RemoteCellularStartResult? = nil,
+        safeErrorDomain: String? = nil,
+        safeErrorCode: Int? = nil
+    ) -> RemoteCellularControlView {
+        RemoteCellularControlView(
+            requestID: base.requestID,
+            deliveryMode: base.deliveryMode,
+            state: state,
+            createdAt: base.createdAt,
+            expiresAt: base.expiresAt,
+            deliveryStatus: base.deliveryStatus,
+            sourcePlatform: base.sourcePlatform,
+            targetPlatform: base.targetPlatform,
+            sameOwnerAuthorized: base.sameOwnerAuthorized,
+            mutationApplied: true,
+            terminalReason: state == .publicStartError ? "public_start_error" : nil,
+            receiptContext: base.receiptContext,
+            applicationState: base.applicationState,
+            receivedAt: base.receivedAt,
+            ordinaryReceivedAt: base.ordinaryReceivedAt,
+            notificationActionReceivedAt: base.notificationActionReceivedAt,
+            startAttemptedAt: startAttemptedAt,
+            startResultAt: startResultAt,
+            startResult: startResult,
+            safeErrorDomain: safeErrorDomain,
+            safeErrorCode: safeErrorCode
+        )
     }
 }
 
