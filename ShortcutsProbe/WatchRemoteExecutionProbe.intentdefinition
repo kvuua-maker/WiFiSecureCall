@@ -14,7 +14,7 @@
 			<key>INIntentCategory</key>
 			<string>generic</string>
 			<key>INIntentDescription</key>
-			<string>Runs an isolated probe in the paired iPhone app extension and returns fresh execution evidence.</string>
+			<string>Runs an isolated execution probe in the paired device app extension and returns fresh execution evidence.</string>
 			<key>INIntentName</key>
 			<string>WatchRemoteExecutionProbe</string>
 			<key>INIntentParameterCombinations</key>
@@ -26,7 +26,7 @@
 					<key>INIntentParameterCombinationSupportsBackgroundExecution</key>
 					<true/>
 					<key>INIntentParameterCombinationTitle</key>
-					<string>Run iPhone execution probe</string>
+					<string>Run remote execution probe</string>
 				</dict>
 			</dict>
 			<key>INIntentParameters</key>
@@ -81,7 +81,7 @@
 				</array>
 			</dict>
 			<key>INIntentTitle</key>
-			<string>Run iPhone execution probe</string>
+			<string>Run remote execution probe</string>
 			<key>INIntentType</key>
 			<string>Custom</string>
 			<key>INIntentVerb</key>

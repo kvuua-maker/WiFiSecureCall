@@ -5,7 +5,7 @@ enum WatchRemoteExecutionProbeDonation {
 
     static func register() {
         let intent = WatchRemoteExecutionProbeIntent()
-        intent.suggestedInvocationPhrase = "Run iPhone execution probe"
+        intent.suggestedInvocationPhrase = "Run remote execution probe"
 
         if let shortcut = INShortcut(intent: intent) {
             INVoiceShortcutCenter.shared.setShortcutSuggestions([shortcut])

@@ -33,7 +33,7 @@
 	<key>NSMicrophoneUsageDescription</key>
 	<string>Microphone access is required for live Wi-Fi calls.</string>
 	<key>NSSiriUsageDescription</key>
-	<string>Siri and Shortcuts can run the owner-enabled iPhone execution probe.</string>
+	<string>Siri and Shortcuts can run the owner-enabled remote execution probe.</string>
 	<key>UIApplicationSceneManifest</key>
 	<dict>
 		<key>UIApplicationSupportsMultipleScenes</key>

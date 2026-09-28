@@ -44,12 +44,48 @@ final class WatchRemoteExecutionProbeTests: XCTestCase {
         let definition = try propertyList(at: "ShortcutsProbe/WatchRemoteExecutionProbe.intentdefinition")
         let intents = try XCTUnwrap(definition["INIntents"] as? [[String: Any]])
         let intent = try XCTUnwrap(intents.first)
+        XCTAssertEqual(intent["INIntentTitle"] as? String, "Run remote execution probe")
+        XCTAssertEqual(
+            intent["INIntentDescription"] as? String,
+            "Runs an isolated execution probe in the paired device app extension and returns fresh execution evidence."
+        )
         XCTAssertEqual((intent["INIntentParameters"] as? [Any])?.count, 0)
 
         let combinations = try XCTUnwrap(intent["INIntentParameterCombinations"] as? [String: [String: Any]])
         let zeroInput = try XCTUnwrap(combinations[""])
         XCTAssertEqual(zeroInput["INIntentParameterCombinationIsPrimary"] as? Bool, true)
         XCTAssertEqual(zeroInput["INIntentParameterCombinationSupportsBackgroundExecution"] as? Bool, true)
+        XCTAssertEqual(zeroInput["INIntentParameterCombinationTitle"] as? String, "Run remote execution probe")
+    }
+
+    func testProbeVisibleNamesAvoidRestrictedDeviceWord() throws {
+        let extensionInfo = try propertyList(at: "ShortcutsProbe/Info.plist")
+        XCTAssertEqual(extensionInfo["CFBundleDisplayName"] as? String, "Remote Execution Probe")
+
+        let hostInfo = try propertyList(at: "iOS/Info.plist")
+        XCTAssertEqual(
+            hostInfo["NSSiriUsageDescription"] as? String,
+            "Siri and Shortcuts can run the owner-enabled remote execution probe."
+        )
+
+        let donationSource = try String(
+            contentsOf: repositoryRoot.appendingPathComponent("iOS/WatchRemoteExecutionProbeDonation.swift"),
+            encoding: .utf8
+        )
+        XCTAssertTrue(donationSource.contains("intent.suggestedInvocationPhrase = \"Run remote execution probe\""))
+
+        let definition = try propertyList(at: "ShortcutsProbe/WatchRemoteExecutionProbe.intentdefinition")
+        let intent = try XCTUnwrap((definition["INIntents"] as? [[String: Any]])?.first)
+        let combinations = try XCTUnwrap(intent["INIntentParameterCombinations"] as? [String: [String: Any]])
+        let visibleStrings = [
+            intent["INIntentTitle"] as? String,
+            intent["INIntentDescription"] as? String,
+            combinations[""]?["INIntentParameterCombinationTitle"] as? String,
+            extensionInfo["CFBundleDisplayName"] as? String,
+            hostInfo["NSSiriUsageDescription"] as? String,
+            "Run remote execution probe"
+        ].compactMap { $0 }
+        XCTAssertTrue(visibleStrings.allSatisfy { !$0.localizedCaseInsensitiveContains("iPhone") })
     }
 
     func testExtensionSupportsProbeWhileLockedWithoutForegroundContinuation() throws {
