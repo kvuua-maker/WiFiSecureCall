@@ -77,6 +77,7 @@ final class CallSession: ObservableObject {
     private let config: AppConfig
     private let audio: AudioEngineHandling
     private let media: MediaTransport
+    private let callHistory: CallHistoryStore
     private let diagnostics = Diagnostics.shared
     private var callKit: CallKitHandling?
     private var generation: CallGeneration?
@@ -97,6 +98,7 @@ final class CallSession: ObservableObject {
     private var suppressedSystemEndDuringAcceptance = false
     private var sequence: UInt64 = 0
     private var callAudioCryptor: CallAudioCryptor?
+    private var callHistoryRecordID: UUID?
     private let playout = AudioPlayoutController()
     private var tasks: [Task<Void, Never>] = []
     private var mediaConnectTask: Task<Void, Never>?
@@ -125,12 +127,13 @@ final class CallSession: ObservableObject {
     private var sendBackpressureDropReported = false
     private(set) var activeCallKitUUID: UUID?
 
-    init(config: AppConfig, api: APIClient? = nil, audio: AudioEngineHandling = AudioEngine(), media: MediaTransport? = nil) {
+    init(config: AppConfig, api: APIClient? = nil, audio: AudioEngineHandling = AudioEngine(), media: MediaTransport? = nil, callHistory: CallHistoryStore? = nil) {
         self.config = config
         let effectiveAPI = api ?? APIClient(config: config)
         self.api = effectiveAPI
         self.audio = audio
         self.media = media ?? WebSocketMediaTransport(baseURL: config.mediaURL)
+        self.callHistory = callHistory ?? .shared
         let runtimeEvents = AsyncStream<RuntimeEvent>(bufferingPolicy: .bufferingNewest(256)) { self.runtimeEventContinuation = $0 }
         let eventContinuation = self.runtimeEventContinuation
         self.media.onPacket = { packet, epoch in eventContinuation?.yield(.packet(packet, epoch)) }
@@ -887,7 +890,7 @@ final class CallSession: ObservableObject {
         guard isCurrent(current) else { return }
         cancelCallTasks()
         let epoch = mediaEpoch; mediaEpoch = nil
-        playout.stop(); audio.stop(); audioStartedForCallKitUUID = nil; activatedCallKitUUID = nil; transportActive = false; audioOperational = false
+        playout.stop(); audio.stop(); isMuted = false; audioStartedForCallKitUUID = nil; activatedCallKitUUID = nil; transportActive = false; audioOperational = false
         if let epoch { await media.close(connectionID: epoch) }
         guard isCurrent(current) else { return }
         if let reportReason, callKitReported || isOutgoingCall { callKit?.reportEnded(id: current.localCallKitUUID, reason: reportReason) }
@@ -897,6 +900,7 @@ final class CallSession: ObservableObject {
         } else {
             transition(finalState)
         }
+        finishCallHistory(finalState: finalState)
         invalidateGeneration(expected: current)
     }
 
@@ -910,6 +914,12 @@ final class CallSession: ObservableObject {
         cancelCallTasks(); audio.stop()
         let next = CallGeneration(id: UUID(), serverCallID: serverID, localCallKitUUID: localID)
         generation = next; activeSignaling = signaling; activeCallKitUUID = localID; isOutgoingCall = outgoing; callKitReported = false; incomingCallerName = outgoing ? nil : signaling.incomingCallerName
+        callHistoryRecordID = callHistory.begin(
+            accountID: signaling.historyAccountID,
+            logicalCallID: serverID,
+            direction: outgoing ? .outgoing : .incoming,
+            peerDisplayName: signaling.historyPeerDisplayName
+        )
         let events = runtimeEventContinuation
         audio.onDiagnostic = { value in events?.yield(.audioDiagnostic(next.id, value)) }
         audio.onFailure = { value in events?.yield(.audioFailure(next.id, value)) }
@@ -928,6 +938,7 @@ final class CallSession: ObservableObject {
         cancelCallTasks(); sendContinuation?.finish(); sendContinuation = nil; sendStream = nil; sendTask?.cancel(); sendTask = nil
         activeSignaling?.eraseSecrets(); callAudioCryptor?.erase(); callAudioCryptor = nil
         generation = nil; activeSignaling = nil; activeCallKitUUID = nil; mediaEpoch = nil; mediaToken = nil; isOutgoingCall = false; callKitReported = false; incomingCallerName = nil; suppressedSystemEndDuringAcceptance = false
+        callHistoryRecordID = nil
     }
 
     private func configureAcceptedEncryption(_ response: CallSignalView, signaling: any CallSignaling) throws {
@@ -959,6 +970,26 @@ final class CallSession: ObservableObject {
             return
         }
         diagnostics.record(role: config.role, callID: next.callID, category: "state", value: String(describing: next)); state = next
+        if case .active = next, let callHistoryRecordID { callHistory.markActive(callHistoryRecordID) }
+    }
+
+    private func finishCallHistory(finalState: CallState) {
+        guard let callHistoryRecordID else { return }
+        let terminal: CallHistoryStatus
+        switch finalState {
+        case let .failed(_, failure):
+            switch failure {
+            case .callRejected: terminal = .rejected
+            case .callExpired, .callCancelled, .answeredElsewhere:
+                terminal = isOutgoingCall ? .failed : .missed
+            default: terminal = .failed
+            }
+        case .ended:
+            terminal = isOutgoingCall ? .failed : .rejected
+        default:
+            terminal = .failed
+        }
+        callHistory.finish(callHistoryRecordID, status: terminal)
     }
 
     private func isCurrent(_ current: CallGeneration) -> Bool { generation == current }

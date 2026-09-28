@@ -1,4 +1,5 @@
 import CryptoKit
+import Combine
 import Foundation
 import Security
 
@@ -136,19 +137,81 @@ final class E2EEIdentityStore: @unchecked Sendable {
 
 final class E2EEIdentityPinStore: @unchecked Sendable {
     private let storage: any E2EESecretStorage
+    private static let transactionLock = NSLock()
     init(storage: any E2EESecretStorage = KeychainE2EESecretStorage(service: "com.vkapps.wifisecurecall.e2ee.pins")) { self.storage = storage }
 
-    func evaluate(userID: UUID, bundle: E2EEPublicDeviceBundle) throws -> E2EETrustState {
-        let key = "\(userID.uuidString.lowercased()).\(bundle.deviceID.uuidString.lowercased())"
-        let encoded = try JSONEncoder().encode(bundle)
-        guard let existing = try storage.load(key) else {
-            try storage.save(encoded, key: key)
-            return .firstTrusted
+    func evaluate(userID: UUID, bundle: E2EEPublicDeviceBundle, accountID: UUID? = nil) throws -> E2EETrustState {
+        try Self.transactionLock.wscLocked {
+            let key = storageKey(accountID: accountID, userID: userID, deviceID: bundle.deviceID)
+            let encoded = try JSONEncoder().encode(bundle)
+            guard let existing = try storage.load(key) else {
+                try storage.save(encoded, key: key)
+                return .firstTrusted
+            }
+            guard let pinned = try? JSONDecoder().decode(E2EEPublicDeviceBundle.self, from: existing) else { throw E2EEIdentityError.malformedIdentity }
+            guard pinned.signingPublicKey == bundle.signingPublicKey,
+                  pinned.agreementPublicKey == bundle.agreementPublicKey,
+                  pinned.keyVersion == bundle.keyVersion else { return .keyChanged }
+            return .unchanged
         }
-        guard let pinned = try? JSONDecoder().decode(E2EEPublicDeviceBundle.self, from: existing) else { throw E2EEIdentityError.malformedIdentity }
-        guard pinned.signingPublicKey == bundle.signingPublicKey,
-              pinned.agreementPublicKey == bundle.agreementPublicKey,
-              pinned.keyVersion == bundle.keyVersion else { return .keyChanged }
-        return .unchanged
+    }
+
+    func pinnedBundle(userID: UUID, deviceID: UUID, accountID: UUID? = nil) throws -> E2EEPublicDeviceBundle? {
+        try Self.transactionLock.wscLocked {
+            let key = storageKey(accountID: accountID, userID: userID, deviceID: deviceID)
+            guard let existing = try storage.load(key) else { return nil }
+            guard let bundle = try? JSONDecoder().decode(E2EEPublicDeviceBundle.self, from: existing) else {
+                throw E2EEIdentityError.malformedIdentity
+            }
+            return bundle
+        }
+    }
+
+    func approveReplacement(userID: UUID, bundle: E2EEPublicDeviceBundle, accountID: UUID? = nil) throws {
+        try Self.transactionLock.wscLocked {
+            let key = storageKey(accountID: accountID, userID: userID, deviceID: bundle.deviceID)
+            try storage.save(try JSONEncoder().encode(bundle), key: key)
+        }
+    }
+
+    private func storageKey(accountID: UUID?, userID: UUID, deviceID: UUID) -> String {
+        let account = accountID?.uuidString.lowercased() ?? "shared"
+        return "\(account).\(userID.uuidString.lowercased()).\(deviceID.uuidString.lowercased())"
+    }
+}
+
+struct E2EECallKeyChangeWarning: Identifiable, Equatable, Sendable {
+    let accountID: UUID
+    let userID: UUID
+    let deviceID: UUID
+    let pinnedFingerprint: String
+    let observedFingerprint: String
+    let observedBundle: E2EEPublicDeviceBundle
+
+    var id: String {
+        "\(accountID.uuidString.lowercased()).\(userID.uuidString.lowercased()).\(deviceID.uuidString.lowercased())"
+    }
+}
+
+@MainActor
+final class E2EEKeyChangeRegistry: ObservableObject {
+    static let shared = E2EEKeyChangeRegistry()
+    @Published private(set) var warnings: [E2EECallKeyChangeWarning] = []
+
+    func record(_ warning: E2EECallKeyChangeWarning) {
+        warnings.removeAll { $0.id == warning.id }
+        warnings.append(warning)
+        warnings.sort { $0.id < $1.id }
+    }
+
+    func clear(accountID: UUID, userID: UUID, deviceID: UUID) {
+        warnings.removeAll {
+            $0.accountID == accountID && $0.userID == userID && $0.deviceID == deviceID
+        }
+    }
+
+    func warnings(for accountID: UUID?) -> [E2EECallKeyChangeWarning] {
+        guard let accountID else { return [] }
+        return warnings.filter { $0.accountID == accountID }
     }
 }

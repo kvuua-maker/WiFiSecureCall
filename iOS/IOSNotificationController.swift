@@ -135,12 +135,15 @@ final class IOSNotificationController: NSObject, UIApplicationDelegate, UNUserNo
     nonisolated func userNotificationCenter(_ center: UNUserNotificationCenter, willPresent notification: UNNotification, withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void) {
         if let envelope = SecureMessagePushEnvelope.parse(notification.request.content.userInfo) {
             Task { @MainActor in
-                let store = SecureMessageStore.shared
+                let completion = RemoteCellularExactlyOnceCompletion(completionHandler)
                 if NotificationRuntime.shared.accountStore.accounts.contains(where: { $0.accountID == envelope.accountID }) {
-                    await store.loadMessages(conversationID: envelope.conversationID, accountID: envelope.accountID)
+                    _ = await SecureMessageNotificationWorkCoordinator.shared.handle(
+                        envelope,
+                        action: .refreshOnly
+                    )
                 }
+                completion.finish([.banner, .sound])
             }
-            completionHandler([.banner, .sound])
             return
         }
         if let envelope = RemoteCellularControlPushEnvelope.parse(notification.request.content.userInfo) {
@@ -178,10 +181,14 @@ final class IOSNotificationController: NSObject, UIApplicationDelegate, UNUserNo
         completionHandler: @escaping () -> Void
     ) async {
         if let envelope = SecureMessagePushEnvelope.parse(response.notification.request.content.userInfo) {
+            let completion = RemoteCellularExactlyOnceCompletion<Void> { _ in completionHandler() }
             if NotificationRuntime.shared.accountStore.accounts.contains(where: { $0.accountID == envelope.accountID }) {
-                await SecureMessageStore.shared.loadMessages(conversationID: envelope.conversationID, accountID: envelope.accountID)
+                _ = await SecureMessageNotificationWorkCoordinator.shared.handle(
+                    envelope,
+                    action: .openConversation
+                )
             }
-            completionHandler()
+            completion.finish(())
             return
         }
         if let envelope = RemoteCellularControlPushEnvelope.parse(response.notification.request.content.userInfo) {

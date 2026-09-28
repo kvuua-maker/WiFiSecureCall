@@ -76,8 +76,14 @@ final class SecureMessengerAudioEncryptionTests: XCTestCase {
         let callerEphemeral = Curve25519.KeyAgreement.PrivateKey(), calleeEphemeral = Curve25519.KeyAgreement.PrivateKey()
         let callerPackage = try E2EECallKeyAgreement.makePackage(callID: callID, userID: UUID(), identity: callerIdentity, side: .caller, epoch: epoch, ephemeral: callerEphemeral)
         let calleePackage = try E2EECallKeyAgreement.makePackage(callID: callID, userID: UUID(), identity: calleeIdentity, side: .callee, epoch: epoch, ephemeral: calleeEphemeral)
-        try E2EECallKeyAgreement.verify(callerPackage, identity: callerIdentity.publicBundle, expectedCallID: callID, expectedSide: .caller)
-        try E2EECallKeyAgreement.verify(calleePackage, identity: calleeIdentity.publicBundle, expectedCallID: callID, expectedSide: .callee)
+        try E2EECallKeyAgreement.verify(
+            callerPackage, identity: callerIdentity.publicBundle, expectedCallID: callID, expectedSide: .caller,
+            expectedUserID: callerPackage.userID, expectedDeviceID: callerPackage.deviceID
+        )
+        try E2EECallKeyAgreement.verify(
+            calleePackage, identity: calleeIdentity.publicBundle, expectedCallID: callID, expectedSide: .callee,
+            expectedUserID: calleePackage.userID, expectedDeviceID: calleePackage.deviceID
+        )
         let callerKeys = try E2EECallKeyAgreement.derive(localSide: .caller, localEphemeral: callerEphemeral, caller: callerPackage, callee: calleePackage)
         let calleeKeys = try E2EECallKeyAgreement.derive(localSide: .callee, localEphemeral: calleeEphemeral, caller: callerPackage, callee: calleePackage)
         XCTAssertNotEqual(callerKeys.send.withUnsafeBytes { Data($0) }, callerKeys.receive.withUnsafeBytes { Data($0) })
@@ -125,6 +131,53 @@ final class SecureMessengerAudioEncryptionTests: XCTestCase {
         let wrongEpoch = AudioPacket(encryptedType: .audio, callID: callID, direction: .callerToCallee, keyEpoch: 2, sequence: one.sequence, timestampMicroseconds: one.timestampMicroseconds, nonce: one.nonce, sealedPayload: one.payload)
         XCTAssertThrowsError(try callee.decrypt(wrongEpoch)) { XCTAssertEqual($0 as? EncryptedAudioError, .wrongEpoch) }
     }
+
+    func testCallPackagesRejectCrossCallWrongIdentityAndUnsafeEpochs() throws {
+        let callID = UUID(), otherCallID = UUID(), callerUserID = UUID(), calleeUserID = UUID()
+        let caller = E2EEDeviceIdentity(deviceID: UUID(), signingPrivateKey: .init(), agreementPrivateKey: .init(), keyVersion: 1)
+        let callee = E2EEDeviceIdentity(deviceID: UUID(), signingPrivateKey: .init(), agreementPrivateKey: .init(), keyVersion: 1)
+        let callerEphemeral = Curve25519.KeyAgreement.PrivateKey(), calleeEphemeral = Curve25519.KeyAgreement.PrivateKey()
+        let callerPackage = try E2EECallKeyAgreement.makePackage(callID: callID, userID: callerUserID, identity: caller, side: .caller, ephemeral: callerEphemeral)
+        XCTAssertThrowsError(try E2EECallKeyAgreement.verify(
+            callerPackage, identity: caller.publicBundle, expectedCallID: otherCallID, expectedSide: .caller,
+            expectedUserID: callerUserID, expectedDeviceID: caller.deviceID
+        ))
+        XCTAssertThrowsError(try E2EECallKeyAgreement.verify(
+            callerPackage, identity: caller.publicBundle, expectedCallID: callID, expectedSide: .caller,
+            expectedUserID: UUID(), expectedDeviceID: caller.deviceID
+        ))
+        XCTAssertThrowsError(try E2EECallKeyAgreement.verify(
+            callerPackage, identity: caller.publicBundle, expectedCallID: callID, expectedSide: .caller,
+            expectedUserID: callerUserID, expectedDeviceID: UUID()
+        ))
+        XCTAssertThrowsError(try E2EECallKeyAgreement.makePackage(callID: callID, userID: callerUserID, identity: caller, side: .caller, epoch: 0, ephemeral: callerEphemeral))
+        XCTAssertThrowsError(try E2EECallKeyAgreement.makePackage(callID: callID, userID: callerUserID, identity: caller, side: .caller, epoch: UInt64(UInt32.max) + 1, ephemeral: callerEphemeral))
+
+        let calleePackage = try E2EECallKeyAgreement.makePackage(callID: callID, userID: calleeUserID, identity: callee, side: .callee, epoch: 2, ephemeral: calleeEphemeral)
+        XCTAssertThrowsError(try E2EECallKeyAgreement.derive(localSide: .caller, localEphemeral: callerEphemeral, caller: callerPackage, callee: calleePackage))
+    }
+
+    func testSlidingReplayWindowAcceptsLimitedReorderingOnlyOnce() throws {
+        let (sender, receiver, _, _) = try fixture()
+        let frame = Data(repeating: 0x2a, count: AudioEngine.bytesPerFrame)
+        let packets = try [10, 8, 9].map { try sender.encrypt(frame, sequence: UInt64($0), timestampMicroseconds: UInt64($0) * 20_000) }
+        for packet in packets { XCTAssertEqual(try receiver.decrypt(packet).payload, frame) }
+        XCTAssertThrowsError(try receiver.decrypt(packets[1])) { XCTAssertEqual($0 as? EncryptedAudioError, .replay) }
+    }
+
+    func testSlidingReplayWindowNeverReadmitsPrunedAuthenticatedPacketAndEraseFailsClosed() throws {
+        let (sender, receiver, _, _) = try fixture()
+        let frame = Data(repeating: 0x18, count: AudioEngine.bytesPerFrame)
+        var earliest: AudioPacket?
+        for sequence in UInt64(0)...UInt64(2_050) {
+            let packet = try sender.encrypt(frame, sequence: sequence, timestampMicroseconds: sequence * 20_000)
+            if sequence == 0 { earliest = packet }
+            _ = try receiver.decrypt(packet)
+        }
+        XCTAssertThrowsError(try receiver.decrypt(try XCTUnwrap(earliest))) { XCTAssertEqual($0 as? EncryptedAudioError, .replay) }
+        receiver.erase()
+        XCTAssertThrowsError(try receiver.decrypt(try XCTUnwrap(earliest))) { XCTAssertEqual($0 as? EncryptedAudioError, .authentication) }
+    }
 }
 
 final class SecureMessengerTransmitMuteTests: XCTestCase {
@@ -155,6 +208,30 @@ final class SecureMessengerTransmitMuteTests: XCTestCase {
         let following = String(source[setMuted.lowerBound...].prefix(500))
         XCTAssertFalse(following.contains("engine.stop"))
         XCTAssertFalse(following.contains("engine.reset"))
+    }
+
+    func testRepeatedMuteTransitionsPreserveFrameCadenceAndCleanupReset() {
+        let gate = TransmitMuteGate()
+        let frames = (0..<8).map { Data(repeating: UInt8($0 + 1), count: AudioEngine.bytesPerFrame) }
+        var output: [Data] = []
+        for (index, frame) in frames.enumerated() {
+            if index == 2 { XCTAssertTrue(gate.setMuted(true)); XCTAssertFalse(gate.setMuted(true)) }
+            if index == 6 { XCTAssertTrue(gate.setMuted(false)); XCTAssertFalse(gate.setMuted(false)) }
+            output.append(gate.outgoingFrame(frame))
+        }
+        XCTAssertEqual(output.count, frames.count)
+        XCTAssertEqual(output[0], frames[0])
+        XCTAssertEqual(output[1], frames[1])
+        for index in 2..<6 {
+            XCTAssertEqual(output[index].count, AudioEngine.bytesPerFrame)
+            XCTAssertTrue(output[index].allSatisfy { $0 == 0 })
+        }
+        XCTAssertEqual(output[6], frames[6])
+        XCTAssertEqual(output[7], frames[7])
+        _ = gate.setMuted(true)
+        gate.reset()
+        XCTAssertFalse(gate.isMuted)
+        XCTAssertEqual(gate.outgoingFrame(frames[0]), frames[0])
     }
 }
 
@@ -346,7 +423,7 @@ final class SystemDialDiagnosticTests: XCTestCase {
         let handle = "+380501234567"
         let url = try XCTUnwrap(SystemDialTelephonyURL.make(handle: handle))
         XCTAssertEqual(url.scheme, "telephony")
-        XCTAssertEqual(url.path, handle)
+        XCTAssertEqual(url.absoluteString, "telephony:\(handle)")
         XCTAssertNil(SystemDialTelephonyURL.make(handle: ""))
     }
 
@@ -395,7 +472,7 @@ final class SystemDialDiagnosticTests: XCTestCase {
         XCTAssertNotNil(store.attempts[0].iPhoneDefaultCallingRequestAt)
         XCTAssertNotNil(store.attempts[0].iPhoneTelephonyFallbackRequestedAt)
         XCTAssertEqual(openedURL?.scheme, "telephony")
-        XCTAssertEqual(openedURL?.path, "+380501234567")
+        XCTAssertEqual(openedURL?.absoluteString, "telephony:+380501234567")
     }
 
     func testTelURLDiagnosticsPersistNoRawNumber() async throws {
@@ -1910,6 +1987,28 @@ final class WiFiSecureCallTests: XCTestCase {
     }
 
     @MainActor
+    func testCallSessionWritesOneHistoryRecordAcrossLogicalLifecycle() async throws {
+        let capture = RequestCapture()
+        let persistence = CallHistoryMemoryPersistence()
+        let history = CallHistoryStore(persistence: persistence, retentionLimit: 10)
+        let session = makeSession(capture: capture, callHistory: history)
+        let adapter = RetainedCallKitMock()
+        session.attach(callKit: adapter)
+
+        await session.startCall()
+        await session.startCall()
+        let localID = try XCTUnwrap(adapter.startedIDs.first)
+        XCTAssertEqual(adapter.startedIDs.count, 1)
+        XCTAssertEqual(history.records.count, 1)
+        _ = try await adapter.approveEnd(localID)
+        await eventually { session.state.isTerminal }
+
+        XCTAssertEqual(history.records.count, 1)
+        XCTAssertTrue(try XCTUnwrap(history.records.first).status.isTerminal)
+        XCTAssertNotNil(history.records.first?.terminalAt)
+    }
+
+    @MainActor
     private func prepareOutgoingRinging(
         capture: RequestCapture,
         audio: AudioEngineHandling = AudioEngineMock(),
@@ -1931,7 +2030,7 @@ final class WiFiSecureCallTests: XCTestCase {
     }
 
     @MainActor
-    private func makeSession(capture: RequestCapture, role: DeviceRole = .B, audio: AudioEngineHandling = AudioEngineMock(), media: MediaTransport? = nil) -> CallSession {
+    private func makeSession(capture: RequestCapture, role: DeviceRole = .B, audio: AudioEngineHandling = AudioEngineMock(), media: MediaTransport? = nil, callHistory: CallHistoryStore? = nil) -> CallSession {
         let config = AppConfig(
             apiBaseURL: URL(string: "https://unit.test/v1")!,
             mediaURL: URL(string: "wss://unit.test/media")!,
@@ -1942,7 +2041,7 @@ final class WiFiSecureCallTests: XCTestCase {
         urlConfiguration.protocolClasses = [CallSessionURLProtocol.self]
         CallSessionURLProtocol.capture = capture
         capture.clientRole = role
-        return CallSession(config: config, api: APIClient(config: config, session: URLSession(configuration: urlConfiguration)), audio: audio, media: media)
+        return CallSession(config: config, api: APIClient(config: config, session: URLSession(configuration: urlConfiguration)), audio: audio, media: media, callHistory: callHistory)
     }
 
     @MainActor

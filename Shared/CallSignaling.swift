@@ -34,7 +34,9 @@ enum CallSignalingError: Error { case invalidResponse, missingTarget }
 
 protocol CallSignaling: Sendable {
     var mediaPeerIdentity: MediaPeerIdentity { get }
+    var historyAccountID: UUID? { get }
     var incomingCallerName: String? { get }
+    var historyPeerDisplayName: String? { get }
     var requiresIncomingReconciliation: Bool { get }
     func create(callID: UUID, requestID: UUID) async throws -> CallSignalView
     func call(_ id: UUID) async throws -> CallSignalView
@@ -43,7 +45,9 @@ protocol CallSignaling: Sendable {
 }
 
 extension CallSignaling {
+    var historyAccountID: UUID? { nil }
     var incomingCallerName: String? { nil }
+    var historyPeerDisplayName: String? { incomingCallerName }
     var requiresIncomingReconciliation: Bool { false }
     func eraseSecrets() {}
 }
@@ -75,6 +79,8 @@ struct AccountCallSignaling: CallSignaling {
     let targetDeviceID: UUID?
     let localSide: CallPartySide
     var mediaPeerIdentity: MediaPeerIdentity { .account(localSide) }
+    var historyAccountID: UUID? { accountID }
+    var historyPeerDisplayName: String? { "Linked device" }
 
     init(client: AccountAPIClient, accountID: UUID, targetDeviceID: UUID? = nil, localSide: CallPartySide) {
         self.client = client
@@ -103,18 +109,22 @@ final class CrossUserCallSignaling: CallSignaling, @unchecked Sendable {
     let targetUserID: UUID?
     let localSide: CallPartySide
     let pushedCallerIdentity: CrossUserCallerIdentity?
+    let targetDisplayName: String?
     private let identityStore: E2EEIdentityStore
     private let pinStore: E2EEIdentityPinStore
     private let lock = NSLock()
     private var ephemeralByCall: [UUID: Curve25519.KeyAgreement.PrivateKey] = [:]
     var mediaPeerIdentity: MediaPeerIdentity { .secureAccount(localSide) }
+    var historyAccountID: UUID? { accountID }
     var incomingCallerName: String? { pushedCallerIdentity?.callKitName }
+    var historyPeerDisplayName: String? { localSide == .caller ? targetDisplayName : pushedCallerIdentity?.callKitName }
     var requiresIncomingReconciliation: Bool { true }
 
-    init(client: AccountAPIClient, accountID: UUID, targetUserID: UUID? = nil, localSide: CallPartySide, callerIdentity: CrossUserCallerIdentity? = nil, identityStore: E2EEIdentityStore = E2EEIdentityStore(), pinStore: E2EEIdentityPinStore = E2EEIdentityPinStore()) {
+    init(client: AccountAPIClient, accountID: UUID, targetUserID: UUID? = nil, targetDisplayName: String? = nil, localSide: CallPartySide, callerIdentity: CrossUserCallerIdentity? = nil, identityStore: E2EEIdentityStore = E2EEIdentityStore(), pinStore: E2EEIdentityPinStore = E2EEIdentityPinStore()) {
         self.client = client
         self.accountID = accountID
         self.targetUserID = targetUserID
+        self.targetDisplayName = targetDisplayName
         self.localSide = localSide
         self.pushedCallerIdentity = callerIdentity
         self.identityStore = identityStore
@@ -125,7 +135,7 @@ final class CrossUserCallSignaling: CallSignaling, @unchecked Sendable {
         guard let targetUserID else { throw CallSignalingError.missingTarget }
         do {
             let package = try await localPackage(callID: callID, side: .caller)
-            return try await map(await client.createUserCall(accountID: accountID, callID: callID, requestID: requestID, targetUserID: targetUserID, callerKeyPackage: package))
+            return try await map(await client.createUserCall(accountID: accountID, callID: callID, requestID: requestID, targetUserID: targetUserID, callerKeyPackage: package), expectedCallID: callID)
         } catch let error as AccountAPIError {
             if case let .status(_, response) = error, response?.error == "recipient_unavailable" {
                 throw CallFailure.targetUnavailable
@@ -135,26 +145,42 @@ final class CrossUserCallSignaling: CallSignaling, @unchecked Sendable {
     }
 
     func call(_ id: UUID) async throws -> CallSignalView {
-        try await map(await client.userCall(accountID: accountID, callID: id))
+        try await map(await client.userCall(accountID: accountID, callID: id), expectedCallID: id)
     }
 
     func mutate(_ action: CallMutation, callID: UUID, requestID: UUID) async throws -> CallSignalView {
         let package = action == .accept ? try await localPackage(callID: callID, side: .callee) : nil
-        return try await map(await client.mutateUserCall(accountID: accountID, action: action, callID: callID, requestID: requestID, calleeKeyPackage: package))
+        return try await map(await client.mutateUserCall(accountID: accountID, action: action, callID: callID, requestID: requestID, calleeKeyPackage: package), expectedCallID: callID)
     }
 
-    private func map(_ response: CrossUserCallResponse) async throws -> CallSignalView {
-        guard response.localSide == localSide else { throw CallSignalingError.invalidResponse }
+    private func map(_ response: CrossUserCallResponse, expectedCallID: UUID) async throws -> CallSignalView {
+        guard response.callID == expectedCallID, response.localSide == localSide else { throw CallSignalingError.invalidResponse }
         let answeredElsewhere = response.legState == .answeredElsewhere
         let callerName = response.caller?.callKitName ?? pushedCallerIdentity?.callKitName
         var audioKeys: CallAudioKeys?
+        let hasKeyMaterial = response.callerKeyPackage != nil || response.calleeKeyPackage != nil
+        let expectedIdentities = hasKeyMaterial ? try await authoritativeIdentities(response, answeredElsewhere: answeredElsewhere) : nil
         if let callerPackage = response.callerKeyPackage {
-            try await verify(callerPackage, expectedSide: .caller)
+            guard let expectedIdentities else { throw CallSignalingError.invalidResponse }
+            try await verify(
+                callerPackage, expectedCallID: expectedCallID, expectedSide: .caller,
+                expectedUserID: expectedIdentities.callerUserID,
+                expectedDeviceID: expectedIdentities.callerDeviceID
+            )
         }
         if let calleePackage = response.calleeKeyPackage {
-            try await verify(calleePackage, expectedSide: .callee)
+            guard let expectedIdentities, let calleeDeviceID = expectedIdentities.calleeDeviceID else {
+                throw CallSignalingError.invalidResponse
+            }
+            try await verify(
+                calleePackage, expectedCallID: expectedCallID, expectedSide: .callee,
+                expectedUserID: expectedIdentities.calleeUserID,
+                expectedDeviceID: calleeDeviceID
+            )
         }
-        if response.state == .accepted, let callerPackage = response.callerKeyPackage, let calleePackage = response.calleeKeyPackage,
+        if response.state == .accepted, !answeredElsewhere, response.mediaToken != nil,
+           let callerPackage = response.callerKeyPackage, let calleePackage = response.calleeKeyPackage,
+           response.calleeDeviceID == calleePackage.deviceID,
            let ephemeral = lock.wscLocked({ ephemeralByCall[response.callID] }) {
             audioKeys = try E2EECallKeyAgreement.derive(localSide: localSide, localEphemeral: ephemeral, caller: callerPackage, callee: calleePackage)
         }
@@ -181,10 +207,60 @@ final class CrossUserCallSignaling: CallSignaling, @unchecked Sendable {
         return try E2EECallKeyAgreement.makePackage(callID: callID, userID: profile.userID, identity: identity, side: side, ephemeral: ephemeral)
     }
 
-    private func verify(_ package: E2EECallKeyPackage, expectedSide: CallPartySide) async throws {
-        let bundles = try await client.deviceKeys(accountID: accountID, userID: package.userID)
+    private func authoritativeIdentities(_ response: CrossUserCallResponse, answeredElsewhere: Bool) async throws -> (callerUserID: UUID, callerDeviceID: UUID, calleeUserID: UUID, calleeDeviceID: UUID?) {
+        guard let callerUserID = response.callerUserID,
+              let callerDeviceID = response.callerDeviceID,
+              let calleeUserID = response.calleeUserID else {
+            throw CallSignalingError.invalidResponse
+        }
+        let profile = try await client.userProfile(accountID: accountID)
+        let localIdentity = try identityStore.identity()
+        if localSide == .caller {
+            guard callerUserID == profile.userID, callerDeviceID == localIdentity.deviceID,
+                  calleeUserID == targetUserID else {
+                throw CallSignalingError.invalidResponse
+            }
+        } else {
+            guard calleeUserID == profile.userID,
+                  answeredElsewhere || response.calleeDeviceID == nil || response.calleeDeviceID == localIdentity.deviceID,
+                  let pushedCallerIdentity else {
+                throw CallSignalingError.invalidResponse
+            }
+            let resolvedCaller = try await client.resolveRecipient(pushedCallerIdentity.publicIdentity, accountID: accountID)
+            guard resolvedCaller.userID == callerUserID else {
+                throw CallSignalingError.invalidResponse
+            }
+        }
+        return (callerUserID, callerDeviceID, calleeUserID, response.calleeDeviceID)
+    }
+
+    private func verify(
+        _ package: E2EECallKeyPackage,
+        expectedCallID: UUID,
+        expectedSide: CallPartySide,
+        expectedUserID: UUID,
+        expectedDeviceID: UUID
+    ) async throws {
+        let bundles = try await client.deviceKeys(accountID: accountID, userID: expectedUserID)
         guard let bundle = bundles.first(where: { $0.deviceID == package.deviceID }) else { throw E2EEKeyAgreementError.invalidIdentity }
-        guard try pinStore.evaluate(userID: package.userID, bundle: bundle) != .keyChanged else { throw E2EEKeyAgreementError.keyChanged }
-        try E2EECallKeyAgreement.verify(package, identity: bundle, expectedCallID: package.callID, expectedSide: expectedSide)
+        let pinned = try pinStore.pinnedBundle(userID: expectedUserID, deviceID: bundle.deviceID, accountID: accountID)
+        guard try pinStore.evaluate(userID: expectedUserID, bundle: bundle, accountID: accountID) != .keyChanged else {
+            if let pinned {
+                await E2EEKeyChangeRegistry.shared.record(.init(
+                    accountID: accountID,
+                    userID: expectedUserID,
+                    deviceID: bundle.deviceID,
+                    pinnedFingerprint: pinned.fingerprint,
+                    observedFingerprint: bundle.fingerprint,
+                    observedBundle: bundle
+                ))
+            }
+            throw E2EEKeyAgreementError.keyChanged
+        }
+        await E2EEKeyChangeRegistry.shared.clear(accountID: accountID, userID: expectedUserID, deviceID: bundle.deviceID)
+        try E2EECallKeyAgreement.verify(
+            package, identity: bundle, expectedCallID: expectedCallID, expectedSide: expectedSide,
+            expectedUserID: expectedUserID, expectedDeviceID: expectedDeviceID
+        )
     }
 }

@@ -67,6 +67,12 @@ struct CreateSecureConversationRequest: Codable, Sendable {
 struct SecureMessageReceiptRequest: Codable, Sendable { let requestID: UUID }
 
 struct DecryptedMessage: Identifiable, Equatable, Sendable {
+    enum Availability: String, Equatable, Sendable {
+        case available
+        case unavailableOnDevice
+        case securityFailure
+    }
+
     let id: UUID
     let conversationID: UUID
     let senderUserID: UUID
@@ -75,6 +81,47 @@ struct DecryptedMessage: Identifiable, Equatable, Sendable {
     let isSentByCurrentUser: Bool
     let delivered: Bool
     let read: Bool
+    let availability: Availability
+
+    init(
+        id: UUID,
+        conversationID: UUID,
+        senderUserID: UUID,
+        text: String,
+        createdAt: Date,
+        isSentByCurrentUser: Bool,
+        delivered: Bool,
+        read: Bool,
+        availability: Availability = .available
+    ) {
+        self.id = id
+        self.conversationID = conversationID
+        self.senderUserID = senderUserID
+        self.text = text
+        self.createdAt = createdAt
+        self.isSentByCurrentUser = isSentByCurrentUser
+        self.delivered = delivered
+        self.read = read
+        self.availability = availability
+    }
+}
+
+struct E2EESafetyDevice: Identifiable, Equatable, Sendable {
+    let deviceID: UUID
+    let fingerprint: String
+    let trustState: E2EETrustState
+    var id: UUID { deviceID }
+}
+
+struct E2EEKeyChangeWarning: Identifiable, Equatable, Sendable {
+    let accountID: UUID
+    let conversationID: UUID
+    let userID: UUID
+    let deviceID: UUID
+    let pinnedFingerprint: String
+    let observedFingerprint: String
+    let observedBundle: E2EEPublicDeviceBundle
+    var id: UUID { deviceID }
 }
 
 struct SecureMessagePushEnvelope: Equatable, Sendable {

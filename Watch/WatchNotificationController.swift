@@ -10,6 +10,16 @@ final class WatchNotificationController: NSObject, WKApplicationDelegate, UNUser
     private var lastAlertToken: Data?
     private var lastVoIPToken: Data?
     private var notificationsAuthorized = false
+    private final class OnceCompletion {
+        private let lock = NSLock()
+        private var completed = false
+        func finish(_ action: () -> Void) {
+            lock.lock(); defer { lock.unlock() }
+            guard !completed else { return }
+            completed = true
+            action()
+        }
+    }
 
     func applicationDidFinishLaunching() {
         NotificationRuntime.shared.configureCallKitFactory { WatchCallKitAdapter() }
@@ -103,11 +113,15 @@ final class WatchNotificationController: NSObject, WKApplicationDelegate, UNUser
     nonisolated func userNotificationCenter(_ center: UNUserNotificationCenter, willPresent notification: UNNotification, withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void) {
         if let envelope = SecureMessagePushEnvelope.parse(notification.request.content.userInfo) {
             Task { @MainActor in
+                let once = OnceCompletion()
                 if NotificationRuntime.shared.accountStore.accounts.contains(where: { $0.accountID == envelope.accountID }) {
-                    await SecureMessageStore.shared.loadMessages(conversationID: envelope.conversationID, accountID: envelope.accountID)
+                    _ = await SecureMessageNotificationWorkCoordinator.shared.handle(
+                        envelope,
+                        action: .refreshOnly
+                    )
                 }
+                once.finish { completionHandler([.banner, .sound]) }
             }
-            completionHandler([.banner, .sound])
             return
         }
         guard let envelope = ForegroundIncomingNotification.envelope(from: notification.request.content.userInfo) else { completionHandler([.banner, .sound]); return }
@@ -117,10 +131,14 @@ final class WatchNotificationController: NSObject, WKApplicationDelegate, UNUser
 
     nonisolated func userNotificationCenter(_ center: UNUserNotificationCenter, didReceive response: UNNotificationResponse) async {
         if let envelope = SecureMessagePushEnvelope.parse(response.notification.request.content.userInfo) {
-            await MainActor.run {
-                guard NotificationRuntime.shared.accountStore.accounts.contains(where: { $0.accountID == envelope.accountID }) else { return }
-                Task { await SecureMessageStore.shared.loadMessages(conversationID: envelope.conversationID, accountID: envelope.accountID) }
+            let allowed = await MainActor.run {
+                NotificationRuntime.shared.accountStore.accounts.contains(where: { $0.accountID == envelope.accountID })
             }
+            guard allowed else { return }
+            _ = await SecureMessageNotificationWorkCoordinator.shared.handle(
+                envelope,
+                action: .openConversation
+            )
             return
         }
         guard let envelope = IncomingNotificationEnvelope.parse(response.notification.request.content.userInfo) else { return }

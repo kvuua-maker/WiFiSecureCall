@@ -21,3 +21,30 @@ enum ProductAccessibility {
     static let endCall = "End secure call"
     static let sendMessage = "Send encrypted message"
 }
+
+@MainActor
+final class ProductNavigation: ObservableObject {
+    static let shared = ProductNavigation()
+
+    struct ConversationRoute: Equatable, Sendable {
+        let accountID: UUID
+        let conversationID: UUID
+    }
+
+    @Published private(set) var pendingConversation: ConversationRoute?
+    @Published private(set) var selectedSection: ProductSection = .chats
+
+    func openConversation(accountID: UUID, conversationID: UUID) {
+        selectedSection = .chats
+        pendingConversation = .init(accountID: accountID, conversationID: conversationID)
+    }
+
+    func select(_ section: ProductSection) {
+        selectedSection = section
+    }
+
+    func consumeConversation() -> ConversationRoute? {
+        defer { pendingConversation = nil }
+        return pendingConversation
+    }
+}

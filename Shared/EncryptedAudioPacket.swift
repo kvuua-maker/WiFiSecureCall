@@ -11,10 +11,12 @@ enum EncryptedAudioError: Error, Equatable {
 }
 
 final class CallAudioCryptor: @unchecked Sendable {
+    private static let replayWindowSize: UInt64 = 2_048
     private let callID: UUID
     private var keys: CallAudioKeys?
     private let lock = NSLock()
     private var receivedSequences = Set<UInt64>()
+    private var receivedHighWater: UInt64?
     private var erased = false
 
     init(callID: UUID, keys: CallAudioKeys) { self.callID = callID; self.keys = keys }
@@ -45,17 +47,14 @@ final class CallAudioCryptor: @unchecked Sendable {
             guard packet.protocolVersion == AudioPacket.encryptedVersion, packet.callID == callID else { throw EncryptedAudioError.wrongCall }
             guard packet.direction == keys.receiveDirection else { throw EncryptedAudioError.wrongDirection }
             guard packet.keyEpoch == keys.epoch else { throw EncryptedAudioError.wrongEpoch }
-            guard !receivedSequences.contains(packet.sequence) else { throw EncryptedAudioError.replay }
+            guard acceptsSequence(packet.sequence) else { throw EncryptedAudioError.replay }
             guard packet.payload.count == AudioEngine.bytesPerFrame + 16 else { throw EncryptedAudioError.invalidFrame }
             do {
                 let nonce = try ChaChaPoly.Nonce(data: packet.nonce)
                 let box = try ChaChaPoly.SealedBox(nonce: nonce, ciphertext: packet.payload.dropLast(16), tag: packet.payload.suffix(16))
                 let plaintext = try ChaChaPoly.open(box, using: keys.receive, authenticating: packet.authenticatedHeader)
                 guard plaintext.count == AudioEngine.bytesPerFrame else { throw EncryptedAudioError.invalidFrame }
-                receivedSequences.insert(packet.sequence)
-                if receivedSequences.count > 2_048, let floor = receivedSequences.max().map({ $0 > 1_024 ? $0 - 1_024 : 0 }) {
-                    receivedSequences = receivedSequences.filter { $0 >= floor }
-                }
+                recordSequence(packet.sequence)
                 return AudioPacket(type: .audio, callID: packet.callID, sequence: packet.sequence, timestampMicroseconds: packet.timestampMicroseconds, payload: plaintext)
             } catch let error as EncryptedAudioError {
                 throw error
@@ -68,8 +67,25 @@ final class CallAudioCryptor: @unchecked Sendable {
     func erase() {
         lock.wscLocked {
             receivedSequences.removeAll(keepingCapacity: false)
+            receivedHighWater = nil
             keys = nil
             erased = true
+        }
+    }
+
+    private func acceptsSequence(_ sequence: UInt64) -> Bool {
+        guard let highWater = receivedHighWater else { return true }
+        if sequence > highWater { return true }
+        guard highWater - sequence < Self.replayWindowSize else { return false }
+        return !receivedSequences.contains(sequence)
+    }
+
+    private func recordSequence(_ sequence: UInt64) {
+        receivedSequences.insert(sequence)
+        if receivedHighWater.map({ sequence > $0 }) ?? true { receivedHighWater = sequence }
+        guard let highWater = receivedHighWater else { return }
+        receivedSequences = receivedSequences.filter { candidate in
+            candidate <= highWater && highWater - candidate < Self.replayWindowSize
         }
     }
 }

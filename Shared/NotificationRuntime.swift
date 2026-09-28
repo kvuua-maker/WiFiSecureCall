@@ -98,7 +98,7 @@ final class NotificationRuntime {
         return try await accountAPI.resolveRecipient(input, accountID: accountID)
     }
 
-    func startUserCall(targetUserID: UUID, accountID: UUID) async {
+    func startUserCall(targetUserID: UUID, accountID: UUID, peerDisplayName: String? = nil) async {
         guard accountStore.accounts.contains(where: { $0.accountID == accountID }) else {
             callSession.failToStart(.accountSessionInvalid)
             return
@@ -113,7 +113,7 @@ final class NotificationRuntime {
             return
         }
         _ = ensureCallKit()
-        let signaling = CrossUserCallSignaling(client: accountAPI, accountID: accountID, targetUserID: targetUserID, localSide: .caller)
+        let signaling = CrossUserCallSignaling(client: accountAPI, accountID: accountID, targetUserID: targetUserID, targetDisplayName: peerDisplayName, localSide: .caller)
         await callSession.startCall(signaling: signaling)
     }
 
@@ -243,6 +243,118 @@ final class NotificationRuntime {
         case let .incomingRinging(value), let .connecting(value), let .active(value), let .reconnecting(value): return value == callID
         default: return false
         }
+    }
+}
+
+enum SecureMessageNotificationAction: Equatable, Sendable {
+    case refreshOnly
+    case openConversation
+}
+
+final class SecureMessageNotificationExecutionPermit: @unchecked Sendable {
+    private let lock = NSLock()
+    private var open = true
+
+    var isOpen: Bool { lock.wscLocked { open } }
+
+    @discardableResult
+    func close() -> Bool {
+        lock.wscLocked {
+            guard open else { return false }
+            open = false
+            return true
+        }
+    }
+}
+
+@MainActor
+final class SecureMessageNotificationWorkCoordinator {
+    typealias Loader = @MainActor (UUID, UUID) async -> Bool
+    typealias Router = @MainActor (UUID, UUID) -> Void
+    typealias Sleeper = @Sendable (UInt64) async -> Void
+
+    static let shared = SecureMessageNotificationWorkCoordinator(
+        loader: { accountID, conversationID in
+            await SecureMessageStore.shared.prepareNotificationConversation(
+                conversationID: conversationID,
+                accountID: accountID
+            )
+        },
+        router: { accountID, conversationID in
+            NotificationRuntime.shared.accountStore.switchAccount(to: accountID)
+            ProductNavigation.shared.openConversation(accountID: accountID, conversationID: conversationID)
+        },
+        sleeper: { nanoseconds in try? await Task.sleep(nanoseconds: nanoseconds) }
+    )
+
+    private final class Outcome {
+        private var continuation: CheckedContinuation<Bool, Never>?
+        private var value: Bool?
+
+        func wait() async -> Bool {
+            if let value { return value }
+            return await withCheckedContinuation { continuation = $0 }
+        }
+
+        func finish(_ value: Bool) {
+            guard self.value == nil else { return }
+            self.value = value
+            continuation?.resume(returning: value)
+            continuation = nil
+        }
+    }
+
+    private let loader: Loader
+    private let router: Router
+    private let sleeper: Sleeper
+    private var operationTasks: [UUID: Task<Void, Never>] = [:]
+    private var deadlineTasks: [UUID: Task<Void, Never>] = [:]
+
+    var trackedOperationCount: Int { operationTasks.count }
+    var trackedDeadlineCount: Int { deadlineTasks.count }
+
+    init(loader: @escaping Loader, router: @escaping Router, sleeper: @escaping Sleeper) {
+        self.loader = loader
+        self.router = router
+        self.sleeper = sleeper
+    }
+
+    func handle(
+        _ envelope: SecureMessagePushEnvelope,
+        action: SecureMessageNotificationAction,
+        budgetNanoseconds: UInt64 = 5_000_000_000
+    ) async -> Bool {
+        let operationID = UUID()
+        let permit = SecureMessageNotificationExecutionPermit()
+        let outcome = Outcome()
+
+        operationTasks[operationID] = Task { @MainActor [weak self] in
+            guard let self else { outcome.finish(false); return }
+            let loaded = await loader(envelope.accountID, envelope.conversationID)
+            guard permit.isOpen else {
+                outcome.finish(false)
+                operationTasks.removeValue(forKey: operationID)
+                return
+            }
+            if loaded, action == .openConversation {
+                router(envelope.accountID, envelope.conversationID)
+            }
+            permit.close()
+            operationTasks.removeValue(forKey: operationID)
+            outcome.finish(loaded)
+        }
+        deadlineTasks[operationID] = Task { @MainActor [weak self] in
+            guard let self else { outcome.finish(false); return }
+            await sleeper(budgetNanoseconds)
+            guard permit.close() else { return }
+            operationTasks.removeValue(forKey: operationID)?.cancel()
+            outcome.finish(false)
+        }
+
+        let result = await outcome.wait()
+        operationTasks.removeValue(forKey: operationID)?.cancel()
+        deadlineTasks.removeValue(forKey: operationID)?.cancel()
+        return result
     }
 }
 

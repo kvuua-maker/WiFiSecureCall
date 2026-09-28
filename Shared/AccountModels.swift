@@ -749,6 +749,10 @@ struct CrossUserCallResponse: Codable, Equatable, Sendable {
     let caller: CrossUserCallerIdentity?
     var callerKeyPackage: E2EECallKeyPackage? = nil
     var calleeKeyPackage: E2EECallKeyPackage? = nil
+    var callerUserID: UUID? = nil
+    var callerDeviceID: UUID? = nil
+    var calleeUserID: UUID? = nil
+    var calleeDeviceID: UUID? = nil
 }
 
 struct AccountCallResponse: Codable, Equatable, Sendable {
