@@ -1,4 +1,5 @@
 import AVFoundation
+import CryptoKit
 import Intents
 import SwiftUI
 import UIKit
@@ -31,6 +32,190 @@ final class WatchSystemDialerNumberTests: XCTestCase {
         XCTAssertEqual(WatchSystemDialerNumber.deletingLast(from: ""), "")
         XCTAssertEqual(WatchSystemDialerNumber.url(for: "+380501234567")?.absoluteString, "tel:+380501234567")
         XCTAssertNil(WatchSystemDialerNumber.url(for: "+380 50"))
+    }
+}
+
+private final class InMemoryE2EESecretStorage: E2EESecretStorage, @unchecked Sendable {
+    private let lock = NSLock()
+    private var values: [String: Data] = [:]
+
+    func load(_ key: String) throws -> Data? { lock.wscLocked { values[key] } }
+    func save(_ data: Data, key: String) throws { lock.wscLocked { values[key] = data } }
+}
+
+final class SecureMessengerIdentityTests: XCTestCase {
+    func testIdentityPersistsStableKeysAndProofVerifies() throws {
+        let storage = InMemoryE2EESecretStorage()
+        let deviceID = UUID()
+        let first = try E2EEIdentityStore(storage: storage, deviceID: deviceID).identity()
+        let second = try E2EEIdentityStore(storage: storage, deviceID: deviceID).identity()
+        XCTAssertEqual(first.publicBundle, second.publicBundle)
+        XCTAssertEqual(first.keyVersion, 1)
+        XCTAssertFalse(first.publicBundle.fingerprint.isEmpty)
+        let registration = try first.registration(requestID: UUID())
+        let signature = try XCTUnwrap(Data(base64Encoded: registration.proofSignature))
+        let publicKey = try Curve25519.Signing.PublicKey(rawRepresentation: first.signingPrivateKey.publicKey.rawRepresentation)
+        XCTAssertTrue(publicKey.isValidSignature(signature, for: E2EEDeviceIdentity.proofMessage(registration)))
+    }
+
+    func testTOFUPinningRejectsSilentIdentityReplacement() throws {
+        let pins = E2EEIdentityPinStore(storage: InMemoryE2EESecretStorage())
+        let userID = UUID(), deviceID = UUID()
+        let first = E2EEDeviceIdentity(deviceID: deviceID, signingPrivateKey: .init(), agreementPrivateKey: .init(), keyVersion: 1).publicBundle
+        let changed = E2EEDeviceIdentity(deviceID: deviceID, signingPrivateKey: .init(), agreementPrivateKey: .init(), keyVersion: 2).publicBundle
+        XCTAssertEqual(try pins.evaluate(userID: userID, bundle: first), .firstTrusted)
+        XCTAssertEqual(try pins.evaluate(userID: userID, bundle: first), .unchanged)
+        XCTAssertEqual(try pins.evaluate(userID: userID, bundle: changed), .keyChanged)
+    }
+}
+
+final class SecureMessengerAudioEncryptionTests: XCTestCase {
+    private func fixture(callID: UUID = UUID(), epoch: UInt64 = 1) throws -> (CallAudioCryptor, CallAudioCryptor, E2EECallKeyPackage, E2EECallKeyPackage) {
+        let callerIdentity = E2EEDeviceIdentity(deviceID: UUID(), signingPrivateKey: .init(), agreementPrivateKey: .init(), keyVersion: 1)
+        let calleeIdentity = E2EEDeviceIdentity(deviceID: UUID(), signingPrivateKey: .init(), agreementPrivateKey: .init(), keyVersion: 1)
+        let callerEphemeral = Curve25519.KeyAgreement.PrivateKey(), calleeEphemeral = Curve25519.KeyAgreement.PrivateKey()
+        let callerPackage = try E2EECallKeyAgreement.makePackage(callID: callID, userID: UUID(), identity: callerIdentity, side: .caller, epoch: epoch, ephemeral: callerEphemeral)
+        let calleePackage = try E2EECallKeyAgreement.makePackage(callID: callID, userID: UUID(), identity: calleeIdentity, side: .callee, epoch: epoch, ephemeral: calleeEphemeral)
+        try E2EECallKeyAgreement.verify(callerPackage, identity: callerIdentity.publicBundle, expectedCallID: callID, expectedSide: .caller)
+        try E2EECallKeyAgreement.verify(calleePackage, identity: calleeIdentity.publicBundle, expectedCallID: callID, expectedSide: .callee)
+        let callerKeys = try E2EECallKeyAgreement.derive(localSide: .caller, localEphemeral: callerEphemeral, caller: callerPackage, callee: calleePackage)
+        let calleeKeys = try E2EECallKeyAgreement.derive(localSide: .callee, localEphemeral: calleeEphemeral, caller: callerPackage, callee: calleePackage)
+        XCTAssertNotEqual(callerKeys.send.withUnsafeBytes { Data($0) }, callerKeys.receive.withUnsafeBytes { Data($0) })
+        XCTAssertEqual(callerKeys.send.withUnsafeBytes { Data($0) }, calleeKeys.receive.withUnsafeBytes { Data($0) })
+        return (CallAudioCryptor(callID: callID, keys: callerKeys), CallAudioCryptor(callID: callID, keys: calleeKeys), callerPackage, calleePackage)
+    }
+
+    func testEncryptedAudioRoundTripReplayTamperAndErasure() throws {
+        let (caller, callee, _, _) = try fixture()
+        let live = Data((0..<AudioEngine.bytesPerFrame).map { UInt8($0 & 0xff) })
+        let packet = try caller.encrypt(live, sequence: 7, timestampMicroseconds: 140_000)
+        XCTAssertEqual(packet.nonce, AudioPacket.encryptedNonce(epoch: 1, sequence: 7))
+        XCTAssertEqual(try callee.decrypt(packet).payload, live)
+        XCTAssertThrowsError(try callee.decrypt(packet)) { XCTAssertEqual($0 as? EncryptedAudioError, .replay) }
+        var encoded = packet.encode(); encoded[encoded.count - 1] ^= 1
+        let tampered = try XCTUnwrap(AudioPacket.decode(encoded))
+        let (_, freshCallee, _, _) = try fixture(callID: packet.callID)
+        XCTAssertThrowsError(try freshCallee.decrypt(tampered))
+        caller.erase()
+        XCTAssertThrowsError(try caller.encrypt(live, sequence: 8, timestampMicroseconds: 160_000))
+    }
+
+    func testCallAndEpochAreBoundAndLegacyFrameStillParses() throws {
+        let first = try fixture(callID: UUID(), epoch: 1)
+        let second = try fixture(callID: UUID(), epoch: 2)
+        XCTAssertNotEqual(first.2.callID, second.2.callID)
+        XCTAssertNotEqual(first.2.keyEpoch, second.2.keyEpoch)
+        let legacy = AudioPacket(type: .audio, callID: UUID(), sequence: 1, timestampMicroseconds: 20_000, payload: Data(repeating: 3, count: AudioEngine.bytesPerFrame))
+        XCTAssertEqual(AudioPacket.decode(legacy.encode()), legacy)
+        var unknown = legacy.encode(); unknown[0] = 99
+        XCTAssertNil(AudioPacket.decode(unknown))
+    }
+
+    func testWrongCallDirectionEpochAndNonceUniquenessFailClosed() throws {
+        let callID = UUID()
+        let (caller, callee, _, _) = try fixture(callID: callID)
+        let frame = Data(repeating: 4, count: AudioEngine.bytesPerFrame)
+        let one = try caller.encrypt(frame, sequence: 1, timestampMicroseconds: 20_000)
+        let two = try caller.encrypt(frame, sequence: 2, timestampMicroseconds: 40_000)
+        XCTAssertNotEqual(one.nonce, two.nonce)
+        let wrongCall = AudioPacket(encryptedType: .audio, callID: UUID(), direction: one.direction!, keyEpoch: one.keyEpoch, sequence: one.sequence, timestampMicroseconds: one.timestampMicroseconds, nonce: one.nonce, sealedPayload: one.payload)
+        XCTAssertThrowsError(try callee.decrypt(wrongCall)) { XCTAssertEqual($0 as? EncryptedAudioError, .wrongCall) }
+        let wrongDirection = AudioPacket(encryptedType: .audio, callID: callID, direction: .calleeToCaller, keyEpoch: one.keyEpoch, sequence: one.sequence, timestampMicroseconds: one.timestampMicroseconds, nonce: one.nonce, sealedPayload: one.payload)
+        XCTAssertThrowsError(try callee.decrypt(wrongDirection)) { XCTAssertEqual($0 as? EncryptedAudioError, .wrongDirection) }
+        let wrongEpoch = AudioPacket(encryptedType: .audio, callID: callID, direction: .callerToCallee, keyEpoch: 2, sequence: one.sequence, timestampMicroseconds: one.timestampMicroseconds, nonce: one.nonce, sealedPayload: one.payload)
+        XCTAssertThrowsError(try callee.decrypt(wrongEpoch)) { XCTAssertEqual($0 as? EncryptedAudioError, .wrongEpoch) }
+    }
+}
+
+final class SecureMessengerTransmitMuteTests: XCTestCase {
+    func testApplicationMuteSubstitutesExactSilenceWithoutAffectingReceivedAudio() {
+        let gate = TransmitMuteGate()
+        let captured = Data(repeating: 0x5a, count: AudioEngine.bytesPerFrame)
+        let received = Data(repeating: 0x7b, count: AudioEngine.bytesPerFrame)
+        XCTAssertEqual(gate.outgoingFrame(captured), captured)
+        XCTAssertTrue(gate.setMuted(true))
+        XCTAssertFalse(gate.setMuted(true))
+        let muted = gate.outgoingFrame(captured)
+        XCTAssertEqual(muted.count, AudioEngine.bytesPerFrame)
+        XCTAssertTrue(muted.allSatisfy { $0 == 0 })
+        XCTAssertEqual(received, Data(repeating: 0x7b, count: AudioEngine.bytesPerFrame))
+        XCTAssertTrue(gate.setMuted(false))
+        XCTAssertEqual(gate.outgoingFrame(captured), captured)
+        _ = gate.setMuted(true); gate.reset()
+        XCTAssertFalse(gate.isMuted)
+    }
+
+
+    func testNormalMuteDoesNotUseSystemVoiceProcessingMuteOrRestartGraph() throws {
+        let repository = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent()
+        let source = try String(contentsOf: repository.appendingPathComponent("Shared/AudioEngine.swift"))
+        XCTAssertFalse(source.contains("AVAudioApplication.shared.setInputMuted"))
+        XCTAssertFalse(source.contains("isVoiceProcessingInputMuted"))
+        let setMuted = try XCTUnwrap(source.range(of: "func setMuted(_ value: Bool) throws"))
+        let following = String(source[setMuted.lowerBound...].prefix(500))
+        XCTAssertFalse(following.contains("engine.stop"))
+        XCTAssertFalse(following.contains("engine.reset"))
+    }
+}
+
+final class SecureMessengerCryptoTests: XCTestCase {
+    func testMessageRoundTripDeviceEnvelopesTamperAndNoPlaintextEncoding() throws {
+        let sender = E2EEDeviceIdentity(deviceID: UUID(), signingPrivateKey: .init(), agreementPrivateKey: .init(), keyVersion: 1)
+        let recipient = E2EEDeviceIdentity(deviceID: UUID(), signingPrivateKey: .init(), agreementPrivateKey: .init(), keyVersion: 1)
+        let senderOther = E2EEDeviceIdentity(deviceID: UUID(), signingPrivateKey: .init(), agreementPrivateKey: .init(), keyVersion: 1)
+        let conversationID = UUID(), senderUserID = UUID(), recipientUserID = UUID()
+        let plaintext = "private message sentinel"
+        let input = try SecureMessageCrypto.encrypt(text: plaintext, conversationID: conversationID, senderUserID: senderUserID, identity: sender, recipientDevices: [recipient.publicBundle], senderOtherDevices: [senderOther.publicBundle])
+        XCTAssertEqual(Set(input.envelopes.map(\.deviceID)), Set([recipient.deviceID, senderOther.deviceID]))
+        XCTAssertFalse(String(data: try JSONEncoder().encode(input), encoding: .utf8)?.contains(plaintext) ?? true)
+        let record = SecureMessageRecord(messageID: input.messageID, conversationID: conversationID, clientMessageID: input.clientMessageID, senderUserID: senderUserID, senderDeviceID: sender.deviceID, recipientUserID: recipientUserID, createdAt: Date(), protocolVersion: input.protocolVersion, keyVersion: input.keyVersion, nonce: input.nonce, ciphertext: input.ciphertext, tag: input.tag, envelopes: input.envelopes, signature: input.signature, receipts: [])
+        XCTAssertTrue(SecureMessageCrypto.verifySignature(record, senderIdentity: sender.publicBundle))
+        XCTAssertEqual(try SecureMessageCrypto.decrypt(record, identity: recipient), plaintext)
+        XCTAssertThrowsError(try SecureMessageCrypto.decrypt(record, identity: sender))
+        let tampered = SecureMessageRecord(messageID: record.messageID, conversationID: record.conversationID, clientMessageID: record.clientMessageID, senderUserID: record.senderUserID, senderDeviceID: record.senderDeviceID, recipientUserID: record.recipientUserID, createdAt: record.createdAt, protocolVersion: record.protocolVersion, keyVersion: record.keyVersion, nonce: record.nonce, ciphertext: Data("tamper".utf8).base64EncodedString(), tag: record.tag, envelopes: record.envelopes, signature: record.signature, receipts: [])
+        XCTAssertThrowsError(try SecureMessageCrypto.decrypt(tampered, identity: recipient))
+        XCTAssertFalse(SecureMessageCrypto.verifySignature(tampered, senderIdentity: sender.publicBundle))
+    }
+
+    func testMessagePushContainsOnlyOpaqueIdentifiers() {
+        let conversation = UUID(), message = UUID(), account = UUID()
+        let payload: [AnyHashable: Any] = ["event": "secure_message", "conversationID": conversation.uuidString, "messageID": message.uuidString, "accountID": account.uuidString]
+        XCTAssertEqual(SecureMessagePushEnvelope.parse(payload), .init(conversationID: conversation, messageID: message, accountID: account))
+        XCTAssertNil(payload["plaintext"])
+        XCTAssertNil(payload["phoneNumber"])
+    }
+}
+
+final class SecureMessengerProductRegressionTests: XCTestCase {
+    func testReleaseProductRootsKeepDeveloperProbesBehindDebug() throws {
+        let repository = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent()
+        for path in ["iOS/IOSProductRootView.swift", "Watch/WatchProductRootView.swift"] {
+            let source = try String(contentsOf: repository.appendingPathComponent(path))
+            XCTAssertTrue(source.contains("#if DEBUG"), path)
+            XCTAssertTrue(source.contains("Developer diagnostics"), path)
+        }
+        let ios = try String(contentsOf: repository.appendingPathComponent("iOS/IOSProductRootView.swift"))
+        XCTAssertTrue(ios.contains("ConversationListView"))
+        XCTAssertTrue(ios.contains("RecipientSearchView"))
+        XCTAssertTrue(ios.contains("AccountView"))
+        XCTAssertFalse(ios.contains("Remote Cellular Probe"))
+        XCTAssertFalse(ios.contains("Carrier Probe"))
+    }
+
+    func testEntitlementsBackgroundModesExportComplianceAndBuildRemainPreserved() throws {
+        let repository = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent()
+        let entitlements = try XCTUnwrap(PropertyListSerialization.propertyList(from: Data(contentsOf: repository.appendingPathComponent("iOS/WiFiSecureCall.entitlements")), format: nil) as? [String: Any])
+        XCTAssertEqual(entitlements["com.apple.developer.calling-app"] as? Bool, true)
+        XCTAssertEqual(entitlements["com.apple.developer.dialing-app"] as? Bool, true)
+        XCTAssertEqual(entitlements["com.apple.developer.applesignin"] as? [String], ["Default"])
+        XCTAssertEqual(entitlements["aps-environment"] as? String, "production")
+        XCTAssertEqual(entitlements["com.apple.developer.usernotifications.time-sensitive"] as? Bool, true)
+        XCTAssertEqual(entitlements["com.apple.developer.siri"] as? Bool, true)
+        let info = try XCTUnwrap(PropertyListSerialization.propertyList(from: Data(contentsOf: repository.appendingPathComponent("iOS/Info.plist")), format: nil) as? [String: Any])
+        XCTAssertEqual(Set(info["UIBackgroundModes"] as? [String] ?? []), Set(["audio", "remote-notification", "voip"]))
+        XCTAssertEqual(info["ITSAppUsesNonExemptEncryption"] as? Bool, false)
+        let build = try String(contentsOf: repository.appendingPathComponent("Config/Base.xcconfig"))
+        XCTAssertTrue(build.contains("CURRENT_PROJECT_VERSION = 56"))
     }
 }
 
