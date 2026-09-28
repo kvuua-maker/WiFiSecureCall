@@ -184,16 +184,46 @@ actor AccountAPIClient {
         try await authorizedV3("recipients/resolve", accountID: accountID, body: RecipientResolveRequest(recipient: recipient))
     }
 
-    func createUserCall(accountID: UUID, callID: UUID, requestID: UUID, targetUserID: UUID) async throws -> CrossUserCallResponse {
-        try await authorizedV3("calls", accountID: accountID, body: CrossUserCallCreateRequest(requestID: requestID, callID: callID, targetUserID: targetUserID))
+    func createUserCall(accountID: UUID, callID: UUID, requestID: UUID, targetUserID: UUID, callerKeyPackage: E2EECallKeyPackage? = nil) async throws -> CrossUserCallResponse {
+        try await authorizedV3("calls", accountID: accountID, body: CrossUserCallCreateRequest(requestID: requestID, callID: callID, targetUserID: targetUserID, callerKeyPackage: callerKeyPackage))
     }
 
     func userCall(accountID: UUID, callID: UUID) async throws -> CrossUserCallResponse {
         try await authorizedV3("calls/\(callID.uuidString.lowercased())", method: "GET", accountID: accountID, body: Optional<EmptyAccountRequest>.none)
     }
 
-    func mutateUserCall(accountID: UUID, action: CallMutation, callID: UUID, requestID: UUID) async throws -> CrossUserCallResponse {
-        try await authorizedV3("calls/\(callID.uuidString.lowercased())/\(action.rawValue)", accountID: accountID, body: AccountCallMutationRequest(requestID: requestID))
+    func mutateUserCall(accountID: UUID, action: CallMutation, callID: UUID, requestID: UUID, calleeKeyPackage: E2EECallKeyPackage? = nil) async throws -> CrossUserCallResponse {
+        try await authorizedV3("calls/\(callID.uuidString.lowercased())/\(action.rawValue)", accountID: accountID, body: CrossUserCallMutationRequest(requestID: requestID, calleeKeyPackage: calleeKeyPackage))
+    }
+
+    func registerDeviceKey(accountID: UUID, request: E2EEDeviceRegistrationRequest) async throws -> E2EEPublicDeviceBundle {
+        try await authorizedV3("device-keys", accountID: accountID, body: request)
+    }
+
+    func deviceKeys(accountID: UUID, userID: UUID) async throws -> [E2EEPublicDeviceBundle] {
+        try await authorizedV3("users/\(userID.uuidString.lowercased())/device-keys", method: "GET", accountID: accountID, body: Optional<EmptyAccountRequest>.none)
+    }
+
+    func createSecureConversation(accountID: UUID, requestID: UUID, targetUserID: UUID) async throws -> SecureConversation {
+        try await authorizedV3("conversations", accountID: accountID, body: CreateSecureConversationRequest(requestID: requestID, targetUserID: targetUserID))
+    }
+
+    func secureConversations(accountID: UUID) async throws -> [SecureConversation] {
+        try await authorizedV3("conversations", method: "GET", accountID: accountID, body: Optional<EmptyAccountRequest>.none)
+    }
+
+    func secureMessages(accountID: UUID, conversationID: UUID, cursor: String?, limit: Int) async throws -> SecureMessagePage {
+        var query = [URLQueryItem(name: "limit", value: String(min(max(limit, 1), 100)))]
+        if let cursor, !cursor.isEmpty { query.append(URLQueryItem(name: "cursor", value: cursor)) }
+        return try await authorizedV3("conversations/\(conversationID.uuidString.lowercased())/messages", method: "GET", accountID: accountID, body: Optional<EmptyAccountRequest>.none, queryItems: query)
+    }
+
+    func sendSecureMessage(accountID: UUID, conversationID: UUID, input: SecureMessageInput) async throws -> SecureMessageRecord {
+        try await authorizedV3("conversations/\(conversationID.uuidString.lowercased())/messages", accountID: accountID, body: input)
+    }
+
+    func markSecureMessage(accountID: UUID, conversationID: UUID, messageID: UUID, action: String) async throws -> SecureMessageRecord {
+        try await authorizedV3("conversations/\(conversationID.uuidString.lowercased())/messages/\(messageID.uuidString.lowercased())/\(action)", accountID: accountID, body: SecureMessageReceiptRequest(requestID: UUID()))
     }
 
     func createRemoteCellularControl(accountID: UUID, requestID: UUID, phoneNumber: String) async throws -> RemoteCellularControlView {
@@ -283,14 +313,14 @@ actor AccountAPIClient {
         )
     }
 
-    private func authorizedV3<T: Decodable, B: Encodable>(_ path: String, method: String = "POST", accountID: UUID, body: B?) async throws -> T {
+    private func authorizedV3<T: Decodable, B: Encodable>(_ path: String, method: String = "POST", accountID: UUID, body: B?, queryItems: [URLQueryItem] = []) async throws -> T {
         var tokens = try tokenStore.tokens(for: accountID) ?? { throw AccountAPIError.missingSession }()
         if tokens.accessExpiresAt <= Date() { tokens = try await refresh(accountID: accountID, expectedRefreshToken: tokens.refreshToken) }
-        do { return try await request(path, method: method, body: body, bearer: tokens.accessToken, root: v3BaseURL) }
+        do { return try await request(path, method: method, body: body, bearer: tokens.accessToken, root: v3BaseURL, queryItems: queryItems) }
         catch let error as AccountAPIError {
             guard case .status(401, _) = error else { throw error }
             tokens = try await refresh(accountID: accountID, expectedRefreshToken: tokens.refreshToken)
-            return try await request(path, method: method, body: body, bearer: tokens.accessToken, root: v3BaseURL)
+            return try await request(path, method: method, body: body, bearer: tokens.accessToken, root: v3BaseURL, queryItems: queryItems)
         }
     }
 
@@ -352,9 +382,13 @@ actor AccountAPIClient {
         }
     }
 
-    private func request<T: Decodable, B: Encodable>(_ path: String, method: String = "POST", body: B?, bearer: String? = nil, root: URL? = nil) async throws -> T {
+    private func request<T: Decodable, B: Encodable>(_ path: String, method: String = "POST", body: B?, bearer: String? = nil, root: URL? = nil, queryItems: [URLQueryItem] = []) async throws -> T {
         if let configurationError { throw configurationError }
-        var value = URLRequest(url: (root ?? baseURL).appendingPathComponent(path))
+        let base = (root ?? baseURL).appendingPathComponent(path)
+        var components = URLComponents(url: base, resolvingAgainstBaseURL: false)
+        components?.queryItems = queryItems.isEmpty ? nil : queryItems
+        guard let url = components?.url else { throw AccountAPIError.invalidConfiguration }
+        var value = URLRequest(url: url)
         value.httpMethod = method
         value.timeoutInterval = AccountTransportPolicy.requestTimeout
         if let body { value.httpBody = try JSONEncoder.account.encode(body) }

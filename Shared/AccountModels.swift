@@ -303,6 +303,12 @@ struct CrossUserCallCreateRequest: Codable, Sendable {
     let requestID: UUID
     let callID: UUID
     let targetUserID: UUID
+    let callerKeyPackage: E2EECallKeyPackage?
+}
+
+struct CrossUserCallMutationRequest: Codable, Sendable {
+    let requestID: UUID
+    let calleeKeyPackage: E2EECallKeyPackage?
 }
 
 enum RemoteCellularControlState: String, Codable, Equatable, Sendable {
@@ -741,6 +747,8 @@ struct CrossUserCallResponse: Codable, Equatable, Sendable {
     let createdNew: Bool?
     let mutationApplied: Bool?
     let caller: CrossUserCallerIdentity?
+    var callerKeyPackage: E2EECallKeyPackage? = nil
+    var calleeKeyPackage: E2EECallKeyPackage? = nil
 }
 
 struct AccountCallResponse: Codable, Equatable, Sendable {
