@@ -96,6 +96,7 @@ final class CallSession: ObservableObject {
     private var serverCallAccepted = false
     private var suppressedSystemEndDuringAcceptance = false
     private var sequence: UInt64 = 0
+    private var callAudioCryptor: CallAudioCryptor?
     private let playout = AudioPlayoutController()
     private var tasks: [Task<Void, Never>] = []
     private var mediaConnectTask: Task<Void, Never>?
@@ -393,6 +394,7 @@ final class CallSession: ObservableObject {
             if response.state == .accepted { await compensateAfterAccept(current, signaling: callSignaling) }
             throw response.state == .expired ? CallFailure.callExpired : CallFailure.invalidServerState
         }
+        try configureAcceptedEncryption(response, signaling: callSignaling)
         mediaToken = token
         serverCallAccepted = true
         transition(.connecting(current.serverCallID))
@@ -423,6 +425,7 @@ final class CallSession: ObservableObject {
                             recordRuntimeDiagnostic("system_end_reconcile_result", status: "failed", callID: current.serverCallID)
                             break
                         }
+                        try configureAcceptedEncryption(response, signaling: callSignaling)
                         recordRuntimeDiagnostic("system_end_reconcile_result", status: "accepted", callID: current.serverCallID)
                         mediaToken = token
                         serverCallAccepted = true
@@ -528,6 +531,8 @@ final class CallSession: ObservableObject {
                     switch response.state {
                     case .accepted:
                         guard let token = response.mediaToken, !token.isEmpty else { await self.fail(current, .invalidServerState); return }
+                        do { try self.configureAcceptedEncryption(response, signaling: try self.signaling(for: current)) }
+                        catch { await self.fail(current, .invalidServerState); return }
                         self.mediaToken = token; self.serverCallAccepted = true; self.transition(.connecting(current.serverCallID)); self.beginActivationWatchdog(current); self.startTerminalObserver(current); return
                     case .ringing: break
                     default: await self.remoteTerminal(response, generation: current); return
@@ -640,7 +645,17 @@ final class CallSession: ObservableObject {
             for await (generationID, callID, data) in stream {
                 guard let active = self.generation, active.id == generationID, active.serverCallID == callID, let epoch = self.mediaEpoch else { continue }
                 self.sequence &+= 1
-                let packet = AudioPacket(type: .audio, callID: callID, sequence: self.sequence, timestampMicroseconds: self.sequence &* 20_000, payload: data)
+                let packet: AudioPacket
+                do {
+                    if let cryptor = self.callAudioCryptor {
+                        packet = try cryptor.encrypt(data, sequence: self.sequence, timestampMicroseconds: self.sequence &* 20_000)
+                    } else {
+                        packet = AudioPacket(type: .audio, callID: callID, sequence: self.sequence, timestampMicroseconds: self.sequence &* 20_000, payload: data)
+                    }
+                } catch {
+                    self.mediaDisconnected(.init(callID: callID, connectionID: epoch, closeCode: nil, reason: .protocolViolation))
+                    continue
+                }
                 do {
                     try await self.media.send(packet, connectionID: epoch)
                     guard self.generation?.id == generationID else { continue }
@@ -664,8 +679,14 @@ final class CallSession: ObservableObject {
         }
     }
 
-    private func receive(_ packet: AudioPacket, mediaEpoch: UUID) {
-        guard let current = generation, packet.callID == current.serverCallID, self.mediaEpoch == mediaEpoch, packet.type == .audio, packet.payload.count == AudioEngine.bytesPerFrame else { return }
+    private func receive(_ receivedPacket: AudioPacket, mediaEpoch: UUID) {
+        guard let current = generation, receivedPacket.callID == current.serverCallID, self.mediaEpoch == mediaEpoch, receivedPacket.type == .audio else { return }
+        let packet: AudioPacket
+        do {
+            if let cryptor = callAudioCryptor { packet = try cryptor.decrypt(receivedPacket) }
+            else { guard receivedPacket.protocolVersion == AudioPacket.legacyVersion else { return }; packet = receivedPacket }
+        } catch { return }
+        guard packet.payload.count == AudioEngine.bytesPerFrame else { return }
         audioFlow.remoteFrameReceived = true
         updateAudioOperational()
         let metrics = AudioEngine.signalMetrics(forCanonicalPCM: packet.payload)
@@ -893,6 +914,7 @@ final class CallSession: ObservableObject {
         audio.onDiagnostic = { value in events?.yield(.audioDiagnostic(next.id, value)) }
         audio.onFailure = { value in events?.yield(.audioFailure(next.id, value)) }
         audio.onMuteChanged = { value in events?.yield(.muteChanged(next.id, value)) }
+        callAudioCryptor?.erase(); callAudioCryptor = nil
         mediaToken = nil; mediaEpoch = nil; createRequestID = nil; acceptRequestID = nil; terminalRequestID = nil; terminalMutation = nil
         activatedCallKitUUID = nil; audioStartedForCallKitUUID = nil; serverCallCreated = false; serverCallAccepted = false; suppressedSystemEndDuringAcceptance = false; sequence = 0; isMuted = false; elapsedSeconds = 0
         firstSentFrameReported = false; firstRemoteFrameReported = false; firstSendFailureReported = false
@@ -904,7 +926,19 @@ final class CallSession: ObservableObject {
     private func invalidateGeneration(expected: CallGeneration? = nil) {
         if let expected, generation != expected { return }
         cancelCallTasks(); sendContinuation?.finish(); sendContinuation = nil; sendStream = nil; sendTask?.cancel(); sendTask = nil
+        activeSignaling?.eraseSecrets(); callAudioCryptor?.erase(); callAudioCryptor = nil
         generation = nil; activeSignaling = nil; activeCallKitUUID = nil; mediaEpoch = nil; mediaToken = nil; isOutgoingCall = false; callKitReported = false; incomingCallerName = nil; suppressedSystemEndDuringAcceptance = false
+    }
+
+    private func configureAcceptedEncryption(_ response: CallSignalView, signaling: any CallSignaling) throws {
+        if signaling.mediaPeerIdentity.protocolVersion == 2 {
+            guard let keys = response.audioKeys else { throw CallFailure.invalidServerState }
+            callAudioCryptor?.erase()
+            callAudioCryptor = CallAudioCryptor(callID: response.callID, keys: keys)
+        } else {
+            callAudioCryptor?.erase()
+            callAudioCryptor = nil
+        }
     }
 
     private func cancelCallTasks() {

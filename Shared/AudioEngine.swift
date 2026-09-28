@@ -232,6 +232,7 @@ final class AudioEngine: AudioEngineHandling, @unchecked Sendable {
     private var playbackOverflowReported = false
     private var peakScheduledBuffers = 0
     private var observers: [NSObjectProtocol] = []
+    private let transmitMute = TransmitMuteGate()
 
     init() { engine.attach(player); installObservers() }
     deinit { observers.forEach(NotificationCenter.default.removeObserver) }
@@ -268,8 +269,8 @@ final class AudioEngine: AudioEngineHandling, @unchecked Sendable {
     }
 
     func setMuted(_ value: Bool) throws {
-        try controlQueue.sync {
-            try applyMute(value)
+        controlQueue.sync {
+            applyMute(value)
             emit("audio_input_mute", value ? "muted" : "unmuted")
         }
     }
@@ -285,7 +286,7 @@ final class AudioEngine: AudioEngineHandling, @unchecked Sendable {
             try input.setVoiceProcessingEnabled(true)
             guard input.isVoiceProcessingEnabled, output.isVoiceProcessingEnabled else { throw NSError(domain: "WiFiSecureCall.AudioEngine", code: 20) }
             emit("voice_processing_enabled", "input=YES output=YES")
-            try applyMute(muted)
+            applyMute(muted)
 
             let session = AVAudioSession.sharedInstance()
             emit("audio_route", "inputAvailable=\(session.isInputAvailable) inputs=\(session.currentRoute.inputs.map(\.portType.rawValue).joined(separator: ",")) outputs=\(session.currentRoute.outputs.map(\.portType.rawValue).joined(separator: ","))")
@@ -448,7 +449,7 @@ final class AudioEngine: AudioEngineHandling, @unchecked Sendable {
                     firstNetworkNonzeroReported = true
                     emit("first_network_pcm_nonzero", metricsDescription(metrics))
                 }
-                onFrame?(frame)
+                onFrame?(transmitMute.outgoingFrame(frame))
             }
         }) {}
     }
@@ -503,6 +504,7 @@ final class AudioEngine: AudioEngineHandling, @unchecked Sendable {
         captureLifecycle.remove { [engine] in guard let sink else { return }; engine.disconnectNodeInput(sink); engine.detach(sink) }
         captureSink = nil; captureRing = nil; engine.disconnectNodeOutput(player); engine.reset()
         inputConverter = nil; outputConverter = nil; networkFormat = nil; pcmRing.reset(); scheduledBuffers = 0
+        transmitMute.reset()
     }
 
     private func installObservers() {
@@ -511,19 +513,12 @@ final class AudioEngine: AudioEngineHandling, @unchecked Sendable {
         observers.append(center.addObserver(forName: AVAudioSession.interruptionNotification, object: nil, queue: nil) { [weak self] note in self?.emit("audio_interruption", "\(note.userInfo?[AVAudioSessionInterruptionTypeKey] ?? "unknown")") })
         observers.append(center.addObserver(forName: AVAudioSession.routeChangeNotification, object: nil, queue: nil) { [weak self] _ in self?.emit("audio_route_changed", "changed") })
         observers.append(center.addObserver(forName: AVAudioSession.mediaServicesWereResetNotification, object: nil, queue: nil) { [weak self] _ in self?.onFailure?(.configurationChanged) })
-        if #available(iOS 17.0, watchOS 10.0, *) { observers.append(center.addObserver(forName: AVAudioApplication.inputMuteStateChangeNotification, object: nil, queue: nil) { [weak self] _ in guard let self else { return }; let muted = AVAudioApplication.shared.isInputMuted; self.emit("audio_input_mute", muted ? "system=muted" : "system=unmuted"); self.onMuteChanged?(muted) }) }
     }
 
     private func validate(_ format: AVAudioFormat) throws { guard format.sampleRate > 0, format.channelCount > 0 else { throw CallFailure.audioFailed } }
-    private func applyMute(_ value: Bool) throws {
-        if #available(iOS 17.0, watchOS 10.0, *) {
-            try AVAudioApplication.shared.setInputMuted(value)
-            emit("app_input_muted", AVAudioApplication.shared.isInputMuted ? "YES" : "NO")
-        } else {
-            emit("app_input_muted", "NOT_SUPPORTED")
-        }
-        engine.inputNode.isVoiceProcessingInputMuted = value
-        emit("voice_processing_input_muted", engine.inputNode.isVoiceProcessingInputMuted ? "YES" : "NO")
+    private func applyMute(_ value: Bool) {
+        _ = transmitMute.setMuted(value)
+        emit("transmit_pcm_muted", value ? "YES" : "NO")
         onMuteChanged?(value)
     }
     private func formatDescription(_ format: AVAudioFormat) -> String { "sampleRate=\(format.sampleRate) channelCount=\(format.channelCount) commonFormat=\(format.commonFormat.rawValue) interleaved=\(format.isInterleaved)" }

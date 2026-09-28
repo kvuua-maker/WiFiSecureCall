@@ -1,18 +1,39 @@
 import Foundation
 
 enum AudioPacketType: UInt8, Sendable { case audio = 1, end = 2, ping = 3 }
+enum AudioPacketDirection: UInt8, Codable, Sendable { case callerToCallee = 1, calleeToCaller = 2 }
 
 struct AudioPacket: Equatable, Sendable {
-    static let version: UInt8 = 1
+    static let legacyVersion: UInt8 = 1
+    static let encryptedVersion: UInt8 = 2
     static let headerSize = 34
+    static let encryptedHeaderSize = 51
+    static let maximumEncodedSize = encryptedHeaderSize + AudioEngine.bytesPerFrame + 16
+    let protocolVersion: UInt8
     let type: AudioPacketType
     let callID: UUID
+    let direction: AudioPacketDirection?
+    let keyEpoch: UInt32
     let sequence: UInt64
     let timestampMicroseconds: UInt64
+    let nonce: Data
     let payload: Data
 
+    init(type: AudioPacketType, callID: UUID, sequence: UInt64, timestampMicroseconds: UInt64, payload: Data) {
+        protocolVersion = Self.legacyVersion
+        self.type = type; self.callID = callID; direction = nil; keyEpoch = 0
+        self.sequence = sequence; self.timestampMicroseconds = timestampMicroseconds; nonce = Data(); self.payload = payload
+    }
+
+    init(encryptedType type: AudioPacketType, callID: UUID, direction: AudioPacketDirection, keyEpoch: UInt32, sequence: UInt64, timestampMicroseconds: UInt64, nonce: Data, sealedPayload: Data) {
+        protocolVersion = Self.encryptedVersion
+        self.type = type; self.callID = callID; self.direction = direction; self.keyEpoch = keyEpoch
+        self.sequence = sequence; self.timestampMicroseconds = timestampMicroseconds; self.nonce = nonce; payload = sealedPayload
+    }
+
     func encode() -> Data {
-        var data = Data([Self.version, type.rawValue])
+        if protocolVersion == Self.encryptedVersion { return authenticatedHeader + payload }
+        var data = Data([Self.legacyVersion, type.rawValue])
         var uuid = callID.uuid
         withUnsafeBytes(of: &uuid) { data.append(contentsOf: $0) }
         var sequenceBE = sequence.bigEndian
@@ -24,17 +45,49 @@ struct AudioPacket: Equatable, Sendable {
     }
 
     static func decode(_ data: Data) -> AudioPacket? {
-        guard data.count >= headerSize, data[0] == version, let type = AudioPacketType(rawValue: data[1]) else { return nil }
+        guard data.count >= headerSize, let type = AudioPacketType(rawValue: data[1]) else { return nil }
         let uuidBytes = [UInt8](data[2..<18])
         let uuid = UUID(uuid: (uuidBytes[0], uuidBytes[1], uuidBytes[2], uuidBytes[3], uuidBytes[4], uuidBytes[5], uuidBytes[6], uuidBytes[7], uuidBytes[8], uuidBytes[9], uuidBytes[10], uuidBytes[11], uuidBytes[12], uuidBytes[13], uuidBytes[14], uuidBytes[15]))
-        let sequence = data[18..<26].reduce(UInt64(0)) { ($0 << 8) | UInt64($1) }
-        let timestamp = data[26..<34].reduce(UInt64(0)) { ($0 << 8) | UInt64($1) }
-        let payload = Data(data.dropFirst(headerSize))
-        switch type {
-        case .audio: guard payload.count == AudioEngine.bytesPerFrame else { return nil }
-        case .end, .ping: guard payload.isEmpty else { return nil }
+        if data[0] == legacyVersion {
+            let sequence = data[18..<26].reduce(UInt64(0)) { ($0 << 8) | UInt64($1) }
+            let timestamp = data[26..<34].reduce(UInt64(0)) { ($0 << 8) | UInt64($1) }
+            let payload = Data(data.dropFirst(headerSize))
+            switch type {
+            case .audio: guard payload.count == AudioEngine.bytesPerFrame else { return nil }
+            case .end, .ping: guard payload.isEmpty else { return nil }
+            }
+            return AudioPacket(type: type, callID: uuid, sequence: sequence, timestampMicroseconds: timestamp, payload: payload)
         }
-        return AudioPacket(type: type, callID: uuid, sequence: sequence, timestampMicroseconds: timestamp, payload: payload)
+        guard data[0] == encryptedVersion, type == .audio, data.count == maximumEncodedSize,
+              let direction = AudioPacketDirection(rawValue: data[18]) else { return nil }
+        let epoch = data[19..<23].reduce(UInt32(0)) { ($0 << 8) | UInt32($1) }
+        let sequence = data[23..<31].reduce(UInt64(0)) { ($0 << 8) | UInt64($1) }
+        let timestamp = data[31..<39].reduce(UInt64(0)) { ($0 << 8) | UInt64($1) }
+        let nonce = Data(data[39..<51])
+        guard epoch > 0, nonce == encryptedNonce(epoch: epoch, sequence: sequence) else { return nil }
+        return AudioPacket(encryptedType: type, callID: uuid, direction: direction, keyEpoch: epoch, sequence: sequence, timestampMicroseconds: timestamp, nonce: nonce, sealedPayload: Data(data.dropFirst(encryptedHeaderSize)))
+    }
+
+    var authenticatedHeader: Data {
+        guard protocolVersion == Self.encryptedVersion, let direction else { return Data() }
+        var data = Data([Self.encryptedVersion, type.rawValue])
+        var uuid = callID.uuid
+        withUnsafeBytes(of: &uuid) { data.append(contentsOf: $0) }
+        data.append(direction.rawValue)
+        var epoch = keyEpoch.bigEndian, sequence = sequence.bigEndian, timestamp = timestampMicroseconds.bigEndian
+        withUnsafeBytes(of: &epoch) { data.append(contentsOf: $0) }
+        withUnsafeBytes(of: &sequence) { data.append(contentsOf: $0) }
+        withUnsafeBytes(of: &timestamp) { data.append(contentsOf: $0) }
+        data.append(nonce)
+        return data
+    }
+
+    static func encryptedNonce(epoch: UInt32, sequence: UInt64) -> Data {
+        var epoch = epoch.bigEndian, sequence = sequence.bigEndian
+        var result = Data()
+        withUnsafeBytes(of: &epoch) { result.append(contentsOf: $0) }
+        withUnsafeBytes(of: &sequence) { result.append(contentsOf: $0) }
+        return result
     }
 }
 

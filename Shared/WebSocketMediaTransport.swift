@@ -34,14 +34,14 @@ final class WebSocketMediaTransport: NSObject, MediaTransport, URLSessionWebSock
         components.queryItems = [
             URLQueryItem(name: "callID", value: callID.uuidString.lowercased()),
             URLQueryItem(name: peer.queryName, value: peer.queryValue),
-            URLQueryItem(name: "protocolVersion", value: "2")
+            URLQueryItem(name: "protocolVersion", value: String(peer.protocolVersion))
         ]
         guard let url = components.url, url.scheme == "wss" else { throw CallFailure.mediaConnectionFailed }
         var request = URLRequest(url: url)
         request.timeoutInterval = CallTimeouts.initialMedia
         request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
         let socket = session.webSocketTask(with: request)
-        socket.maximumMessageSize = AudioPacket.headerSize + AudioEngine.bytesPerFrame
+        socket.maximumMessageSize = AudioPacket.maximumEncodedSize
         let epoch = UUID()
 
         let previous = replaceCurrent(with: socket, callID: callID, connectionID: epoch)

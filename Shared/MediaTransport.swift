@@ -13,9 +13,11 @@ enum MediaDisconnectReason: String, Sendable { case remoteClosed, authFailed, pr
 enum MediaPeerIdentity: Equatable, Sendable {
     case legacy(DeviceRole)
     case account(CallPartySide)
+    case secureAccount(CallPartySide)
 
-    var queryName: String { switch self { case .legacy: return "role"; case .account: return "side" } }
-    var queryValue: String { switch self { case let .legacy(role): return role.rawValue; case let .account(side): return side.rawValue } }
+    var queryName: String { switch self { case .legacy: return "role"; case .account, .secureAccount: return "side" } }
+    var queryValue: String { switch self { case let .legacy(role): return role.rawValue; case let .account(side), let .secureAccount(side): return side.rawValue } }
+    var protocolVersion: Int { if case .secureAccount = self { return 2 }; return 1 }
 }
 
 struct MediaDisconnect: Sendable {
