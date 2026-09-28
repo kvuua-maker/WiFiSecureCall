@@ -37,7 +37,11 @@
 				<array>
 					<dict>
 						<key>INIntentResponseCodeFormatString</key>
-						<string>${executionResult}</string>
+						<string>Remote execution confirmed
+${executionResult}
+Local receipt: ${receiptStatus}</string>
+						<key>INIntentResponseCodeFormatStringID</key>
+						<string>remoteExecutionConfirmed</string>
 						<key>INIntentResponseCodeName</key>
 						<string>success</string>
 						<key>INIntentResponseCodeSuccess</key>
@@ -49,7 +53,7 @@
 					</dict>
 				</array>
 				<key>INIntentResponseLastParameterTag</key>
-				<integer>2</integer>
+				<integer>3</integer>
 				<key>INIntentResponseOutput</key>
 				<string>executionResult</string>
 				<key>INIntentResponseParameters</key>
@@ -75,6 +79,18 @@
 						<string>nonce</string>
 						<key>INIntentResponseParameterTag</key>
 						<integer>2</integer>
+						<key>INIntentResponseParameterType</key>
+						<string>String</string>
+					</dict>
+					<dict>
+						<key>INIntentResponseParameterDisplayName</key>
+						<string>Local Receipt Status</string>
+						<key>INIntentResponseParameterDisplayPriority</key>
+						<integer>3</integer>
+						<key>INIntentResponseParameterName</key>
+						<string>receiptStatus</string>
+						<key>INIntentResponseParameterTag</key>
+						<integer>3</integer>
 						<key>INIntentResponseParameterType</key>
 						<string>String</string>
 					</dict>
