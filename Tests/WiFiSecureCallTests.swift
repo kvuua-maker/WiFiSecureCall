@@ -6185,6 +6185,7 @@ final class RemoteCellularControlTests: XCTestCase {
         XCTAssertEqual(iOSEntitlements["com.apple.developer.calling-app"] as? Bool, true)
         XCTAssertEqual(iOSEntitlements["com.apple.developer.dialing-app"] as? Bool, true)
         XCTAssertEqual(iOSEntitlements["com.apple.developer.applesignin"] as? [String], ["Default"])
+        XCTAssertEqual(iOSEntitlements["com.apple.developer.siri"] as? Bool, true)
         XCTAssertEqual(iOSEntitlements["com.apple.developer.usernotifications.time-sensitive"] as? Bool, true)
 
         let watchEntitlementsData = try Data(contentsOf: root.appendingPathComponent("Watch/WiFiSecureCallWatch.entitlements"))
@@ -6216,7 +6217,7 @@ final class RemoteCellularControlTests: XCTestCase {
         )
         XCTAssertTrue(project.contains("PROVISIONING_PROFILE_SPECIFIER = WiFiSecureCallAppStoreD24;"))
         XCTAssertTrue(project.contains(
-            "T10000000000000000000001 = {CreatedOnToolsVersion = 26.6; SystemCapabilities = {com.apple.BackgroundModes = {enabled = 1; }; }; };"
+            "T10000000000000000000001 = {CreatedOnToolsVersion = 26.6; SystemCapabilities = {com.apple.BackgroundModes = {enabled = 1; }; com.apple.Siri = {enabled = 1; }; }; };"
         ))
         XCTAssertTrue(project.contains(
             "T10000000000000000000002 = {CreatedOnToolsVersion = 26.6; };"

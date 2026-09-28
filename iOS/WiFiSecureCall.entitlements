@@ -6,5 +6,6 @@
   <array><string>Default</string></array>
   <key>com.apple.developer.calling-app</key><true/>
   <key>com.apple.developer.dialing-app</key><true/>
+  <key>com.apple.developer.siri</key><true/>
   <key>com.apple.developer.usernotifications.time-sensitive</key><true/>
 </dict></plist>
