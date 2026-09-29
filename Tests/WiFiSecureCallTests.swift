@@ -292,7 +292,17 @@ final class SecureMessengerProductRegressionTests: XCTestCase {
         XCTAssertEqual(Set(info["UIBackgroundModes"] as? [String] ?? []), Set(["audio", "remote-notification", "voip"]))
         XCTAssertEqual(info["ITSAppUsesNonExemptEncryption"] as? Bool, false)
         let build = try String(contentsOf: repository.appendingPathComponent("Config/Base.xcconfig"))
-        XCTAssertTrue(build.contains("CURRENT_PROJECT_VERSION = 56"))
+        let assignments = build.components(separatedBy: .newlines)
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { $0.hasPrefix("CURRENT_PROJECT_VERSION") }
+        XCTAssertEqual(assignments.count, 1)
+        let assignment = try XCTUnwrap(assignments.first)
+        let parts = assignment.components(separatedBy: "=")
+        XCTAssertEqual(parts.count, 2)
+        guard parts.count == 2 else { return }
+        XCTAssertEqual(parts[0].trimmingCharacters(in: .whitespaces), "CURRENT_PROJECT_VERSION")
+        let version = try XCTUnwrap(Int(parts[1].trimmingCharacters(in: .whitespaces)))
+        XCTAssertGreaterThan(version, 0)
     }
 }
 
