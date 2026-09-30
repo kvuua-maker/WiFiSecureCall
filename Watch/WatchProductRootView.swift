@@ -98,7 +98,11 @@ private struct WatchContactsView: View {
         List {
             NavigationLink("Ручний пошук") { RecipientSearchView(messageStore: messageStore, runtime: runtime) }
             if cache.contacts.isEmpty {
-                Text("Контакти ще не синхронізовано. Ручний пошук працює через мережу годинника.").font(.caption)
+                if cache.generation == 0 {
+                    Text("Контакти ще не синхронізовано. Ручний пошук працює через мережу годинника.").font(.caption)
+                } else {
+                    Text("Синхронізовані контакти очищено. Ручний пошук працює через мережу годинника.").font(.caption)
+                }
             } else {
                 if let updatedAt = cache.updatedAt { Text("Оновлено \(updatedAt, style: .relative)").font(.caption2) }
                 ForEach(visible) { contact in
