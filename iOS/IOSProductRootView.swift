@@ -1,6 +1,5 @@
 import SwiftUI
 import Contacts
-import UIKit
 
 struct IOSProductRootView: View {
     @ObservedObject var session: CallSession
@@ -75,16 +74,13 @@ struct IOSProductRootView: View {
 private struct IOSContactsView: View {
     @ObservedObject var messageStore: SecureMessageStore
     let runtime: NotificationRuntime
-    @State private var status = CNContactStore.authorizationStatus(for: .contacts)
-    @State private var contacts: [LocalPhoneContact] = []
+    @StateObject private var contactsStore = LocalContactsStore.shared
     @State private var query = ""
-    @State private var loadError: String?
-    private let contactStore = CNContactStore()
 
-    private var visibleContacts: [LocalPhoneContact] {
+    private var visibleContacts: [LocalContactEntry] {
         let term = query.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !term.isEmpty else { return contacts }
-        return contacts.filter { $0.name.localizedCaseInsensitiveContains(term) || $0.number.contains(term) }
+        guard !term.isEmpty else { return contactsStore.contacts }
+        return contactsStore.contacts.filter { $0.name.localizedCaseInsensitiveContains(term) || $0.normalizedNumbers.contains(where: { $0.contains(term) }) }
     }
 
     var body: some View {
@@ -94,29 +90,35 @@ private struct IOSContactsView: View {
                     RecipientSearchView(messageStore: messageStore, runtime: runtime)
                 }
             }
-            if status == .notDetermined {
+            if contactsStore.authorizationStatus == .notDetermined {
                 Section {
                     Text("Дозвольте доступ, щоб знайти людину у своїй телефонній книзі. Контакти не надсилаються списком на сервер.")
-                    Button("Показати контакти iPhone") { requestContacts() }
+                    Button("Показати контакти iPhone") { contactsStore.requestAccess() }
                 }
-            } else if status == .denied || status == .restricted {
+            } else if contactsStore.authorizationStatus == .denied || contactsStore.authorizationStatus == .restricted {
                 Section {
                     Text("Доступ до контактів вимкнено. Ручний пошук залишається доступним.")
-                    Button("Відкрити налаштування доступу") {
-                        if let url = URL(string: UIApplication.openSettingsURLString) { UIApplication.shared.open(url) }
-                    }
+                    Button("Відкрити налаштування доступу") { contactsStore.openSystemSettings() }
                 }
             } else {
-                if let loadError { Text(loadError).foregroundStyle(.red) }
-                if contacts.isEmpty { Text("Контактів із номером немає. Скористайтеся ручним пошуком.") }
+                if #available(iOS 18.0, *), contactsStore.authorizationStatus == .limited {
+                    Section {
+                        Text("Показано лише вибрані контакти.")
+                        Button("Додати доступ до контактів") { contactsStore.openSystemSettings() }
+                    }
+                }
+                if let loadError = contactsStore.errorMessage { Text(loadError).foregroundStyle(.red) }
+                if contactsStore.contacts.isEmpty { Text("Контактів із міжнародним номером немає. Скористайтеся ручним пошуком.") }
                 ForEach(visibleContacts) { contact in
-                    NavigationLink {
-                        RecipientSearchView(messageStore: messageStore, runtime: runtime, initialRecipient: contact.number)
-                    } label: {
-                        VStack(alignment: .leading) {
-                            Text(contact.name).font(.headline)
-                            Text(contact.number).font(.caption).foregroundStyle(.secondary)
-                            Text("Статус у сервісі невідомий — перевірити").font(.caption2).foregroundStyle(.secondary)
+                    ForEach(contact.normalizedNumbers, id: \.self) { number in
+                        NavigationLink {
+                            RecipientSearchView(messageStore: messageStore, runtime: runtime, initialRecipient: number)
+                        } label: {
+                            VStack(alignment: .leading) {
+                                Text(contact.name).font(.headline)
+                                Text(number).font(.caption).foregroundStyle(.secondary)
+                                Text("Статус у сервісі невідомий — перевірити").font(.caption2).foregroundStyle(.secondary)
+                            }
                         }
                     }
                 }
@@ -124,45 +126,8 @@ private struct IOSContactsView: View {
         }
         .navigationTitle("Контакти")
         .searchable(text: $query, prompt: "Ім’я або номер")
-        .onAppear {
-            status = CNContactStore.authorizationStatus(for: .contacts)
-            if status == .authorized { loadContacts() }
-        }
+        .onAppear { contactsStore.refreshAuthorizationAndContacts() }
     }
-
-    private func requestContacts() {
-        contactStore.requestAccess(for: .contacts) { granted, _ in
-            Task { @MainActor in
-                status = granted ? .authorized : .denied
-                if granted { loadContacts() }
-            }
-        }
-    }
-
-    private func loadContacts() {
-        do {
-            let keys: [CNKeyDescriptor] = [CNContactGivenNameKey as NSString, CNContactFamilyNameKey as NSString, CNContactPhoneNumbersKey as NSString]
-            let request = CNContactFetchRequest(keysToFetch: keys)
-            var loaded: [LocalPhoneContact] = []
-            try contactStore.enumerateContacts(with: request) { contact, _ in
-                let name = [contact.givenName, contact.familyName].filter { !$0.isEmpty }.joined(separator: " ")
-                for phone in contact.phoneNumbers {
-                    loaded.append(LocalPhoneContact(id: "\(contact.identifier):\(phone.identifier)", name: name.isEmpty ? "Без імені" : name, number: phone.value.stringValue))
-                }
-            }
-            contacts = loaded.sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
-            loadError = nil
-        } catch {
-            contacts = []
-            loadError = "Не вдалося прочитати контакти. Доступний ручний пошук."
-        }
-    }
-}
-
-private struct LocalPhoneContact: Identifiable {
-    let id: String
-    let name: String
-    let number: String
 }
 
 private struct EncryptionDetailsView: View {

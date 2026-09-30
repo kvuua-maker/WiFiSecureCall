@@ -222,6 +222,18 @@ final class SecureMessengerCallHistoryRepairTests: XCTestCase {
 }
 
 final class SecureConversationPeerMetadataTests: XCTestCase {
+    func testContactSnapshotIsMinimalValidatedAndInternationalOnly() throws {
+        XCTAssertEqual(LocalPhoneNumberNormalizer.normalize("+380 (50) 123-45-67"), "+380501234567")
+        XCTAssertNil(LocalPhoneNumberNormalizer.normalize("0501234567"))
+        let entry = LocalContactEntry(id: "local-id", name: "Олена", normalizedNumbers: ["+380501234567"])
+        let snapshot = LocalContactSnapshot(generation: 4, updatedAt: Date(timeIntervalSince1970: 100), contacts: [entry])
+        XCTAssertTrue(snapshot.isValid)
+        let encoded = try JSONEncoder().encode(snapshot)
+        let text = try XCTUnwrap(String(data: encoded, encoding: .utf8))
+        for forbidden in ["token", "message", "note", "email", "address"] { XCTAssertFalse(text.localizedCaseInsensitiveContains(forbidden)) }
+        XCTAssertEqual(try JSONDecoder().decode(LocalContactSnapshot.self, from: encoded), snapshot)
+    }
+
     func testInternationalNumberNormalizationDoesNotGuessCountryOrChangeUsername() {
         XCTAssertEqual(RecipientQueryNormalization.normalize(" +380 (50) 123-45-67 "), "+380501234567")
         XCTAssertEqual(RecipientQueryNormalization.normalize("0501234567"), "0501234567")

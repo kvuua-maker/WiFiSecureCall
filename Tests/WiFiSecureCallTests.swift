@@ -2825,10 +2825,10 @@ final class AccountCallFoundationTests: XCTestCase {
             return (200, self.accountCallResponse(callID: callID, side: side, state: .ringing))
         }
         let client = AccountAPIClient(config: accountCallConfig(), tokenStore: secrets, session: session)
-        let caller = AccountCallSignaling(client: client, accountID: accountID, targetDeviceID: targetID, localSide: .caller)
+        let caller = AccountCallSignaling(client: client, accountID: accountID, targetDeviceID: targetID, localSide: .caller, identityStore: E2EEIdentityStore(storage: InMemoryE2EESecretStorage()), pinStore: E2EEIdentityPinStore(storage: InMemoryE2EESecretStorage()))
         let callerView = try await caller.create(callID: callID, requestID: UUID())
         XCTAssertEqual(callerView.localSide, .caller)
-        XCTAssertEqual(caller.mediaPeerIdentity, .account(.caller))
+        XCTAssertEqual(caller.mediaPeerIdentity, .secureAccount(.caller))
         let callee = AccountCallSignaling(client: client, accountID: accountID, localSide: .callee)
         let calleeView = try await callee.call(callID)
         XCTAssertEqual(calleeView.localSide, .callee)
@@ -2883,7 +2883,7 @@ final class AccountCallFoundationTests: XCTestCase {
             if request.url!.path.hasSuffix("/cancel") { mutationCount.increment() }
             return (200, self.accountCallResponse(callID: callID, side: .caller, state: request.url!.path.hasSuffix("/cancel") ? .cancelled : .ringing))
         }
-        let runtime = NotificationRuntime(config: accountCallConfig(), accountStore: store, accountAPI: AccountAPIClient(config: accountCallConfig(), tokenStore: secrets, session: session), audio: AudioEngineMock(), media: MediaTransportMock())
+        let runtime = NotificationRuntime(config: accountCallConfig(), accountStore: store, accountAPI: AccountAPIClient(config: accountCallConfig(), tokenStore: secrets, session: session), audio: AudioEngineMock(), media: MediaTransportMock(), accountIdentityStore: E2EEIdentityStore(storage: InMemoryE2EESecretStorage()), accountPinStore: E2EEIdentityPinStore(storage: InMemoryE2EESecretStorage()))
         let adapter = RetainedCallKitMock()
         runtime.configureCallKitFactory { adapter }
         await runtime.startPreferredCall(targetPlatform: "watchOS")
@@ -2922,7 +2922,7 @@ final class AccountCallFoundationTests: XCTestCase {
             }
             return (200, self.accountCallResponse(callID: try XCTUnwrap(callIDBox.value), side: .caller, state: .ringing))
         }
-        let runtime = NotificationRuntime(config: accountCallConfig(), accountStore: store, accountAPI: AccountAPIClient(config: accountCallConfig(), tokenStore: secrets, session: session), audio: AudioEngineMock(), media: MediaTransportMock())
+        let runtime = NotificationRuntime(config: accountCallConfig(), accountStore: store, accountAPI: AccountAPIClient(config: accountCallConfig(), tokenStore: secrets, session: session), audio: AudioEngineMock(), media: MediaTransportMock(), accountIdentityStore: E2EEIdentityStore(storage: InMemoryE2EESecretStorage()), accountPinStore: E2EEIdentityPinStore(storage: InMemoryE2EESecretStorage()))
         let adapter = RetainedCallKitMock()
         runtime.configureCallKitFactory { adapter }
 
@@ -3225,7 +3225,16 @@ final class AccountCallFoundationTests: XCTestCase {
     }
 
     private func accountCallTestSession(handler: @escaping (URLRequest) throws -> (Int, Encodable)) -> URLSession {
-        AccountURLProtocol.handler = handler
+        AccountURLProtocol.handler = { request in
+            if request.url?.path.hasSuffix("/v3/me") == true {
+                return (200, UserProfile(userID: UUID(uuidString: "99999999-9999-4999-8999-999999999999")!, username: "fixture", displayName: "Fixture", email: nil, verifiedPhones: [], publicIdentity: "wsc:user:fixture"))
+            }
+            if request.url?.path.hasSuffix("/v3/device-keys") == true, request.httpMethod == "POST" {
+                let registration = try JSONDecoder.account.decode(E2EEDeviceRegistrationRequest.self, from: XCTUnwrap(request.httpBody))
+                return (200, E2EEPublicDeviceBundle(deviceID: registration.deviceID, signingPublicKey: registration.signingPublicKey, agreementPublicKey: registration.agreementPublicKey, keyVersion: registration.keyVersion, protocolVersion: registration.protocolVersion, createdAt: Date(), updatedAt: Date()))
+            }
+            return try handler(request)
+        }
         let configuration = URLSessionConfiguration.ephemeral
         configuration.protocolClasses = [AccountURLProtocol.self]
         return URLSession(configuration: configuration)

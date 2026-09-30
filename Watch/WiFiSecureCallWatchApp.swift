@@ -10,6 +10,7 @@ struct WiFiSecureCallWatchApp: App {
         let runtime = NotificationRuntime.shared
         let accountStore = AccountSessionStore.shared
         runtime.configureCallKitFactory { WatchCallKitAdapter() }
+        WatchContactsCache.shared.activate()
         _session = StateObject(wrappedValue: runtime.callSession)
         _appleAuthentication = StateObject(
             wrappedValue: WatchAppleAuthenticationCoordinator(store: accountStore)

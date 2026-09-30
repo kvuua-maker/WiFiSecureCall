@@ -44,6 +44,7 @@ struct RecipientSearchView: View {
     @State private var createdConversationAccountID: UUID?
     @State private var showCreatedConversation = false
     @State private var operationGate = RecipientSearchOperationGate()
+    @State private var initialLookupStarted = false
 
     private var accounts: [AccountSummary] { runtime.accountStore.callableAccounts }
 
@@ -96,17 +97,27 @@ struct RecipientSearchView: View {
             if selectedAccountID == nil {
                 selectedAccountID = accounts.first(where: { $0.accountID == runtime.accountStore.activeAccountID })?.accountID ?? accounts.first?.accountID
             }
+            beginInitialLookupIfNeeded()
         }
         .onChange(of: selectedAccountID) { _ in
             operationGate.invalidate()
             result = nil
             state = .idle
+            beginInitialLookupIfNeeded()
         }
         .onChange(of: recipient) { _ in
             operationGate.invalidate()
             result = nil
             state = .idle
         }
+    }
+
+    private func beginInitialLookupIfNeeded() {
+        guard !initialLookupStarted,
+              currentAccountID != nil,
+              !recipient.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
+        initialLookupStarted = true
+        Task { await resolve() }
     }
 
     private func resolve() async {

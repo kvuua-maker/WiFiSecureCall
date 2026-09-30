@@ -285,9 +285,13 @@ struct AccountCallCreateRequest: Codable, Sendable {
     let requestID: UUID
     let callID: UUID
     let targetDeviceID: UUID
+    let callerKeyPackage: E2EECallKeyPackage?
 }
 
-struct AccountCallMutationRequest: Codable, Sendable { let requestID: UUID }
+struct AccountCallMutationRequest: Codable, Sendable {
+    let requestID: UUID
+    let calleeKeyPackage: E2EECallKeyPackage?
+}
 
 struct RecipientResolveRequest: Codable, Sendable { let recipient: String }
 
@@ -769,6 +773,12 @@ struct AccountCallResponse: Codable, Equatable, Sendable {
     let peerReady: Bool?
     let createdNew: Bool?
     let mutationApplied: Bool?
+    var callerKeyPackage: E2EECallKeyPackage? = nil
+    var calleeKeyPackage: E2EECallKeyPackage? = nil
+    var callerUserID: UUID? = nil
+    var callerDeviceID: UUID? = nil
+    var calleeUserID: UUID? = nil
+    var calleeDeviceID: UUID? = nil
 }
 
 struct AccountMeResponse: Codable, Sendable {

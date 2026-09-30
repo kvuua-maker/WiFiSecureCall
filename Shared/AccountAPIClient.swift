@@ -168,16 +168,16 @@ actor AccountAPIClient {
         try await authorized("devices", method: "GET", accountID: accountID, body: Optional<EmptyAccountRequest>.none)
     }
 
-    func createCall(accountID: UUID, callID: UUID, requestID: UUID, targetDeviceID: UUID) async throws -> AccountCallResponse {
-        try await authorized("calls", accountID: accountID, body: AccountCallCreateRequest(requestID: requestID, callID: callID, targetDeviceID: targetDeviceID))
+    func createCall(accountID: UUID, callID: UUID, requestID: UUID, targetDeviceID: UUID, callerKeyPackage: E2EECallKeyPackage? = nil) async throws -> AccountCallResponse {
+        try await authorized("calls", accountID: accountID, body: AccountCallCreateRequest(requestID: requestID, callID: callID, targetDeviceID: targetDeviceID, callerKeyPackage: callerKeyPackage))
     }
 
     func call(accountID: UUID, callID: UUID) async throws -> AccountCallResponse {
         try await authorized("calls/\(callID.uuidString.lowercased())", method: "GET", accountID: accountID, body: Optional<EmptyAccountRequest>.none)
     }
 
-    func mutateCall(accountID: UUID, action: CallMutation, callID: UUID, requestID: UUID) async throws -> AccountCallResponse {
-        try await authorized("calls/\(callID.uuidString.lowercased())/\(action.rawValue)", accountID: accountID, body: AccountCallMutationRequest(requestID: requestID))
+    func mutateCall(accountID: UUID, action: CallMutation, callID: UUID, requestID: UUID, calleeKeyPackage: E2EECallKeyPackage? = nil) async throws -> AccountCallResponse {
+        try await authorized("calls/\(callID.uuidString.lowercased())/\(action.rawValue)", accountID: accountID, body: AccountCallMutationRequest(requestID: requestID, calleeKeyPackage: calleeKeyPackage))
     }
 
     func resolveRecipient(_ recipient: String, accountID: UUID) async throws -> ResolvedRecipient {

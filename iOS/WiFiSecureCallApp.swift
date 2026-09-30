@@ -8,6 +8,8 @@ struct WiFiSecureCallApp: App {
     init() {
         let runtime = NotificationRuntime.shared
         runtime.configureCallKitFactory { IOSCallKitAdapter() }
+        ContactsToWatchSync.shared.activate()
+        _ = LocalContactsStore.shared
         WatchRemoteExecutionProbeDonation.register()
         _session = StateObject(wrappedValue: runtime.callSession)
     }

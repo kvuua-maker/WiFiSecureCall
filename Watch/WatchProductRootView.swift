@@ -49,7 +49,7 @@ struct WatchProductRootView: View {
                             }
                             else { ActiveCallView(session: session) }
                         }
-                        NavigationLink("Контакти") { RecipientSearchView(messageStore: messages, runtime: runtime) }
+                        NavigationLink("Контакти") { WatchContactsView(messageStore: messages, runtime: runtime) }
                         NavigationLink("Набрати номер") { WatchDialEntry(messageStore: messages, runtime: runtime) }
                         NavigationLink("Акаунт") {
                             List {
@@ -79,6 +79,41 @@ struct WatchProductRootView: View {
         routedAccountID = route.accountID
         showsRoutedConversation = true
         _ = navigation.consumeConversation()
+    }
+}
+
+private struct WatchContactsView: View {
+    @ObservedObject private var cache = WatchContactsCache.shared
+    @ObservedObject var messageStore: SecureMessageStore
+    let runtime: NotificationRuntime
+    @State private var query = ""
+
+    private var visible: [LocalContactEntry] {
+        let term = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !term.isEmpty else { return cache.contacts }
+        return cache.contacts.filter { $0.name.localizedCaseInsensitiveContains(term) || $0.normalizedNumbers.contains(where: { $0.contains(term) }) }
+    }
+
+    var body: some View {
+        List {
+            NavigationLink("Ручний пошук") { RecipientSearchView(messageStore: messageStore, runtime: runtime) }
+            if cache.contacts.isEmpty {
+                Text("Контакти ще не синхронізовано. Ручний пошук працює через мережу годинника.").font(.caption)
+            } else {
+                if let updatedAt = cache.updatedAt { Text("Оновлено \(updatedAt, style: .relative)").font(.caption2) }
+                ForEach(visible) { contact in
+                    ForEach(contact.normalizedNumbers, id: \.self) { number in
+                        NavigationLink {
+                            RecipientSearchView(messageStore: messageStore, runtime: runtime, initialRecipient: number)
+                        } label: {
+                            VStack(alignment: .leading) { Text(contact.name).lineLimit(1); Text(number).font(.caption2) }
+                        }
+                    }
+                }
+            }
+        }
+        .searchable(text: $query, prompt: "Пошук")
+        .navigationTitle("Контакти")
     }
 }
 

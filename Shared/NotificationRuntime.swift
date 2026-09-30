@@ -7,6 +7,8 @@ final class NotificationRuntime {
     let api: APIClient
     let accountStore: AccountSessionStore
     let accountAPI: AccountAPIClient
+    private let accountIdentityStore: E2EEIdentityStore
+    private let accountPinStore: E2EEIdentityPinStore
     private var callKitFactory: (() -> CallKitHandling)?
     private var callKit: CallKitHandling?
     private(set) var callKitCreationCount = 0
@@ -17,13 +19,17 @@ final class NotificationRuntime {
         accountStore: AccountSessionStore? = nil,
         accountAPI: AccountAPIClient? = nil,
         audio: AudioEngineHandling = AudioEngine(),
-        media: MediaTransport? = nil
+        media: MediaTransport? = nil,
+        accountIdentityStore: E2EEIdentityStore = E2EEIdentityStore(),
+        accountPinStore: E2EEIdentityPinStore = E2EEIdentityPinStore()
     ) {
         let effectiveAPI = api ?? APIClient(config: config)
         self.api = effectiveAPI
         let effectiveAccountStore = accountStore ?? .shared
         self.accountStore = effectiveAccountStore
         self.accountAPI = accountAPI ?? AccountAPIClient(config: config, tokenStore: effectiveAccountStore.tokenStore)
+        self.accountIdentityStore = accountIdentityStore
+        self.accountPinStore = accountPinStore
         callSession = CallSession(config: config, api: effectiveAPI, audio: audio, media: media)
     }
 
@@ -86,7 +92,7 @@ final class NotificationRuntime {
             return
         }
         _ = ensureCallKit()
-        let signaling = AccountCallSignaling(client: accountAPI, accountID: accountID, targetDeviceID: matches[0].deviceID, localSide: .caller)
+        let signaling = AccountCallSignaling(client: accountAPI, accountID: accountID, targetDeviceID: matches[0].deviceID, localSide: .caller, identityStore: accountIdentityStore, pinStore: accountPinStore)
         await callSession.startCall(signaling: signaling)
     }
 
@@ -220,7 +226,7 @@ final class NotificationRuntime {
             callSession.recordLifecycleDiagnostic("account_session_invalid", status: "missing_tokens", callID: callID)
             return nil
         }
-        return AccountCallSignaling(client: accountAPI, accountID: accountID, localSide: .callee)
+        return AccountCallSignaling(client: accountAPI, accountID: accountID, localSide: .callee, identityStore: accountIdentityStore, pinStore: accountPinStore)
     }
 
     private static func isInvalidAccountSession(_ error: Error) -> Bool {
