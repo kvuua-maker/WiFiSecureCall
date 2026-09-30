@@ -8,48 +8,60 @@ actor AccountE2EEContext {
     private var bundles: [String: Timed<[E2EEPublicDeviceBundle]>] = [:]
     private var profileTasks: [String: Task<UserProfile, Error>] = [:]
     private var bundleTasks: [String: Task<[E2EEPublicDeviceBundle], Error>] = [:]
-    private var registrations = Set<String>()
+    private var registrations: [String: Date] = [:]
     private var registrationTasks: [String: Task<Void, Error>] = [:]
+    private var accountEpochs: [UUID: UInt64] = [:]
 
     func profile(client: AccountAPIClient, accountID: UUID) async throws -> UserProfile {
         let key = cacheKey(client: client, accountID: accountID)
+        let epoch = accountEpochs[accountID, default: 0]
         if let cached = profiles[key], cached.expires > Date() { return cached.value }
         if let task = profileTasks[key] { return try await task.value }
         let task = Task { try await client.userProfile(accountID: accountID) }
         profileTasks[key] = task
         defer { profileTasks.removeValue(forKey: key) }
         let value = try await task.value
+        guard accountEpochs[accountID, default: 0] == epoch else { throw CancellationError() }
         profiles[key] = .init(value: value, expires: Date().addingTimeInterval(30))
         return value
     }
 
     func ensureRegistered(client: AccountAPIClient, accountID: UUID, identity: E2EEDeviceIdentity) async throws {
         let key = "\(cacheKey(client: client, accountID: accountID)):\(identity.deviceID.uuidString):\(identity.keyVersion):\(identity.publicBundle.fingerprint)"
-        guard !registrations.contains(key) else { return }
+        let epoch = accountEpochs[accountID, default: 0]
+        if let confirmed = registrations[key], Date().timeIntervalSince(confirmed) < 60 { return }
         if let task = registrationTasks[key] { return try await task.value }
         let task = Task { _ = try await client.registerDeviceKey(accountID: accountID, request: identity.registration(requestID: UUID())) }
         registrationTasks[key] = task
         defer { registrationTasks.removeValue(forKey: key) }
         try await task.value
-        registrations.insert(key)
+        guard accountEpochs[accountID, default: 0] == epoch else { throw CancellationError() }
+        registrations[key] = Date()
     }
 
     func deviceKeys(client: AccountAPIClient, accountID: UUID, userID: UUID) async throws -> [E2EEPublicDeviceBundle] {
         let key = "\(cacheKey(client: client, accountID: accountID)):\(userID.uuidString)"
+        let epoch = accountEpochs[accountID, default: 0]
         if let cached = bundles[key], cached.expires > Date() { return cached.value }
         if let task = bundleTasks[key] { return try await task.value }
         let task = Task { try await client.deviceKeys(accountID: accountID, userID: userID) }
         bundleTasks[key] = task
         defer { bundleTasks.removeValue(forKey: key) }
         let value = try await task.value
+        guard accountEpochs[accountID, default: 0] == epoch else { throw CancellationError() }
         bundles[key] = .init(value: value, expires: Date().addingTimeInterval(15))
         return value
     }
 
     func invalidate(accountID: UUID) {
+        accountEpochs[accountID, default: 0] &+= 1
+        let marker = ":" + accountID.uuidString
+        for key in profileTasks.keys.filter({ $0.hasSuffix(marker) }) { profileTasks.removeValue(forKey: key)?.cancel() }
+        for key in bundleTasks.keys.filter({ $0.contains(marker + ":") }) { bundleTasks.removeValue(forKey: key)?.cancel() }
+        for key in registrationTasks.keys.filter({ $0.contains(marker + ":") }) { registrationTasks.removeValue(forKey: key)?.cancel() }
         profiles = profiles.filter { !$0.key.hasSuffix(":" + accountID.uuidString) }
         bundles = bundles.filter { !$0.key.contains(":" + accountID.uuidString + ":") }
-        registrations = registrations.filter { !$0.contains(":" + accountID.uuidString + ":") }
+        registrations = registrations.filter { !$0.key.contains(":" + accountID.uuidString + ":") }
     }
 
     private func cacheKey(client: AccountAPIClient, accountID: UUID) -> String {

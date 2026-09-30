@@ -568,8 +568,15 @@ final class CallSession: ObservableObject {
                     guard self.isCurrent(current), response.callID == current.serverCallID else { return }
                     switch response.state {
                     case .accepted:
-                        guard let token = response.mediaToken, !token.isEmpty else { await self.fail(current, .invalidServerState); return }
-                        do { try self.configureAcceptedEncryption(response, signaling: try self.signaling(for: current)) }
+                        let signaling = try self.signaling(for: current)
+                        let verified: CallSignalView
+                        do { verified = try await signaling.call(current.serverCallID) }
+                        catch { await self.fail(current, .invalidServerState); return }
+                        guard self.isCurrent(current), verified.callID == current.serverCallID,
+                              verified.state == .accepted, let token = verified.mediaToken, !token.isEmpty else {
+                            await self.fail(current, .invalidServerState); return
+                        }
+                        do { try self.configureAcceptedEncryption(verified, signaling: signaling) }
                         catch { await self.fail(current, .invalidServerState); return }
                         self.mediaToken = token; self.serverCallAccepted = true; self.transition(.connecting(current.serverCallID)); self.beginActivationWatchdog(current); self.startTerminalObserver(current); return
                     case .ringing: break
@@ -920,7 +927,10 @@ final class CallSession: ObservableObject {
 
     private func registerTerminalCompensation(_ current: CallGeneration, mutation: CallMutation, signaling: any CallSignaling, requestID: UUID? = nil) {
         if let retained = terminalCompensations[current.id] {
-            terminalCompensations[current.id] = TerminalCompensation(mutation: mutation, requestID: requestID ?? retained.requestID, signaling: retained.signaling)
+            // Once an accepted call requires `end`, later CallKit failure paths
+            // must not downgrade the legal server transition to `cancel`.
+            if retained.mutation == .end && mutation != .end { return }
+            terminalCompensations[current.id] = TerminalCompensation(mutation: mutation, requestID: retained.mutation == mutation ? retained.requestID : (requestID ?? UUID()), signaling: retained.signaling)
             return
         }
         if terminalCompensations.count >= 8, let oldest = terminalCompensations.keys.first { terminalCompensations.removeValue(forKey: oldest) }

@@ -93,11 +93,15 @@ private struct WatchContactsView: View {
             } else {
                 if let updatedAt = cache.updatedAt { Text("Оновлено \(updatedAt, style: .relative)").font(.caption2) }
                 ForEach(visible) { contact in
-                    ForEach(contact.normalizedNumbers, id: \.self) { number in
+                    ForEach(contact.numbers) { number in
                         NavigationLink {
-                            RecipientSearchView(messageStore: messageStore, runtime: runtime, initialRecipient: number)
+                            if let canonical = number.canonicalE164 {
+                                RecipientSearchView(messageStore: messageStore, runtime: runtime, initialRecipient: canonical)
+                            } else {
+                                WatchCountryPrefixConfirmation(number: number, messageStore: messageStore, runtime: runtime)
+                            }
                         } label: {
-                            VStack(alignment: .leading) { Text(contact.name).lineLimit(1); Text(number).font(.caption2) }
+                            VStack(alignment: .leading) { Text(contact.name).lineLimit(1); Text(number.displayValue).font(.caption2) }
                         }
                     }
                 }
@@ -105,6 +109,34 @@ private struct WatchContactsView: View {
         }
         .searchable(text: $query, prompt: "Пошук")
         .navigationTitle("Контакти")
+    }
+}
+
+private struct WatchCountryPrefixConfirmation: View {
+    let number: LocalContactNumber
+    @ObservedObject var messageStore: SecureMessageStore
+    let runtime: NotificationRuntime
+    @State private var internationalNumber = "+"
+
+    var body: some View {
+        ScrollView {
+            VStack(spacing: 8) {
+                Text(number.displayValue).font(.headline).minimumScaleFactor(0.7)
+                Text("Введіть повний міжнародний номер. Код країни не визначається автоматично.").font(.caption2)
+                TextField("+код і номер", text: $internationalNumber)
+                NavigationLink("Перевірити") {
+                    RecipientSearchView(messageStore: messageStore, runtime: runtime, initialRecipient: normalized ?? "")
+                }
+                .disabled(normalized == nil)
+            }
+        }
+        .navigationTitle("Номер")
+    }
+
+    private var normalized: String? {
+        let value = RecipientQueryNormalization.normalize(internationalNumber)
+        guard value.hasPrefix("+"), value.dropFirst().allSatisfy(\.isNumber), value.count >= 8 else { return nil }
+        return value
     }
 }
 

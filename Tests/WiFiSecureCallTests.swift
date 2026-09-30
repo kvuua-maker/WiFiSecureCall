@@ -3378,6 +3378,63 @@ final class AccountCallFoundationTests: XCTestCase {
     }
 }
 
+@MainActor
+final class SecureRingingUpgradeRegressionTests: XCTestCase {
+    func testOwnDeviceAndCrossUserRingingUpgradeRequireVerifiedFullResponse() async throws {
+        for kind in ["own", "cross"] {
+            let signaling = RingingUpgradeSignaling(hasVerifiedKeys: true, kind: kind)
+            let session = CallSession(config: config(), audio: AudioEngineMock(), media: MediaTransportMock())
+            let adapter = RetainedCallKitMock(); session.attach(callKit: adapter)
+            await session.startCall(signaling: signaling)
+            let localID = try XCTUnwrap(adapter.startedIDs.first)
+            try await adapter.approveStart(localID)
+            await waitUntil { if case .connecting = session.state { return true }; return false }
+            XCTAssertEqual(signaling.rawAcceptedCount, 1)
+            XCTAssertGreaterThanOrEqual(signaling.verifiedAcceptedCount, 1)
+            XCTAssertTrue(session.isEndToEndEncryptedMedia)
+        }
+    }
+
+    func testRingingUpgradeWithoutVerifiedKeysFailsClosed() async throws {
+        let signaling = RingingUpgradeSignaling(hasVerifiedKeys: false, kind: "invalid")
+        let session = CallSession(config: config(), audio: AudioEngineMock(), media: MediaTransportMock())
+        let adapter = RetainedCallKitMock(); session.attach(callKit: adapter)
+        await session.startCall(signaling: signaling)
+        try await adapter.approveStart(try XCTUnwrap(adapter.startedIDs.first))
+        await waitUntil { session.state.isTerminal }
+        XCTAssertFalse(session.isEndToEndEncryptedMedia)
+    }
+
+    private func config() -> AppConfig {
+        AppConfig(apiBaseURL: URL(string: "https://example.invalid/wifi-secure-call/v1")!, mediaURL: URL(string: "wss://example.invalid/media")!, role: .B, bearerToken: String(repeating: "b", count: 64))
+    }
+    private func waitUntil(_ predicate: @escaping () -> Bool) async {
+        for _ in 0..<200 where !predicate() { try? await Task.sleep(nanoseconds: 10_000_000) }
+    }
+}
+
+private final class RingingUpgradeSignaling: CallSignaling, @unchecked Sendable {
+    let mediaPeerIdentity = MediaPeerIdentity.secureAccount(.caller)
+    let historyAccountID: UUID? = UUID()
+    private let lock = NSLock()
+    private let hasVerifiedKeys: Bool
+    private let kind: String
+    private(set) var rawAcceptedCount = 0
+    private(set) var verifiedAcceptedCount = 0
+    init(hasVerifiedKeys: Bool, kind: String) { self.hasVerifiedKeys = hasVerifiedKeys; self.kind = kind }
+    func create(callID: UUID, requestID: UUID) async throws -> CallSignalView { view(callID, state: .ringing, keys: nil) }
+    func rawCall(_ id: UUID) async throws -> CallSignalView { lock.withLock { rawAcceptedCount += 1 }; return view(id, state: .accepted, keys: nil) }
+    func call(_ id: UUID) async throws -> CallSignalView {
+        lock.withLock { verifiedAcceptedCount += 1 }
+        let keys = hasVerifiedKeys ? CallAudioKeys(send: SymmetricKey(size: .bits256), receive: SymmetricKey(size: .bits256), epoch: 1, sendDirection: .callerToCallee, receiveDirection: .calleeToCaller) : nil
+        return view(id, state: .accepted, keys: keys)
+    }
+    func mutate(_ action: CallMutation, callID: UUID, requestID: UUID) async throws -> CallSignalView { view(callID, state: action == .end ? .ended : .cancelled, keys: nil) }
+    private func view(_ id: UUID, state: ServerCallState, keys: CallAudioKeys?) -> CallSignalView {
+        CallSignalView(callID: id, localSide: .caller, state: state, expiresAt: Date().addingTimeInterval(60), mediaToken: state == .accepted ? "token-\(kind)" : nil, ringExpiresAt: Date().addingTimeInterval(60), acceptedAt: state == .accepted ? Date() : nil, terminalAt: state == .ended ? Date() : nil, terminalReason: nil, deliveryStatus: nil, peerReady: false, createdNew: true, mutationApplied: true, audioKeys: keys)
+    }
+}
+
 private final class ControlledCallSignaling: CallSignaling, @unchecked Sendable {
     private struct HeldOperation {
         let callID: UUID

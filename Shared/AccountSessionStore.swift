@@ -82,6 +82,7 @@ final class AccountSessionStore: ObservableObject {
     }
 
     private func removeLocal(accountID: UUID) throws {
+        Task { await AccountE2EEContext.shared.invalidate(accountID: accountID) }
         try tokenStore.delete(accountID: accountID)
         accounts.removeAll { $0.accountID == accountID }
         profiles.removeValue(forKey: accountID)
