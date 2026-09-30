@@ -2,7 +2,7 @@ import Foundation
 import WatchConnectivity
 
 @MainActor
-final class WatchContactsCache: NSObject, ObservableObject, WCSessionDelegate {
+final class WatchContactsCache: NSObject, ObservableObject {
     static let shared = WatchContactsCache()
 
     @Published private(set) var contacts: [LocalContactEntry] = []
@@ -26,13 +26,10 @@ final class WatchContactsCache: NSObject, ObservableObject, WCSessionDelegate {
 
     func activate() {
         guard WCSession.isSupported() else { return }
-        WCSession.default.delegate = self
-        WCSession.default.activate()
+        WatchWCSessionRouter.shared.activate()
     }
 
-    nonisolated func session(_ session: WCSession, activationDidCompleteWith activationState: WCSessionActivationState, error: Error?) {}
-
-    nonisolated func session(_ session: WCSession, didReceive file: WCSessionFile) {
+    nonisolated func didReceive(_ file: WCSessionFile) {
         guard let data = try? Data(contentsOf: file.fileURL), let snapshot = try? JSONDecoder().decode(LocalContactSnapshot.self, from: data), snapshot.isValid else { return }
         Task { @MainActor in
             guard snapshot.generation > self.generation else { return }
@@ -40,14 +37,15 @@ final class WatchContactsCache: NSObject, ObservableObject, WCSessionDelegate {
         }
     }
 
-    nonisolated func session(_ session: WCSession, didReceiveApplicationContext applicationContext: [String : Any]) {
-        let formatVersion = (applicationContext["formatVersion"] as? NSNumber)?.intValue
-            ?? applicationContext["formatVersion"] as? Int
-        let generation = (applicationContext["generation"] as? NSNumber)?.uint64Value
-            ?? applicationContext["generation"] as? UInt64
+    nonisolated func didReceiveApplicationContext(_ applicationContext: [String : Any]) {
+        let source = (applicationContext["contacts"] as? [String: Any]) ?? applicationContext
+        let formatVersion = (source["formatVersion"] as? NSNumber)?.intValue
+            ?? source["formatVersion"] as? Int
+        let generation = (source["generation"] as? NSNumber)?.uint64Value
+            ?? source["generation"] as? UInt64
         guard formatVersion == LocalContactSnapshot.formatVersion,
               let generation,
-              let kind = applicationContext["contactsKind"] as? String else { return }
+              let kind = source["contactsKind"] as? String else { return }
         Task { @MainActor in
             guard generation >= self.generation else { return }
             if kind == "cleared" { self.clear(generation: generation) }

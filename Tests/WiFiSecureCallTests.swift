@@ -58,6 +58,26 @@ final class SecureMessengerIdentityTests: XCTestCase {
         XCTAssertTrue(publicKey.isValidSignature(signature, for: E2EEDeviceIdentity.proofMessage(registration)))
     }
 
+    func testConcurrentStoreInstancesLoadOrCreateOneIdentity() throws {
+        let storage = InMemoryE2EESecretStorage(), deviceID = UUID(), resultLock = NSLock()
+        let group = DispatchGroup(), queue = DispatchQueue(label: "identity-race", attributes: .concurrent)
+        var bundles: [E2EEPublicDeviceBundle] = [], errors: [Error] = []
+        for _ in 0..<32 {
+            group.enter(); queue.async {
+                defer { group.leave() }
+                do {
+                    let value = try E2EEIdentityStore(storage: storage, deviceID: deviceID).identity().publicBundle
+                    resultLock.wscLocked { bundles.append(value) }
+                } catch { resultLock.wscLocked { errors.append(error) } }
+            }
+        }
+        XCTAssertEqual(group.wait(timeout: .now() + 5), .success)
+        XCTAssertTrue(errors.isEmpty)
+        XCTAssertEqual(Set(bundles.map(\.signingPublicKey)).count, 1)
+        XCTAssertEqual(Set(bundles.map(\.agreementPublicKey)).count, 1)
+        XCTAssertEqual(Set(bundles.map(\.deviceID)).count, 1)
+    }
+
     func testTOFUPinningRejectsSilentIdentityReplacement() throws {
         let pins = E2EEIdentityPinStore(storage: InMemoryE2EESecretStorage())
         let userID = UUID(), deviceID = UUID()

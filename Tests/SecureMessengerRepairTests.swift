@@ -223,8 +223,9 @@ final class SecureMessengerCallHistoryRepairTests: XCTestCase {
 
 final class SecureConversationPeerMetadataTests: XCTestCase {
     func testContactSnapshotIsMinimalValidatedAndInternationalOnly() throws {
-        XCTAssertEqual(LocalPhoneNumberNormalizer.normalize("+380 (50) 123-45-67"), "+380501234567")
-        XCTAssertNil(LocalPhoneNumberNormalizer.normalize("0501234567"))
+        XCTAssertEqual(LocalPhoneNumberNormalizer.normalize("+380 (50) 123-45-67"), .init(digits: "380501234567", canonicalE164: "+380501234567"))
+        XCTAssertEqual(LocalPhoneNumberNormalizer.normalize("00380 50 123 45 67"), .init(digits: "380501234567", canonicalE164: "+380501234567"))
+        XCTAssertEqual(LocalPhoneNumberNormalizer.normalize("0501234567"), .init(digits: "0501234567", canonicalE164: nil))
         let entry = LocalContactEntry(id: "local-id", name: "Олена", normalizedNumbers: ["+380501234567"])
         let snapshot = LocalContactSnapshot(generation: 4, updatedAt: Date(timeIntervalSince1970: 100), contacts: [entry])
         XCTAssertTrue(snapshot.isValid)

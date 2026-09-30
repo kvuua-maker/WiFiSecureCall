@@ -30,7 +30,11 @@ struct CallSignalView: Sendable, Equatable {
     }
 }
 
-enum CallSignalingError: Error { case invalidResponse, missingTarget }
+enum CallSignalingError: Error {
+    case invalidResponse
+    case missingTarget
+    case postCommitValidation(callID: UUID, state: ServerCallState, mutationApplied: Bool?, reason: String)
+}
 
 protocol CallSignaling: Sendable {
     var mediaPeerIdentity: MediaPeerIdentity { get }
@@ -111,7 +115,14 @@ final class AccountCallSignaling: CallSignaling, @unchecked Sendable {
             let current = try await client.call(accountID: accountID, callID: callID)
             if current.callerKeyPackage != nil { package = try await localPackage(callID: callID, side: .callee) }
         }
-        return try await map(await client.mutateCall(accountID: accountID, action: action, callID: callID, requestID: requestID, calleeKeyPackage: package), expectedCallID: callID)
+        let response = try await client.mutateCall(accountID: accountID, action: action, callID: callID, requestID: requestID, calleeKeyPackage: package)
+        do { return try await map(response, expectedCallID: callID) }
+        catch {
+            if action == .accept, response.state == .accepted {
+                throw CallSignalingError.postCommitValidation(callID: response.callID, state: response.state, mutationApplied: response.mutationApplied, reason: "secure_media_validation_failed")
+            }
+            throw error
+        }
     }
     private func map(_ response: AccountCallResponse, expectedCallID: UUID) async throws -> CallSignalView {
         guard response.callID == expectedCallID, response.localSide == localSide else { throw CallSignalingError.invalidResponse }
@@ -214,7 +225,14 @@ final class CrossUserCallSignaling: CallSignaling, @unchecked Sendable {
 
     func mutate(_ action: CallMutation, callID: UUID, requestID: UUID) async throws -> CallSignalView {
         let package = action == .accept ? try await localPackage(callID: callID, side: .callee) : nil
-        return try await map(await client.mutateUserCall(accountID: accountID, action: action, callID: callID, requestID: requestID, calleeKeyPackage: package), expectedCallID: callID)
+        let response = try await client.mutateUserCall(accountID: accountID, action: action, callID: callID, requestID: requestID, calleeKeyPackage: package)
+        do { return try await map(response, expectedCallID: callID) }
+        catch {
+            if action == .accept, response.state == .accepted {
+                throw CallSignalingError.postCommitValidation(callID: response.callID, state: response.state, mutationApplied: response.mutationApplied, reason: "secure_media_validation_failed")
+            }
+            throw error
+        }
     }
 
     private func map(_ response: CrossUserCallResponse, expectedCallID: UUID) async throws -> CallSignalView {

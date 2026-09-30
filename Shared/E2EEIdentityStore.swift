@@ -94,6 +94,7 @@ struct E2EEDeviceIdentity: Sendable {
 }
 
 final class E2EEIdentityStore: @unchecked Sendable {
+    private static let creationLock = NSLock()
     private let storage: any E2EESecretStorage
     private let deviceID: UUID
     private let lock = NSLock()
@@ -107,6 +108,8 @@ final class E2EEIdentityStore: @unchecked Sendable {
     func identity() throws -> E2EEDeviceIdentity {
         try lock.wscLocked {
             if let cached { return cached }
+            return try Self.creationLock.wscLocked {
+                if let cached { return cached }
             let signing: Curve25519.Signing.PrivateKey
             let agreement: Curve25519.KeyAgreement.PrivateKey
             if let signingData = try storage.load("identity.signing.v1"),
@@ -131,6 +134,7 @@ final class E2EEIdentityStore: @unchecked Sendable {
             let value = E2EEDeviceIdentity(deviceID: deviceID, signingPrivateKey: signing, agreementPrivateKey: agreement, keyVersion: version)
             cached = value
             return value
+            }
         }
     }
 }

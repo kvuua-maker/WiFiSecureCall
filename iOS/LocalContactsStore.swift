@@ -56,10 +56,14 @@ final class LocalContactsStore: ObservableObject {
             let request = CNContactFetchRequest(keysToFetch: keys)
             var loaded: [LocalContactEntry] = []
             try store.enumerateContacts(with: request) { contact, _ in
-                let numbers = Array(Set(contact.phoneNumbers.compactMap { LocalPhoneNumberNormalizer.normalize($0.value.stringValue) })).sorted()
+                let numbers = contact.phoneNumbers.enumerated().compactMap { index, labeled -> LocalContactNumber? in
+                    let display = labeled.value.stringValue
+                    guard let normalized = LocalPhoneNumberNormalizer.normalize(display) else { return nil }
+                    return LocalContactNumber(id: "\(contact.identifier):\(index)", displayValue: display, digits: normalized.digits, canonicalE164: normalized.canonicalE164)
+                }
                 guard !numbers.isEmpty else { return }
                 let name = [contact.givenName, contact.familyName].filter { !$0.isEmpty }.joined(separator: " ")
-                loaded.append(.init(id: contact.identifier, name: name.isEmpty ? "Без імені" : name, normalizedNumbers: numbers))
+                loaded.append(.init(id: contact.identifier, name: name.isEmpty ? "Без імені" : name, numbers: numbers))
             }
             contacts = loaded.sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
             let snapshot = LocalContactSnapshot(generation: generationStore.next(), contacts: contacts)

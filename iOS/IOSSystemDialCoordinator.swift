@@ -56,8 +56,7 @@ final class IOSSystemDialCoordinator: NSObject {
     func activate() {
         _ = network.current
         guard let session else { return }
-        session.delegate = self
-        session.activate()
+        IOSWCSessionRouter.shared.activate()
     }
 
     @discardableResult
@@ -234,7 +233,7 @@ final class IOSSystemDialCoordinator: NSObject {
         return nil
     }
 
-    private func handlePrepare(_ message: [String: Any]) -> [String: Any] {
+    func handlePrepare(_ message: [String: Any]) -> [String: Any] {
         let receivedAt = Date()
         guard let attemptString = message["attemptID"] as? String,
               let attemptID = UUID(uuidString: attemptString),
@@ -506,16 +505,47 @@ enum WSCDefaultCallingURLParser {
     }
 }
 
-extension IOSSystemDialCoordinator: WCSessionDelegate {
-    nonisolated func session(_ session: WCSession, activationDidCompleteWith activationState: WCSessionActivationState, error: Error?) {}
+final class IOSWCSessionRouter: NSObject, WCSessionDelegate, @unchecked Sendable {
+    static let shared = IOSWCSessionRouter()
+    private let lock = NSLock()
+    private var contactsActivation: (@Sendable (WCSessionActivationState, Error?) -> Void)?
+    private var contactsFileFinished: (@Sendable (WCSessionFileTransfer, Error?) -> Void)?
+
+    func activate() {
+        guard WCSession.isSupported() else { return }
+        WCSession.default.delegate = self
+        WCSession.default.activate()
+    }
+
+    func updateApplicationContext(namespace: String, values: [String: Any]) {
+        guard WCSession.isSupported() else { return }
+        lock.wscLocked {
+            var merged = WCSession.default.applicationContext
+            merged[namespace] = values
+            for (key, value) in values { merged[key] = value }
+            try? WCSession.default.updateApplicationContext(merged)
+        }
+    }
+
+    func registerContacts(activation: @escaping @Sendable (WCSessionActivationState, Error?) -> Void, fileFinished: @escaping @Sendable (WCSessionFileTransfer, Error?) -> Void) {
+        lock.wscLocked { contactsActivation = activation; contactsFileFinished = fileFinished }
+    }
+
+    nonisolated func session(_ session: WCSession, activationDidCompleteWith activationState: WCSessionActivationState, error: Error?) {
+        lock.wscLocked { contactsActivation }?(activationState, error)
+    }
     nonisolated func sessionDidBecomeInactive(_ session: WCSession) {}
     nonisolated func sessionDidDeactivate(_ session: WCSession) { session.activate() }
+
+    nonisolated func session(_ session: WCSession, didFinish fileTransfer: WCSessionFileTransfer, error: Error?) {
+        lock.wscLocked { contactsFileFinished }?(fileTransfer, error)
+    }
 
     nonisolated func session(_ session: WCSession, didReceiveMessage message: [String: Any], replyHandler: @escaping ([String: Any]) -> Void) {
         Task { @MainActor in
             switch message["type"] as? String {
-            case "prepareSystemDial": replyHandler(self.handlePrepare(message))
-            case "systemDialResult": replyHandler(self.handleResult(message))
+            case "prepareSystemDial": replyHandler(IOSSystemDialCoordinator.shared.handlePrepare(message))
+            case "systemDialResult": replyHandler(IOSSystemDialCoordinator.shared.handleResult(message))
             default: replyHandler(["type": "unsupported"])
             }
         }
@@ -524,7 +554,7 @@ extension IOSSystemDialCoordinator: WCSessionDelegate {
     nonisolated func session(_ session: WCSession, didReceiveMessage message: [String: Any]) {
         Task { @MainActor in
             if message["type"] as? String == "systemDialHandoff" {
-                self.handleHandoff(message)
+                IOSSystemDialCoordinator.shared.handleHandoff(message)
             }
         }
     }

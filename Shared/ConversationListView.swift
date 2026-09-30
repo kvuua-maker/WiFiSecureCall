@@ -25,16 +25,6 @@ struct ConversationListView: View {
 
     var body: some View {
         Group {
-            NavigationLink(
-                destination: Group {
-                    if let routedConversation, let routedAccountID {
-                        ConversationView(store: store, conversation: routedConversation, accountID: routedAccountID)
-                    }
-                    else { EmptyView() }
-                },
-                isActive: $showsRoutedConversation,
-                label: { EmptyView() }
-            )
             if store.conversations.isEmpty {
                 VStack(spacing: 8) {
                     Image(systemName: "bubble.left.and.bubble.right").font(.largeTitle)
@@ -43,6 +33,18 @@ struct ConversationListView: View {
                     NavigationLink("Написати повідомлення") { RecipientSearchView(messageStore: store, runtime: runtime) }
                 }.padding()
             } else {
+                #if os(watchOS)
+                ScrollView(showsIndicators: false) {
+                    LazyVStack(spacing: 5) {
+                        ForEach(filteredConversations) { conversation in
+                            NavigationLink {
+                                if let accountID = store.activeAccountID { ConversationView(store: store, conversation: conversation, accountID: accountID) }
+                            } label: { compactWatchRow(conversation) }
+                            .buttonStyle(.plain)
+                        }
+                    }
+                }
+                #else
                 List(filteredConversations) { conversation in
                     NavigationLink {
                         if let accountID = store.activeAccountID {
@@ -63,16 +65,44 @@ struct ConversationListView: View {
                         }
                     }
                 }
+                #endif
             }
         }
         .navigationTitle("Чати")
         .searchable(text: $query, prompt: "Пошук розмов")
-        .toolbar { NavigationLink("Новий чат") { RecipientSearchView(messageStore: store, runtime: runtime) } }
+        .toolbar {
+            NavigationLink { RecipientSearchView(messageStore: store, runtime: runtime) } label: { Image(systemName: "square.and.pencil") }
+                .accessibilityLabel("Новий чат")
+        }
         .task { await store.refresh() }
         .onReceive(navigation.$pendingConversation) { _ in routeIfPossible() }
         .onChange(of: store.conversations) { _ in routeIfPossible() }
         .overlay { if store.state == .loading { ProgressView().accessibilityLabel("Loading secure conversations") } }
+        .sheet(isPresented: $showsRoutedConversation) {
+            if let routedConversation, let routedAccountID {
+                NavigationView { ConversationView(store: store, conversation: routedConversation, accountID: routedAccountID) }
+            }
+        }
     }
+
+    #if os(watchOS)
+    private func compactWatchRow(_ conversation: SecureConversation) -> some View {
+        HStack(spacing: 6) {
+            Text(String(conversation.peerDisplayName.prefix(1)).uppercased())
+                .font(.caption.bold()).frame(width: 30, height: 30).background(Circle().fill(.blue.opacity(0.25)))
+            VStack(alignment: .leading, spacing: 2) {
+                Text(conversation.peerDisplayName).font(.caption.bold()).lineLimit(1)
+                if let accountID = store.activeAccountID, let last = store.messages(conversationID: conversation.id, accountID: accountID).last {
+                    Text(last.text).font(.caption2).foregroundStyle(.secondary).lineLimit(1)
+                } else { Text("Відкрити розмову").font(.caption2).foregroundStyle(.secondary).lineLimit(1) }
+            }
+            Spacer(minLength: 2)
+            Text(conversation.updatedAt, style: .time).font(.system(size: 9)).foregroundStyle(.secondary)
+        }
+        .frame(minHeight: 48)
+        .contentShape(Rectangle())
+    }
+    #endif
 
     private func routeIfPossible() {
         guard let route = navigation.pendingConversation,

@@ -1,7 +1,7 @@
 import Foundation
 import WatchConnectivity
 
-final class ContactsToWatchSync: NSObject, WCSessionDelegate, @unchecked Sendable {
+final class ContactsToWatchSync: NSObject, @unchecked Sendable {
     static let shared = ContactsToWatchSync()
     private let queue = DispatchQueue(label: "com.vkapps.wifisecurecall.contacts-sync")
     private var latestSnapshot: LocalContactSnapshot?
@@ -9,8 +9,11 @@ final class ContactsToWatchSync: NSObject, WCSessionDelegate, @unchecked Sendabl
 
     func activate() {
         guard WCSession.isSupported() else { return }
-        WCSession.default.delegate = self
-        WCSession.default.activate()
+        IOSWCSessionRouter.shared.registerContacts(
+            activation: { [weak self] state, error in self?.activationDidComplete(state, error: error) },
+            fileFinished: { [weak self] transfer, error in self?.didFinish(transfer, error: error) }
+        )
+        IOSWCSessionRouter.shared.activate()
     }
 
     func publish(_ snapshot: LocalContactSnapshot) {
@@ -44,22 +47,20 @@ final class ContactsToWatchSync: NSObject, WCSessionDelegate, @unchecked Sendabl
 
     private func sendContext(kind: String, generation: UInt64, updatedAt: Date) {
         guard WCSession.default.activationState == .activated else { return }
-        try? WCSession.default.updateApplicationContext([
+        IOSWCSessionRouter.shared.updateApplicationContext(namespace: "contacts", values: [
             "contactsKind": kind, "formatVersion": LocalContactSnapshot.formatVersion,
             "generation": generation, "updatedAt": updatedAt.timeIntervalSince1970
         ])
     }
 
-    func session(_ session: WCSession, activationDidCompleteWith activationState: WCSessionActivationState, error: Error?) {
+    func activationDidComplete(_ activationState: WCSessionActivationState, error: Error?) {
         guard activationState == .activated, error == nil else { return }
         queue.async {
             if let snapshot = self.latestSnapshot { self.send(snapshot) }
             else if let generation = self.latestClearGeneration { self.sendContext(kind: "cleared", generation: generation, updatedAt: Date()) }
         }
     }
-    func session(_ session: WCSession, didFinish fileTransfer: WCSessionFileTransfer, error: Error?) {
+    func didFinish(_ fileTransfer: WCSessionFileTransfer, error: Error?) {
         try? FileManager.default.removeItem(at: fileTransfer.file.fileURL)
     }
-    func sessionDidBecomeInactive(_ session: WCSession) {}
-    func sessionDidDeactivate(_ session: WCSession) { session.activate() }
 }

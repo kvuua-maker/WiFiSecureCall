@@ -7,6 +7,7 @@ struct IOSProductRootView: View {
     @StateObject private var messages: SecureMessageStore
     @StateObject private var callHistory: CallHistoryStore
     @ObservedObject private var navigation = ProductNavigation.shared
+    @State private var showsActiveCall = false
     private let runtime: NotificationRuntime
 
     @MainActor init(session: CallSession, runtime: NotificationRuntime) {
@@ -30,22 +31,17 @@ struct IOSProductRootView: View {
             get: { navigation.selectedSection },
             set: { navigation.select($0) }
         )) {
-            NavigationView { ConversationListView(store: messages, runtime: runtime) }
-                .tabItem { Label("Чати", systemImage: "bubble.left.and.bubble.right") }
-                .tag(ProductSection.chats)
-            NavigationView {
-                Group {
-                    if session.state == .idle || session.state.isTerminal {
-                        CallHistoryView(store: callHistory, accountID: accountStore.activeAccountID, runtime: runtime)
-                    }
-                    else { ActiveCallView(session: session) }
-                }
-            }
-            .tabItem { Label("Дзвінки", systemImage: "phone") }
-            .tag(ProductSection.calls)
             NavigationView { IOSContactsView(messageStore: messages, runtime: runtime) }
                 .tabItem { Label("Контакти", systemImage: "person.2") }
                 .tag(ProductSection.contacts)
+            NavigationView {
+                CallHistoryView(store: callHistory, accountID: accountStore.activeAccountID, runtime: runtime)
+            }
+            .tabItem { Label("Дзвінки", systemImage: "phone") }
+            .tag(ProductSection.calls)
+            NavigationView { ConversationListView(store: messages, runtime: runtime) }
+                .tabItem { Label("Чати", systemImage: "bubble.left.and.bubble.right") }
+                .tag(ProductSection.chats)
             NavigationView {
                 AccountView(store: accountStore)
                     .toolbar {
@@ -59,13 +55,14 @@ struct IOSProductRootView: View {
             .tag(ProductSection.settings)
         }
         .safeAreaInset(edge: .top) {
-            if session.state != .idle && !session.state.isTerminal && navigation.selectedSection != .calls {
-                Button("Повернутися до дзвінка") { navigation.select(.calls) }
+            if session.state != .idle && !session.state.isTerminal {
+                Button("Повернутися до дзвінка") { showsActiveCall = true }
                     .frame(maxWidth: .infinity)
                     .padding(8)
                     .background(.thinMaterial)
             }
         }
+        .fullScreenCover(isPresented: $showsActiveCall) { ActiveCallView(session: session) }
         }
         }
     }

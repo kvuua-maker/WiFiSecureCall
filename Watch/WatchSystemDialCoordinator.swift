@@ -35,8 +35,7 @@ final class WatchSystemDialCoordinator: NSObject, ObservableObject {
     func activate() {
         _ = network.current
         guard let session else { return }
-        session.delegate = self
-        session.activate()
+        WatchWCSessionRouter.shared.activate()
     }
 
     func prepareAndDial(number: String, url: URL) async {
@@ -266,7 +265,7 @@ final class WatchSystemDialCoordinator: NSObject, ObservableObject {
         await store.flush()
     }
 
-    private func applyPushedResult(_ message: [String: Any]) -> Bool {
+    func applyPushedResult(_ message: [String: Any]) -> Bool {
         guard let attemptString = message["attemptID"] as? String,
               let attemptID = UUID(uuidString: attemptString),
               let data = message["attemptJSON"] as? Data,
@@ -290,6 +289,12 @@ final class WatchSystemDialCoordinator: NSObject, ObservableObject {
         publish(attemptID)
         Task { await store.flush() }
         return true
+    }
+
+    func recordActivation(_ session: WCSession, error: Error?) {
+        guard let attemptID = activeAttemptID else { return }
+        store.record(id: attemptID, source: "watch", event: "wc_activation", status: error == nil ? Self.activationState(session) : "error")
+        publish(attemptID)
     }
 
     private func publish(_ attemptID: UUID) {
@@ -340,20 +345,34 @@ final class WatchSystemDialCoordinator: NSObject, ObservableObject {
     }
 }
 
-extension WatchSystemDialCoordinator: WCSessionDelegate {
+final class WatchWCSessionRouter: NSObject, WCSessionDelegate, @unchecked Sendable {
+    static let shared = WatchWCSessionRouter()
+
+    func activate() {
+        guard WCSession.isSupported() else { return }
+        WCSession.default.delegate = self
+        WCSession.default.activate()
+    }
+
     nonisolated func session(_ session: WCSession, activationDidCompleteWith activationState: WCSessionActivationState, error: Error?) {
         Task { @MainActor in
-            guard let attemptID = self.activeAttemptID else { return }
-            self.store.record(id: attemptID, source: "watch", event: "wc_activation", status: error == nil ? Self.activationState(session) : "error")
-            self.publish(attemptID)
+            WatchSystemDialCoordinator.shared.recordActivation(session, error: error)
         }
     }
 
     nonisolated func session(_ session: WCSession, didReceiveMessage message: [String: Any], replyHandler: @escaping ([String: Any]) -> Void) {
         Task { @MainActor in
-            let applied = message["type"] as? String == "systemDialResultPush" && self.applyPushedResult(message)
+            let applied = message["type"] as? String == "systemDialResultPush" && WatchSystemDialCoordinator.shared.applyPushedResult(message)
             replyHandler(["type": "systemDialResultPushReply", "accepted": applied])
         }
+    }
+
+    nonisolated func session(_ session: WCSession, didReceive file: WCSessionFile) {
+        WatchContactsCache.shared.didReceive(file)
+    }
+
+    nonisolated func session(_ session: WCSession, didReceiveApplicationContext applicationContext: [String: Any]) {
+        WatchContactsCache.shared.didReceiveApplicationContext(applicationContext)
     }
 }
 

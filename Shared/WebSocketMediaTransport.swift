@@ -21,6 +21,7 @@ final class WebSocketMediaTransport: NSObject, MediaTransport, URLSessionWebSock
     private var connectionID: UUID?
     private var activeCallID: UUID?
     private var openContinuation: CheckedContinuation<Void, Error>?
+    private var openedEpochs: Set<UUID> = []
     private var intentionalClose: Set<UUID> = []
     private var taskEpoch: [ObjectIdentifier: UUID] = [:]
     private var epochCallID: [UUID: UUID] = [:]
@@ -81,7 +82,7 @@ final class WebSocketMediaTransport: NSObject, MediaTransport, URLSessionWebSock
         let values: (URLSessionWebSocketTask?, Task<Void, Never>?, Task<Void, Never>?, UUID?) = lock.withLock {
             guard expected == nil || connectionID == expected else { return (nil, nil, nil, nil) }
             let values = (task, receiveTask, heartbeatTask, connectionID)
-            if let id = connectionID { intentionalClose.insert(id) }
+            if let id = connectionID { intentionalClose.insert(id); openedEpochs.remove(id) }
             task = nil; receiveTask = nil; heartbeatTask = nil; connectionID = nil; activeCallID = nil
             return values
         }
@@ -111,6 +112,7 @@ final class WebSocketMediaTransport: NSObject, MediaTransport, URLSessionWebSock
                     try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
                         self.lock.withLock {
                             guard self.connectionID == connectionID, self.task === socket else { continuation.resume(throwing: CancellationError()); return }
+                            if self.openedEpochs.remove(connectionID) != nil { continuation.resume(returning: ()); return }
                             self.openContinuation = continuation
                         }
                     }
@@ -154,7 +156,13 @@ final class WebSocketMediaTransport: NSObject, MediaTransport, URLSessionWebSock
     }
 
     nonisolated func urlSession(_ session: URLSession, webSocketTask: URLSessionWebSocketTask, didOpenWithProtocol protocol: String?) {
-        let continuation = lock.withLock { () -> CheckedContinuation<Void, Error>? in guard task === webSocketTask else { return nil }; let value = openContinuation; openContinuation = nil; return value }
+        let continuation = lock.withLock { () -> CheckedContinuation<Void, Error>? in
+            guard task === webSocketTask, let epoch = taskEpoch[ObjectIdentifier(webSocketTask)] else { return nil }
+            let value = openContinuation
+            openContinuation = nil
+            if value == nil { openedEpochs.insert(epoch) }
+            return value
+        }
         continuation?.resume(returning: ())
     }
 
@@ -175,7 +183,7 @@ final class WebSocketMediaTransport: NSObject, MediaTransport, URLSessionWebSock
     private func replaceCurrent(with socket: URLSessionWebSocketTask, callID: UUID, connectionID: UUID) -> (URLSessionWebSocketTask?, Task<Void, Never>?) {
         lock.withLock {
             let previous = (task, receiveTask)
-            if let old = self.connectionID { intentionalClose.insert(old) }
+            if let old = self.connectionID { intentionalClose.insert(old); openedEpochs.remove(old) }
             openContinuation?.resume(throwing: CancellationError()); openContinuation = nil
             task = socket; activeCallID = callID; self.connectionID = connectionID
             taskEpoch[ObjectIdentifier(socket)] = connectionID; epochCallID[connectionID] = callID
@@ -184,7 +192,7 @@ final class WebSocketMediaTransport: NSObject, MediaTransport, URLSessionWebSock
         }
     }
     private func cancelOpen(_ expected: UUID) { let value = lock.withLock { () -> CheckedContinuation<Void, Error>? in guard connectionID == expected else { return nil }; let result = openContinuation; openContinuation = nil; return result }; value?.resume(throwing: CancellationError()) }
-    private func clearIfCurrent(_ expected: UUID) { lock.withLock { guard connectionID == expected else { return }; task = nil; receiveTask = nil; heartbeatTask?.cancel(); heartbeatTask = nil; connectionID = nil; activeCallID = nil } }
+    private func clearIfCurrent(_ expected: UUID) { lock.withLock { guard connectionID == expected else { return }; openedEpochs.remove(expected); task = nil; receiveTask = nil; heartbeatTask?.cancel(); heartbeatTask = nil; connectionID = nil; activeCallID = nil } }
     private func completeCloseTimeout(id: UUID, socket: URLSessionWebSocketTask) {
         let waiter = lock.withLock { () -> CheckedContinuation<Void, Never>? in
             guard taskEpoch[ObjectIdentifier(socket)] == id else { return closeWaiters.removeValue(forKey: id) }

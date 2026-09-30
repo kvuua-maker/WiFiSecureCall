@@ -1,7 +1,7 @@
 import Foundation
 
 struct LocalContactSnapshot: Codable, Equatable, Sendable {
-    static let formatVersion = 1
+    static let formatVersion = 2
 
     let formatVersion: Int
     let generation: UInt64
@@ -16,7 +16,7 @@ struct LocalContactSnapshot: Codable, Equatable, Sendable {
     }
 
     var isValid: Bool {
-        formatVersion == Self.formatVersion && generation > 0 && contacts.count <= 10_000 &&
+        (formatVersion == 1 || formatVersion == Self.formatVersion) && generation > 0 && contacts.count <= 10_000 &&
         contacts.allSatisfy(\.isValid)
     }
 }
@@ -74,25 +74,71 @@ final class LocalContactSnapshotDiskCache: @unchecked Sendable {
     }
 }
 
+struct LocalContactNumber: Codable, Equatable, Identifiable, Sendable {
+    let id: String
+    let displayValue: String
+    let digits: String
+    let canonicalE164: String?
+
+    var isValid: Bool {
+        !id.isEmpty && id.count <= 256 && !displayValue.isEmpty && displayValue.count <= 64 &&
+        (3...15).contains(digits.count) && digits.allSatisfy(\.isNumber) &&
+        (canonicalE164 == nil || (canonicalE164!.hasPrefix("+") && canonicalE164!.dropFirst().allSatisfy(\.isNumber)))
+    }
+}
+
 struct LocalContactEntry: Codable, Equatable, Identifiable, Sendable {
     let id: String
     let name: String
-    let normalizedNumbers: [String]
+    let numbers: [LocalContactNumber]
+
+    init(id: String, name: String, numbers: [LocalContactNumber]) { self.id = id; self.name = name; self.numbers = numbers }
+    init(id: String, name: String, normalizedNumbers: [String]) {
+        self.id = id; self.name = name
+        self.numbers = normalizedNumbers.enumerated().compactMap { index, value in
+            guard let normalized = LocalPhoneNumberNormalizer.normalize(value) else { return nil }
+            return LocalContactNumber(id: "\(id):\(index)", displayValue: value, digits: normalized.digits, canonicalE164: normalized.canonicalE164)
+        }
+    }
+
+    var normalizedNumbers: [String] { numbers.map { $0.canonicalE164 ?? $0.displayValue } }
 
     var isValid: Bool {
         !id.isEmpty && id.count <= 256 && !name.isEmpty && name.count <= 256 &&
-        !normalizedNumbers.isEmpty && normalizedNumbers.count <= 16 &&
-        normalizedNumbers.allSatisfy { $0.hasPrefix("+") && $0.dropFirst().allSatisfy(\.isNumber) && (4...15).contains($0.dropFirst().count) }
+        !numbers.isEmpty && numbers.count <= 16 && numbers.allSatisfy(\.isValid)
+    }
+
+    private enum CodingKeys: String, CodingKey { case id, name, numbers, normalizedNumbers }
+    init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        let decodedID = try values.decode(String.self, forKey: .id)
+        let decodedName = try values.decode(String.self, forKey: .name)
+        let decodedNumbers: [LocalContactNumber]
+        if let decoded = try values.decodeIfPresent([LocalContactNumber].self, forKey: .numbers) { decodedNumbers = decoded }
+        else {
+            let legacy = try values.decode([String].self, forKey: .normalizedNumbers)
+            decodedNumbers = legacy.enumerated().compactMap { index, value in
+                guard let normalized = LocalPhoneNumberNormalizer.normalize(value) else { return nil }
+                return LocalContactNumber(id: "\(decodedID):\(index)", displayValue: value, digits: normalized.digits, canonicalE164: normalized.canonicalE164)
+            }
+        }
+        id = decodedID; name = decodedName; numbers = decodedNumbers
+    }
+    func encode(to encoder: Encoder) throws {
+        var values = encoder.container(keyedBy: CodingKeys.self)
+        try values.encode(id, forKey: .id); try values.encode(name, forKey: .name); try values.encode(numbers, forKey: .numbers)
     }
 }
 
 enum LocalPhoneNumberNormalizer {
-    static func normalize(_ value: String) -> String? {
+    struct Result: Equatable { let digits: String; let canonicalE164: String? }
+    static func normalize(_ value: String) -> Result? {
         let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard trimmed.hasPrefix("+") else { return nil }
-        let digits = trimmed.dropFirst().filter(\.isNumber)
-        guard (4...15).contains(digits.count),
-              trimmed.dropFirst().allSatisfy({ $0.isNumber || " -().".contains($0) }) else { return nil }
-        return "+" + digits
+        guard !trimmed.isEmpty, trimmed.allSatisfy({ $0.isNumber || "+ -().".contains($0) }) else { return nil }
+        let digits = trimmed.filter(\.isNumber)
+        guard (3...15).contains(digits.count) else { return nil }
+        if trimmed.hasPrefix("+") { return Result(digits: digits, canonicalE164: "+" + digits) }
+        if trimmed.hasPrefix("00"), digits.count > 2 { return Result(digits: String(digits.dropFirst(2)), canonicalE164: "+" + String(digits.dropFirst(2))) }
+        return Result(digits: digits, canonicalE164: nil)
     }
 }

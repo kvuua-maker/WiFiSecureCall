@@ -5,10 +5,6 @@ struct WatchProductRootView: View {
     @ObservedObject private var accountStore: AccountSessionStore
     @StateObject private var messages: SecureMessageStore
     @StateObject private var callHistory: CallHistoryStore
-    @ObservedObject private var navigation = ProductNavigation.shared
-    @State private var routedConversation: SecureConversation?
-    @State private var routedAccountID: UUID?
-    @State private var showsRoutedConversation = false
     private let runtime: NotificationRuntime
 
     @MainActor init(session: CallSession, runtime: NotificationRuntime) {
@@ -25,60 +21,51 @@ struct WatchProductRootView: View {
 
     var body: some View {
         NavigationStack {
-            ZStack {
-                NavigationLink(
-                    destination: Group {
-                        if let routedConversation, let routedAccountID {
-                            ConversationView(store: messages, conversation: routedConversation, accountID: routedAccountID)
-                        } else { EmptyView() }
-                    },
-                    isActive: $showsRoutedConversation,
-                    label: { EmptyView() }
-                )
-                if accountStore.callableAccounts.isEmpty {
+            if accountStore.callableAccounts.isEmpty { WatchAccountLinkView(store: accountStore) }
+            else { ConversationListView(store: messages, runtime: runtime) }
+        }
+        .overlay(alignment: .top) {
+            if session.state != .idle && !session.state.isTerminal {
+                NavigationLink("Поточний дзвінок") { ActiveCallView(session: session) }
+                    .font(.caption.bold()).buttonStyle(.borderedProminent)
+            }
+        }
+        .toolbar {
+            ToolbarItem(placement: .cancellationAction) {
+                NavigationLink {
+                    WatchMoreView(session: session, accountStore: accountStore, messages: messages, callHistory: callHistory, runtime: runtime)
+                } label: { Image(systemName: "line.3.horizontal").accessibilityLabel("Меню") }
+            }
+        }
+    }
+}
+
+private struct WatchMoreView: View {
+    @ObservedObject var session: CallSession
+    @ObservedObject var accountStore: AccountSessionStore
+    @ObservedObject var messages: SecureMessageStore
+    @ObservedObject var callHistory: CallHistoryStore
+    let runtime: NotificationRuntime
+
+    var body: some View {
+        List {
+            NavigationLink("Дзвінки") {
+                if session.state == .idle || session.state.isTerminal { CallHistoryView(store: callHistory, accountID: accountStore.activeAccountID, runtime: runtime) }
+                else { ActiveCallView(session: session) }
+            }
+            NavigationLink("Контакти") { WatchContactsView(messageStore: messages, runtime: runtime) }
+            NavigationLink("Набрати номер") { WatchDialEntry(messageStore: messages, runtime: runtime) }
+            NavigationLink("Акаунт і безпека") {
+                List {
                     WatchAccountLinkView(store: accountStore)
-                } else {
-                    List {
-                        if session.state != .idle && !session.state.isTerminal {
-                            NavigationLink("Поточний дзвінок") { ActiveCallView(session: session) }
-                        }
-                        NavigationLink("Чати") { ConversationListView(store: messages, runtime: runtime) }
-                        NavigationLink("Дзвінки") {
-                            if session.state == .idle || session.state.isTerminal {
-                                CallHistoryView(store: callHistory, accountID: accountStore.activeAccountID, runtime: runtime)
-                            }
-                            else { ActiveCallView(session: session) }
-                        }
-                        NavigationLink("Контакти") { WatchContactsView(messageStore: messages, runtime: runtime) }
-                        NavigationLink("Набрати номер") { WatchDialEntry(messageStore: messages, runtime: runtime) }
-                        NavigationLink("Акаунт") {
-                            List {
-                                WatchAccountLinkView(store: accountStore)
-                                Text("Нові захищені дзвінки — E2EE protocol 2. Legacy protocol 1 не є E2EE.").font(.caption)
-                                CallKeyChangeWarningsView(accountID: accountStore.activeAccountID)
-                                #if DEBUG
-                                NavigationLink("Developer diagnostics") { WatchRootView(session: session) }
-                                #endif
-                            }
-                        }
-                    }
-                    .navigationTitle("WiFi Secure Call")
+                    CallKeyChangeWarningsView(accountID: accountStore.activeAccountID)
+                    #if DEBUG
+                    NavigationLink("Developer diagnostics") { WatchRootView(session: session) }
+                    #endif
                 }
             }
         }
-        .onAppear { routeIfPossible() }
-        .onReceive(navigation.$pendingConversation) { _ in routeIfPossible() }
-        .onChange(of: messages.conversations) { _ in routeIfPossible() }
-    }
-
-    private func routeIfPossible() {
-        guard let route = navigation.pendingConversation,
-              route.accountID == messages.activeAccountID,
-              let conversation = messages.conversations.first(where: { $0.id == route.conversationID }) else { return }
-        routedConversation = conversation
-        routedAccountID = route.accountID
-        showsRoutedConversation = true
-        _ = navigation.consumeConversation()
+        .navigationTitle("Меню")
     }
 }
 

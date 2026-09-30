@@ -86,6 +86,7 @@ final class CallSession: ObservableObject {
     private var callKit: CallKitHandling?
     private var generation: CallGeneration?
     private var mediaEpoch: UUID?
+    private var pendingPeerReadyEpochs: Set<UUID> = []
     private var mediaToken: String?
     private var createRequestID: UUID?
     private var acceptRequestID: UUID?
@@ -388,7 +389,17 @@ final class CallSession: ObservableObject {
         guard isCurrent(current), Date() < deadline else { throw CallKitCoordinatorError.actionTimedOut }
         let callSignaling = try signaling(for: current)
         let requestID = acceptRequestID ?? UUID(); acceptRequestID = requestID
-        let response = try await callSignaling.mutate(.accept, callID: current.serverCallID, requestID: requestID)
+        let response: CallSignalView
+        do {
+            response = try await callSignaling.mutate(.accept, callID: current.serverCallID, requestID: requestID)
+        } catch let CallSignalingError.postCommitValidation(callID, state, mutationApplied, _) where callID == current.serverCallID && state == .accepted {
+            serverCallAccepted = true
+            terminalRequestID = terminalRequestID ?? UUID()
+            registerTerminalCompensation(current, mutation: .end, signaling: callSignaling)
+            await deliverTerminalCompensation(current)
+            recordRuntimeDiagnostic("accepted_media_validation_failed", status: mutationApplied == false ? "reconciled" : "committed", callID: current.serverCallID)
+            throw CallFailure.invalidServerState
+        }
         guard isCurrent(current) else {
             if response.state == .accepted, !response.answeredElsewhere, response.mediaToken?.isEmpty == false { registerTerminalCompensation(current, mutation: .end, signaling: callSignaling, requestID: UUID()); await deliverTerminalCompensation(current) }
             throw CancellationError()
@@ -586,7 +597,8 @@ final class CallSession: ObservableObject {
                 guard self.isCurrent(current) else { await self.media.close(connectionID: epoch); return }
                 self.mediaEpoch = epoch
                 self.startPlayout(current, mediaEpoch: epoch)
-                self.beginPeerWatchdog(current, mediaEpoch: epoch)
+                if self.pendingPeerReadyEpochs.remove(epoch) != nil { self.peerReady(callID: current.serverCallID, mediaEpoch: epoch) }
+                else { self.beginPeerWatchdog(current, mediaEpoch: epoch) }
             } catch {
                 guard self.isCurrent(current) else { return }
                 await self.fail(current, (error as? CallFailure) == .audioFailed ? .audioFailed : .mediaConnectionFailed)
@@ -595,7 +607,11 @@ final class CallSession: ObservableObject {
     }
 
     private func peerReady(callID: UUID, mediaEpoch: UUID) {
-        guard let current = generation, current.serverCallID == callID, self.mediaEpoch == mediaEpoch else { return }
+        guard let current = generation, current.serverCallID == callID else { return }
+        guard self.mediaEpoch == mediaEpoch else {
+            if self.mediaEpoch == nil { pendingPeerReadyEpochs.insert(mediaEpoch) }
+            return
+        }
         peerWatchdog?.cancel()
         transportActive = true
         suppressedSystemEndDuringAcceptance = false
@@ -617,6 +633,18 @@ final class CallSession: ObservableObject {
     private func mediaDisconnected(_ event: MediaDisconnect) {
         guard let current = generation, current.serverCallID == event.callID, mediaEpoch == event.connectionID, state.isAcceptedLifecycle, let token = mediaToken else { return }
         mediaEpoch = nil; transportActive = false; audioOperational = false; audioFlowWatchdog?.cancel(); playout.stop()
+        if event.reason == .authFailed || event.reason == .protocolViolation {
+            spawn { [weak self] in guard let self, self.isCurrent(current) else { return }; await self.fail(current, .invalidServerState) }
+            return
+        }
+        if event.reason == .remoteClosed {
+            spawn { [weak self] in
+                guard let self, self.isCurrent(current) else { return }
+                do { await self.remoteTerminal(try await self.signaling(for: current).call(current.serverCallID), generation: current) }
+                catch { await self.fail(current, .networkLost) }
+            }
+            return
+        }
         transition(.reconnecting(current.serverCallID))
         reconnectTask?.cancel()
         reconnectTask = Task { [weak self] in
@@ -628,7 +656,10 @@ final class CallSession: ObservableObject {
                 do {
                     let epoch = try await self.media.connect(callID: current.serverCallID, peer: try self.signaling(for: current).mediaPeerIdentity, token: token)
                     guard self.isCurrent(current) else { await self.media.close(connectionID: epoch); return }
-                    self.mediaEpoch = epoch; self.startPlayout(current, mediaEpoch: epoch); self.beginPeerWatchdog(current, mediaEpoch: epoch); return
+                    self.mediaEpoch = epoch; self.startPlayout(current, mediaEpoch: epoch)
+                    if self.pendingPeerReadyEpochs.remove(epoch) != nil { self.peerReady(callID: current.serverCallID, mediaEpoch: epoch) }
+                    else { self.beginPeerWatchdog(current, mediaEpoch: epoch) }
+                    return
                 } catch { delay = min(delay * 2, 2) }
             }
             guard self.isCurrent(current) else { return }
@@ -893,7 +924,7 @@ final class CallSession: ObservableObject {
     private func teardownLocal(_ current: CallGeneration, finalState: CallState, reportReason: CallEndReason?) async {
         guard isCurrent(current) else { return }
         cancelCallTasks()
-        let epoch = mediaEpoch; mediaEpoch = nil
+        let epoch = mediaEpoch; mediaEpoch = nil; pendingPeerReadyEpochs.removeAll(keepingCapacity: false)
         playout.stop(); audio.stop(); isMuted = false; audioStartedForCallKitUUID = nil; activatedCallKitUUID = nil; transportActive = false; audioOperational = false
         if let epoch { await media.close(connectionID: epoch) }
         guard isCurrent(current) else { return }
@@ -930,7 +961,7 @@ final class CallSession: ObservableObject {
         audio.onFailure = { value in events?.yield(.audioFailure(next.id, value)) }
         audio.onMuteChanged = { value in events?.yield(.muteChanged(next.id, value)) }
         callAudioCryptor?.erase(); callAudioCryptor = nil
-        mediaToken = nil; mediaEpoch = nil; createRequestID = nil; acceptRequestID = nil; terminalRequestID = nil; terminalMutation = nil
+        mediaToken = nil; mediaEpoch = nil; pendingPeerReadyEpochs.removeAll(keepingCapacity: false); createRequestID = nil; acceptRequestID = nil; terminalRequestID = nil; terminalMutation = nil
         activatedCallKitUUID = nil; audioStartedForCallKitUUID = nil; serverCallCreated = false; serverCallAccepted = false; suppressedSystemEndDuringAcceptance = false; sequence = 0; isMuted = false; elapsedSeconds = 0
         firstSentFrameReported = false; firstRemoteFrameReported = false; firstSendFailureReported = false
         transportActive = false; audioOperational = false; audioFlow = AudioFlowMilestones(); audioRecoveryBudget = AudioRecoveryBudget()
