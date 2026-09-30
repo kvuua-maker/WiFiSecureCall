@@ -25,10 +25,13 @@ struct RecipientSearchOperationGate {
 enum RecipientQueryNormalization {
     static func normalize(_ input: String) -> String {
         let trimmed = input.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard trimmed.hasPrefix("+") else { return trimmed }
-        let digits = trimmed.dropFirst().filter { $0.isNumber }
+        let international = trimmed.hasPrefix("+") || trimmed.hasPrefix("00")
+        guard international else { return trimmed }
+        let prefixCount = trimmed.hasPrefix("00") ? 2 : 1
+        let suffix = trimmed.dropFirst(prefixCount)
+        let digits = suffix.filter { $0.isNumber }
         guard !digits.isEmpty,
-              trimmed.dropFirst().allSatisfy({ $0.isNumber || " -().".contains($0) }) else { return trimmed }
+              suffix.allSatisfy({ $0.isNumber || " -().".contains($0) }) else { return trimmed }
         return "+" + digits
     }
 }
@@ -56,16 +59,6 @@ struct RecipientSearchView: View {
 
     var body: some View {
         Form {
-            NavigationLink(
-                destination: Group {
-                    if let createdConversation, let createdConversationAccountID {
-                        ConversationView(store: messageStore, conversation: createdConversation, accountID: createdConversationAccountID)
-                    }
-                    else { EmptyView() }
-                },
-                isActive: $showCreatedConversation,
-                label: { EmptyView() }
-            )
             if accounts.count > 1 {
                 Picker("Від акаунта", selection: $selectedAccountID) {
                     ForEach(accounts) { account in Text(account.displayLabel).tag(Optional(account.accountID)) }
@@ -90,6 +83,11 @@ struct RecipientSearchView: View {
                             .disabled(state == .loading)
                     }
                 }
+            }
+        }
+        .sheet(isPresented: $showCreatedConversation) {
+            if let createdConversation, let createdConversationAccountID {
+                NavigationView { ConversationView(store: messageStore, conversation: createdConversation, accountID: createdConversationAccountID) }
             }
         }
         .navigationTitle("Контакти")

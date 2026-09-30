@@ -10,12 +10,24 @@ struct ConversationView: View {
     @State private var approvingDeviceID: UUID?
     @State private var pendingApproval: E2EEKeyChangeWarning?
     @State private var showsApprovalConfirmation = false
+    @State private var loadingOlder = false
 
     var body: some View {
         VStack(spacing: 8) {
             ScrollViewReader { proxy in
                 ScrollView {
                     LazyVStack(alignment: .leading, spacing: 8) {
+                        if store.hasOlderMessages(conversationID: conversation.id, accountID: accountID) {
+                            Button(loadingOlder ? "Завантаження…" : "Раніші повідомлення") {
+                                let anchor = store.messages(conversationID: conversation.id, accountID: accountID).first?.id
+                                loadingOlder = true
+                                Task {
+                                    _ = await store.loadMessages(conversationID: conversation.id, accountID: accountID, append: true, reportsLoading: false)
+                                    loadingOlder = false
+                                    if let anchor { proxy.scrollTo(anchor, anchor: .top) }
+                                }
+                            }.disabled(loadingOlder)
+                        }
                         ForEach(store.messages(conversationID: conversation.id, accountID: accountID)) { message in
                             HStack {
                                 if message.isSentByCurrentUser { Spacer(minLength: 32) }
@@ -37,6 +49,7 @@ struct ConversationView: View {
                     .padding(.horizontal)
                 }
                 .onChange(of: store.messages(conversationID: conversation.id, accountID: accountID).count) { _ in
+                    guard !loadingOlder else { return }
                     if let last = store.messages(conversationID: conversation.id, accountID: accountID).last {
                         proxy.scrollTo(last.id, anchor: .bottom)
                     }

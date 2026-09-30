@@ -1,6 +1,62 @@
 import CryptoKit
 import Foundation
 
+actor AccountE2EEContext {
+    static let shared = AccountE2EEContext()
+    private struct Timed<T> { let value: T; let expires: Date }
+    private var profiles: [String: Timed<UserProfile>] = [:]
+    private var bundles: [String: Timed<[E2EEPublicDeviceBundle]>] = [:]
+    private var profileTasks: [String: Task<UserProfile, Error>] = [:]
+    private var bundleTasks: [String: Task<[E2EEPublicDeviceBundle], Error>] = [:]
+    private var registrations = Set<String>()
+    private var registrationTasks: [String: Task<Void, Error>] = [:]
+
+    func profile(client: AccountAPIClient, accountID: UUID) async throws -> UserProfile {
+        let key = cacheKey(client: client, accountID: accountID)
+        if let cached = profiles[key], cached.expires > Date() { return cached.value }
+        if let task = profileTasks[key] { return try await task.value }
+        let task = Task { try await client.userProfile(accountID: accountID) }
+        profileTasks[key] = task
+        defer { profileTasks.removeValue(forKey: key) }
+        let value = try await task.value
+        profiles[key] = .init(value: value, expires: Date().addingTimeInterval(30))
+        return value
+    }
+
+    func ensureRegistered(client: AccountAPIClient, accountID: UUID, identity: E2EEDeviceIdentity) async throws {
+        let key = "\(cacheKey(client: client, accountID: accountID)):\(identity.deviceID.uuidString):\(identity.keyVersion):\(identity.publicBundle.fingerprint)"
+        guard !registrations.contains(key) else { return }
+        if let task = registrationTasks[key] { return try await task.value }
+        let task = Task { _ = try await client.registerDeviceKey(accountID: accountID, request: identity.registration(requestID: UUID())) }
+        registrationTasks[key] = task
+        defer { registrationTasks.removeValue(forKey: key) }
+        try await task.value
+        registrations.insert(key)
+    }
+
+    func deviceKeys(client: AccountAPIClient, accountID: UUID, userID: UUID) async throws -> [E2EEPublicDeviceBundle] {
+        let key = "\(cacheKey(client: client, accountID: accountID)):\(userID.uuidString)"
+        if let cached = bundles[key], cached.expires > Date() { return cached.value }
+        if let task = bundleTasks[key] { return try await task.value }
+        let task = Task { try await client.deviceKeys(accountID: accountID, userID: userID) }
+        bundleTasks[key] = task
+        defer { bundleTasks.removeValue(forKey: key) }
+        let value = try await task.value
+        bundles[key] = .init(value: value, expires: Date().addingTimeInterval(15))
+        return value
+    }
+
+    func invalidate(accountID: UUID) {
+        profiles = profiles.filter { !$0.key.hasSuffix(":" + accountID.uuidString) }
+        bundles = bundles.filter { !$0.key.contains(":" + accountID.uuidString + ":") }
+        registrations = registrations.filter { !$0.contains(":" + accountID.uuidString + ":") }
+    }
+
+    private func cacheKey(client: AccountAPIClient, accountID: UUID) -> String {
+        "\(ObjectIdentifier(client).hashValue):\(accountID.uuidString)"
+    }
+}
+
 enum CallPartySide: String, Codable, Sendable { case caller, callee }
 
 struct CallSignalView: Sendable, Equatable {
@@ -45,6 +101,7 @@ protocol CallSignaling: Sendable {
     var requiresIncomingReconciliation: Bool { get }
     func create(callID: UUID, requestID: UUID) async throws -> CallSignalView
     func call(_ id: UUID) async throws -> CallSignalView
+    func rawCall(_ id: UUID) async throws -> CallSignalView
     func mutate(_ action: CallMutation, callID: UUID, requestID: UUID) async throws -> CallSignalView
     func eraseSecrets()
 }
@@ -55,6 +112,7 @@ extension CallSignaling {
     var historyPeerDisplayName: String? { incomingCallerName }
     var historyTargetUserID: UUID? { nil }
     var requiresIncomingReconciliation: Bool { false }
+    func rawCall(_ id: UUID) async throws -> CallSignalView { try await call(id) }
     func eraseSecrets() {}
 }
 
@@ -92,6 +150,7 @@ final class AccountCallSignaling: CallSignaling, @unchecked Sendable {
     var mediaPeerIdentity: MediaPeerIdentity { lock.wscLocked { secureMode } ? .secureAccount(localSide) : .account(localSide) }
     var historyAccountID: UUID? { accountID }
     var historyPeerDisplayName: String? { "Зв’язаний пристрій" }
+    var requiresIncomingReconciliation: Bool { true }
 
     init(client: AccountAPIClient, accountID: UUID, targetDeviceID: UUID? = nil, localSide: CallPartySide, identityStore: E2EEIdentityStore = E2EEIdentityStore(), pinStore: E2EEIdentityPinStore = E2EEIdentityPinStore()) {
         self.client = client
@@ -109,6 +168,7 @@ final class AccountCallSignaling: CallSignaling, @unchecked Sendable {
         return try await map(await client.createCall(accountID: accountID, callID: callID, requestID: requestID, targetDeviceID: targetDeviceID, callerKeyPackage: package), expectedCallID: callID)
     }
     func call(_ id: UUID) async throws -> CallSignalView { try await map(await client.call(accountID: accountID, callID: id), expectedCallID: id) }
+    func rawCall(_ id: UUID) async throws -> CallSignalView { try rawMap(await client.call(accountID: accountID, callID: id), expectedCallID: id) }
     func mutate(_ action: CallMutation, callID: UUID, requestID: UUID) async throws -> CallSignalView {
         var package: E2EECallKeyPackage?
         if action == .accept {
@@ -126,6 +186,7 @@ final class AccountCallSignaling: CallSignaling, @unchecked Sendable {
     }
     private func map(_ response: AccountCallResponse, expectedCallID: UUID) async throws -> CallSignalView {
         guard response.callID == expectedCallID, response.localSide == localSide else { throw CallSignalingError.invalidResponse }
+        if response.state != .ringing && response.state != .accepted { return try rawMap(response, expectedCallID: expectedCallID) }
         let hasKeys = response.callerKeyPackage != nil || response.calleeKeyPackage != nil
         let requiresSecureProtocol = lock.wscLocked { secureMode } || hasKeys
         if requiresSecureProtocol { lock.wscLocked { secureMode = true } }
@@ -135,7 +196,7 @@ final class AccountCallSignaling: CallSignaling, @unchecked Sendable {
                   let callerUserID = response.callerUserID, let callerDeviceID = response.callerDeviceID,
                   let calleeUserID = response.calleeUserID, let calleeDeviceID = response.calleeDeviceID,
                   callerUserID == calleeUserID else { throw CallSignalingError.invalidResponse }
-            let profile = try await client.userProfile(accountID: accountID)
+            let profile = try await AccountE2EEContext.shared.profile(client: client, accountID: accountID)
             let identity = try identityStore.identity()
             guard profile.userID == callerUserID,
                   (localSide == .caller ? callerDeviceID : calleeDeviceID) == identity.deviceID,
@@ -156,12 +217,17 @@ final class AccountCallSignaling: CallSignaling, @unchecked Sendable {
         return CallSignalView(callID: response.callID, localSide: response.localSide, state: response.state, expiresAt: response.expiresAt, mediaToken: response.mediaToken, ringExpiresAt: response.ringExpiresAt, acceptedAt: response.acceptedAt, terminalAt: response.terminalAt, terminalReason: response.terminalReason, deliveryStatus: response.deliveryStatus, peerReady: response.peerReady, createdNew: response.createdNew, mutationApplied: response.mutationApplied, audioKeys: audioKeys)
     }
 
+    private func rawMap(_ response: AccountCallResponse, expectedCallID: UUID) throws -> CallSignalView {
+        guard response.callID == expectedCallID, response.localSide == localSide else { throw CallSignalingError.invalidResponse }
+        return CallSignalView(callID: response.callID, localSide: response.localSide, state: response.state, expiresAt: response.expiresAt, mediaToken: response.state == .accepted ? response.mediaToken : nil, ringExpiresAt: response.ringExpiresAt, acceptedAt: response.acceptedAt, terminalAt: response.terminalAt, terminalReason: response.terminalReason, deliveryStatus: response.deliveryStatus, peerReady: response.peerReady, createdNew: response.createdNew, mutationApplied: response.mutationApplied)
+    }
+
     func eraseSecrets() { lock.wscLocked { ephemeralByCall.removeAll(keepingCapacity: false); secureMode = false } }
 
     private func localPackage(callID: UUID, side: CallPartySide) async throws -> E2EECallKeyPackage {
-        let profile = try await client.userProfile(accountID: accountID)
+        let profile = try await AccountE2EEContext.shared.profile(client: client, accountID: accountID)
         let identity = try identityStore.identity()
-        _ = try await client.registerDeviceKey(accountID: accountID, request: identity.registration(requestID: UUID()))
+        try await AccountE2EEContext.shared.ensureRegistered(client: client, accountID: accountID, identity: identity)
         let ephemeral = lock.wscLocked { () -> Curve25519.KeyAgreement.PrivateKey in
             if let value = ephemeralByCall[callID] { return value }
             let value = Curve25519.KeyAgreement.PrivateKey(); ephemeralByCall[callID] = value; return value
@@ -170,9 +236,16 @@ final class AccountCallSignaling: CallSignaling, @unchecked Sendable {
     }
 
     private func verify(_ package: E2EECallKeyPackage, expectedCallID: UUID, expectedSide: CallPartySide, expectedUserID: UUID, expectedDeviceID: UUID) async throws {
-        let bundles = try await client.deviceKeys(accountID: accountID, userID: expectedUserID)
+        let bundles = try await AccountE2EEContext.shared.deviceKeys(client: client, accountID: accountID, userID: expectedUserID)
         guard let bundle = bundles.first(where: { $0.deviceID == expectedDeviceID }) else { throw E2EEKeyAgreementError.invalidIdentity }
-        guard try pinStore.evaluate(userID: expectedUserID, bundle: bundle, accountID: accountID) != .keyChanged else { throw E2EEKeyAgreementError.keyChanged }
+        let pinned = try pinStore.pinnedBundle(userID: expectedUserID, deviceID: bundle.deviceID, accountID: accountID)
+        guard try pinStore.evaluate(userID: expectedUserID, bundle: bundle, accountID: accountID) != .keyChanged else {
+            if let pinned {
+                await E2EEKeyChangeRegistry.shared.record(.init(accountID: accountID, userID: expectedUserID, deviceID: bundle.deviceID, pinnedFingerprint: pinned.fingerprint, observedFingerprint: bundle.fingerprint, observedBundle: bundle))
+            }
+            throw E2EEKeyAgreementError.keyChanged
+        }
+        await E2EEKeyChangeRegistry.shared.clear(accountID: accountID, userID: expectedUserID, deviceID: bundle.deviceID)
         try E2EECallKeyAgreement.verify(package, identity: bundle, expectedCallID: expectedCallID, expectedSide: expectedSide, expectedUserID: expectedUserID, expectedDeviceID: expectedDeviceID)
     }
 }
@@ -222,6 +295,7 @@ final class CrossUserCallSignaling: CallSignaling, @unchecked Sendable {
     func call(_ id: UUID) async throws -> CallSignalView {
         try await map(await client.userCall(accountID: accountID, callID: id), expectedCallID: id)
     }
+    func rawCall(_ id: UUID) async throws -> CallSignalView { try rawMap(await client.userCall(accountID: accountID, callID: id), expectedCallID: id) }
 
     func mutate(_ action: CallMutation, callID: UUID, requestID: UUID) async throws -> CallSignalView {
         let package = action == .accept ? try await localPackage(callID: callID, side: .callee) : nil
@@ -239,6 +313,7 @@ final class CrossUserCallSignaling: CallSignaling, @unchecked Sendable {
         guard response.callID == expectedCallID, response.localSide == localSide else { throw CallSignalingError.invalidResponse }
         let answeredElsewhere = response.legState == .answeredElsewhere
         let callerName = response.caller?.callKitName ?? pushedCallerIdentity?.callKitName
+        if response.state != .ringing && response.state != .accepted { return try rawMap(response, expectedCallID: expectedCallID) }
         var audioKeys: CallAudioKeys?
         let hasKeyMaterial = response.callerKeyPackage != nil || response.calleeKeyPackage != nil
         let expectedIdentities = hasKeyMaterial ? try await authoritativeIdentities(response, answeredElsewhere: answeredElsewhere) : nil
@@ -276,12 +351,18 @@ final class CrossUserCallSignaling: CallSignaling, @unchecked Sendable {
         )
     }
 
+    private func rawMap(_ response: CrossUserCallResponse, expectedCallID: UUID) throws -> CallSignalView {
+        guard response.callID == expectedCallID, response.localSide == localSide else { throw CallSignalingError.invalidResponse }
+        let elsewhere = response.legState == .answeredElsewhere
+        return CallSignalView(callID: response.callID, localSide: response.localSide, state: response.state, expiresAt: response.expiresAt, mediaToken: response.state == .accepted && !elsewhere ? response.mediaToken : nil, ringExpiresAt: response.ringExpiresAt, acceptedAt: response.acceptedAt, terminalAt: response.terminalAt, terminalReason: response.terminalReason, deliveryStatus: response.deliveryStatus, peerReady: response.peerReady, createdNew: response.createdNew, mutationApplied: response.mutationApplied, answeredElsewhere: elsewhere, incomingCallerName: response.caller?.callKitName ?? pushedCallerIdentity?.callKitName)
+    }
+
     func eraseSecrets() { lock.wscLocked { ephemeralByCall.removeAll(keepingCapacity: false) } }
 
     private func localPackage(callID: UUID, side: CallPartySide) async throws -> E2EECallKeyPackage {
-        let profile = try await client.userProfile(accountID: accountID)
+        let profile = try await AccountE2EEContext.shared.profile(client: client, accountID: accountID)
         let identity = try identityStore.identity()
-        _ = try await client.registerDeviceKey(accountID: accountID, request: identity.registration(requestID: UUID()))
+        try await AccountE2EEContext.shared.ensureRegistered(client: client, accountID: accountID, identity: identity)
         let ephemeral = lock.wscLocked { () -> Curve25519.KeyAgreement.PrivateKey in
             if let value = ephemeralByCall[callID] { return value }
             let value = Curve25519.KeyAgreement.PrivateKey(); ephemeralByCall[callID] = value; return value
@@ -295,7 +376,7 @@ final class CrossUserCallSignaling: CallSignaling, @unchecked Sendable {
               let calleeUserID = response.calleeUserID else {
             throw CallSignalingError.invalidResponse
         }
-        let profile = try await client.userProfile(accountID: accountID)
+        let profile = try await AccountE2EEContext.shared.profile(client: client, accountID: accountID)
         let localIdentity = try identityStore.identity()
         if localSide == .caller {
             guard callerUserID == profile.userID, callerDeviceID == localIdentity.deviceID,
@@ -323,7 +404,7 @@ final class CrossUserCallSignaling: CallSignaling, @unchecked Sendable {
         expectedUserID: UUID,
         expectedDeviceID: UUID
     ) async throws {
-        let bundles = try await client.deviceKeys(accountID: accountID, userID: expectedUserID)
+        let bundles = try await AccountE2EEContext.shared.deviceKeys(client: client, accountID: accountID, userID: expectedUserID)
         guard let bundle = bundles.first(where: { $0.deviceID == package.deviceID }) else { throw E2EEKeyAgreementError.invalidIdentity }
         let pinned = try pinStore.pinnedBundle(userID: expectedUserID, deviceID: bundle.deviceID, accountID: accountID)
         guard try pinStore.evaluate(userID: expectedUserID, bundle: bundle, accountID: accountID) != .keyChanged else {

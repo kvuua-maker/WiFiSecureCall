@@ -74,7 +74,7 @@ struct ConversationListView: View {
             NavigationLink { RecipientSearchView(messageStore: store, runtime: runtime) } label: { Image(systemName: "square.and.pencil") }
                 .accessibilityLabel("Новий чат")
         }
-        .task { await store.refresh() }
+        .task(id: store.activeAccountID) { await store.refresh() }
         .onReceive(navigation.$pendingConversation) { _ in routeIfPossible() }
         .onChange(of: store.conversations) { _ in routeIfPossible() }
         .overlay { if store.state == .loading { ProgressView().accessibilityLabel("Loading secure conversations") } }

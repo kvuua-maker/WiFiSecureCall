@@ -15,6 +15,8 @@ final class LocalContactsStore: ObservableObject {
     private let store = CNContactStore()
     private let generationStore = LocalContactGenerationStore()
     private var observer: NSObjectProtocol?
+    private var refreshGeneration: UInt64 = 0
+    private let fetchQueue = DispatchQueue(label: "com.vkapps.wifisecurecall.contacts", qos: .userInitiated)
 
     init(notificationCenter: NotificationCenter = .default) {
         observer = notificationCenter.addObserver(forName: .CNContactStoreDidChange, object: nil, queue: .main) { [weak self] _ in
@@ -43,6 +45,8 @@ final class LocalContactsStore: ObservableObject {
     }
 
     func refreshAuthorizationAndContacts() {
+        refreshGeneration &+= 1
+        let operation = refreshGeneration
         authorizationStatus = CNContactStore.authorizationStatus(for: .contacts)
         guard hasReadableAuthorization else {
             contacts = []
@@ -51,11 +55,13 @@ final class LocalContactsStore: ObservableObject {
             ContactsToWatchSync.shared.publishCleared(generation: generationStore.next())
             return
         }
+        let contactStore = store
+        fetchQueue.async { [weak self] in
         do {
             let keys: [CNKeyDescriptor] = [CNContactGivenNameKey as NSString, CNContactFamilyNameKey as NSString, CNContactPhoneNumbersKey as NSString]
             let request = CNContactFetchRequest(keysToFetch: keys)
             var loaded: [LocalContactEntry] = []
-            try store.enumerateContacts(with: request) { contact, _ in
+            try contactStore.enumerateContacts(with: request) { contact, _ in
                 let numbers = contact.phoneNumbers.enumerated().compactMap { index, labeled -> LocalContactNumber? in
                     let display = labeled.value.stringValue
                     guard let normalized = LocalPhoneNumberNormalizer.normalize(display) else { return nil }
@@ -65,16 +71,22 @@ final class LocalContactsStore: ObservableObject {
                 let name = [contact.givenName, contact.familyName].filter { !$0.isEmpty }.joined(separator: " ")
                 loaded.append(.init(id: contact.identifier, name: name.isEmpty ? "Без імені" : name, numbers: numbers))
             }
-            contacts = loaded.sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
-            let snapshot = LocalContactSnapshot(generation: generationStore.next(), contacts: contacts)
-            updatedAt = snapshot.updatedAt
-            errorMessage = nil
-            ContactsToWatchSync.shared.publish(snapshot)
+            let sorted = loaded.sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
+            Task { @MainActor [weak self] in
+                guard let self, self.refreshGeneration == operation, self.hasReadableAuthorization else { return }
+                self.contacts = sorted
+                let snapshot = LocalContactSnapshot(generation: self.generationStore.next(), contacts: sorted)
+                self.updatedAt = snapshot.updatedAt; self.errorMessage = nil
+                ContactsToWatchSync.shared.publish(snapshot)
+            }
         } catch {
-            contacts = []
-            updatedAt = nil
-            errorMessage = "Не вдалося прочитати контакти. Доступний ручний пошук."
-            ContactsToWatchSync.shared.publishCleared(generation: generationStore.next())
+            Task { @MainActor [weak self] in
+                guard let self, self.refreshGeneration == operation else { return }
+                self.contacts = []; self.updatedAt = nil
+                self.errorMessage = "Не вдалося прочитати контакти. Доступний ручний пошук."
+                ContactsToWatchSync.shared.publishCleared(generation: self.generationStore.next())
+            }
+        }
         }
     }
 }

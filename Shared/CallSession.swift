@@ -364,7 +364,16 @@ final class CallSession: ObservableObject {
         let response: CallSignalView
         recordRuntimeDiagnostic("server_call_create_started", status: "started", callID: current.serverCallID)
         do { response = try await callSignaling.create(callID: current.serverCallID, requestID: requestID) }
-        catch { guard isCurrent(current) else { throw CancellationError() }; recordRuntimeDiagnostic("server_call_create_failed", status: "failed", callID: current.serverCallID, domain: (error as NSError).domain, code: (error as NSError).code); throw error }
+        catch {
+            guard isCurrent(current) else { throw CancellationError() }
+            if let reconciled = try? await callSignaling.rawCall(current.serverCallID), reconciled.state == .ringing || reconciled.state == .accepted {
+                serverCallCreated = true
+                let mutation: CallMutation = reconciled.state == .accepted ? .end : .cancel
+                registerTerminalCompensation(current, mutation: mutation, signaling: callSignaling, requestID: UUID())
+                await deliverTerminalCompensation(current)
+            }
+            recordRuntimeDiagnostic("server_call_create_failed", status: "failed", callID: current.serverCallID, domain: (error as NSError).domain, code: (error as NSError).code); throw error
+        }
         guard response.callID == current.serverCallID, response.localSide == .caller, response.state == .ringing else {
             throw CallKitCoordinatorError.invalidAction
         }
@@ -399,6 +408,17 @@ final class CallSession: ObservableObject {
             await deliverTerminalCompensation(current)
             recordRuntimeDiagnostic("accepted_media_validation_failed", status: mutationApplied == false ? "reconciled" : "committed", callID: current.serverCallID)
             throw CallFailure.invalidServerState
+        } catch {
+            guard isCurrent(current) else { throw CancellationError() }
+            if let reconciled = try? await callSignaling.rawCall(current.serverCallID) {
+                let mutation: CallMutation
+                if reconciled.state == .accepted { serverCallAccepted = true; mutation = .end }
+                else if reconciled.state == .ringing { mutation = .reject }
+                else { throw error }
+                registerTerminalCompensation(current, mutation: mutation, signaling: callSignaling, requestID: UUID())
+                await deliverTerminalCompensation(current)
+            }
+            throw error
         }
         guard isCurrent(current) else {
             if response.state == .accepted, !response.answeredElsewhere, response.mediaToken?.isEmpty == false { registerTerminalCompensation(current, mutation: .end, signaling: callSignaling, requestID: UUID()); await deliverTerminalCompensation(current) }
@@ -544,7 +564,7 @@ final class CallSession: ObservableObject {
             guard let self else { return }
             while !Task.isCancelled, self.isCurrent(current), Date() < ringExpiresAt {
                 do {
-                    let response = try await self.signaling(for: current).call(current.serverCallID)
+                    let response = try await self.signaling(for: current).rawCall(current.serverCallID)
                     guard self.isCurrent(current), response.callID == current.serverCallID else { return }
                     switch response.state {
                     case .accepted:
@@ -640,11 +660,20 @@ final class CallSession: ObservableObject {
         if event.reason == .remoteClosed {
             spawn { [weak self] in
                 guard let self, self.isCurrent(current) else { return }
-                do { await self.remoteTerminal(try await self.signaling(for: current).call(current.serverCallID), generation: current) }
+                do {
+                    let response = try await self.signaling(for: current).rawCall(current.serverCallID)
+                    if response.state == .accepted { self.startMediaReconnect(current, token: token) }
+                    else { await self.remoteTerminal(response, generation: current) }
+                }
                 catch { await self.fail(current, .networkLost) }
             }
             return
         }
+        startMediaReconnect(current, token: token)
+    }
+
+    private func startMediaReconnect(_ current: CallGeneration, token: String) {
+        guard isCurrent(current), state.isAcceptedLifecycle else { return }
         transition(.reconnecting(current.serverCallID))
         reconnectTask?.cancel()
         reconnectTask = Task { [weak self] in
@@ -753,9 +782,9 @@ final class CallSession: ObservableObject {
 
     private func startIncomingReconciliation(_ current: CallGeneration) {
         spawn { [weak self] in
-            guard let self else { return }
-            while !Task.isCancelled, self.isCurrent(current), case .incomingRinging = self.state {
+            while !Task.isCancelled {
                 do { try await Task.sleep(nanoseconds: 500_000_000) } catch { return }
+                guard let self else { return }
                 guard self.isCurrent(current), case .incomingRinging = self.state else { return }
                 do {
                     let response = try await self.signaling(for: current).call(current.serverCallID)
@@ -1026,6 +1055,12 @@ final class CallSession: ObservableObject {
             terminal = .failed
         }
         callHistory.finish(callHistoryRecordID, status: terminal)
+    }
+
+    deinit {
+        for task in tasks { task.cancel() }
+        mediaConnectTask?.cancel(); reconnectTask?.cancel(); durationTask?.cancel()
+        activationWatchdog?.cancel(); peerWatchdog?.cancel(); audioFlowWatchdog?.cancel(); terminalObserver?.cancel()
     }
 
     private func isCurrent(_ current: CallGeneration) -> Bool { generation == current }

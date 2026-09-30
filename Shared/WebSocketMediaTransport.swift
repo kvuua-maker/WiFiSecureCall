@@ -20,7 +20,7 @@ final class WebSocketMediaTransport: NSObject, MediaTransport, URLSessionWebSock
     private var heartbeatTask: Task<Void, Never>?
     private var connectionID: UUID?
     private var activeCallID: UUID?
-    private var openContinuation: CheckedContinuation<Void, Error>?
+    private var openWaiter: (epoch: UUID, continuation: CheckedContinuation<Void, Error>)?
     private var openedEpochs: Set<UUID> = []
     private var intentionalClose: Set<UUID> = []
     private var taskEpoch: [ObjectIdentifier: UUID] = [:]
@@ -46,6 +46,7 @@ final class WebSocketMediaTransport: NSObject, MediaTransport, URLSessionWebSock
         let epoch = UUID()
 
         let previous = replaceCurrent(with: socket, callID: callID, connectionID: epoch)
+        previous.2?.resume(throwing: CancellationError())
         previous.1?.cancel(); previous.0?.cancel(with: .goingAway, reason: nil)
         socket.resume()
         do {
@@ -79,13 +80,16 @@ final class WebSocketMediaTransport: NSObject, MediaTransport, URLSessionWebSock
     }
 
     func close(connectionID expected: UUID?) async {
-        let values: (URLSessionWebSocketTask?, Task<Void, Never>?, Task<Void, Never>?, UUID?) = lock.withLock {
-            guard expected == nil || connectionID == expected else { return (nil, nil, nil, nil) }
-            let values = (task, receiveTask, heartbeatTask, connectionID)
+        let values: (URLSessionWebSocketTask?, Task<Void, Never>?, Task<Void, Never>?, UUID?, CheckedContinuation<Void, Error>?) = lock.withLock {
+            guard expected == nil || connectionID == expected else { return (nil, nil, nil, nil, nil) }
+            let id = connectionID
+            let oldTask = task, oldReceive = receiveTask, oldHeartbeat = heartbeatTask
             if let id = connectionID { intentionalClose.insert(id); openedEpochs.remove(id) }
+            let open = connectionID.flatMap { takeOpenWaiterLocked(epoch: $0) }
             task = nil; receiveTask = nil; heartbeatTask = nil; connectionID = nil; activeCallID = nil
-            return values
+            return (oldTask, oldReceive, oldHeartbeat, id, open)
         }
+        values.4?.resume(throwing: CancellationError())
         values.1?.cancel(); values.2?.cancel()
         guard let socket = values.0, let id = values.3 else { return }
         await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
@@ -111,9 +115,9 @@ final class WebSocketMediaTransport: NSObject, MediaTransport, URLSessionWebSock
                 try await withTaskCancellationHandler {
                     try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
                         self.lock.withLock {
-                            guard self.connectionID == connectionID, self.task === socket else { continuation.resume(throwing: CancellationError()); return }
+                            guard !Task.isCancelled, self.connectionID == connectionID, self.task === socket else { continuation.resume(throwing: CancellationError()); return }
                             if self.openedEpochs.remove(connectionID) != nil { continuation.resume(returning: ()); return }
-                            self.openContinuation = continuation
+                            self.openWaiter = (connectionID, continuation)
                         }
                     }
                 } onCancel: { self.cancelOpen(connectionID) }
@@ -158,8 +162,7 @@ final class WebSocketMediaTransport: NSObject, MediaTransport, URLSessionWebSock
     nonisolated func urlSession(_ session: URLSession, webSocketTask: URLSessionWebSocketTask, didOpenWithProtocol protocol: String?) {
         let continuation = lock.withLock { () -> CheckedContinuation<Void, Error>? in
             guard task === webSocketTask, let epoch = taskEpoch[ObjectIdentifier(webSocketTask)] else { return nil }
-            let value = openContinuation
-            openContinuation = nil
+            let value = takeOpenWaiterLocked(epoch: epoch)
             if value == nil { openedEpochs.insert(epoch) }
             return value
         }
@@ -167,32 +170,45 @@ final class WebSocketMediaTransport: NSObject, MediaTransport, URLSessionWebSock
     }
 
     nonisolated func urlSession(_ session: URLSession, webSocketTask: URLSessionWebSocketTask, didCloseWith closeCode: URLSessionWebSocketTask.CloseCode, reason: Data?) {
-        let values = lock.withLock { () -> (UUID?, UUID?, Bool, CheckedContinuation<Void, Never>?) in
+        let values = lock.withLock { () -> (UUID?, UUID?, Bool, CheckedContinuation<Void, Never>?, CheckedContinuation<Void, Error>?) in
             let key = ObjectIdentifier(webSocketTask)
             let epoch = taskEpoch.removeValue(forKey: key)
             let callID = epoch.flatMap { epochCallID.removeValue(forKey: $0) }
             let intentional = epoch.map { intentionalClose.remove($0) != nil } ?? false
             let waiter = epoch.flatMap { closeWaiters.removeValue(forKey: $0) }
+            let open = epoch.flatMap { takeOpenWaiterLocked(epoch: $0) }
             if task === webSocketTask { task = nil; receiveTask = nil; heartbeatTask = nil; connectionID = nil; activeCallID = nil }
-            return (epoch, callID, intentional, waiter)
+            return (epoch, callID, intentional, waiter, open)
         }
         values.3?.resume()
+        values.4?.resume(throwing: CallFailure.mediaConnectionFailed)
         if let epoch = values.0, let callID = values.1, !values.2 { onDisconnect?(.init(callID: callID, connectionID: epoch, closeCode: closeCode.rawValue, reason: classify(closeCode))) }
     }
 
-    private func replaceCurrent(with socket: URLSessionWebSocketTask, callID: UUID, connectionID: UUID) -> (URLSessionWebSocketTask?, Task<Void, Never>?) {
+    private func replaceCurrent(with socket: URLSessionWebSocketTask, callID: UUID, connectionID: UUID) -> (URLSessionWebSocketTask?, Task<Void, Never>?, CheckedContinuation<Void, Error>?) {
         lock.withLock {
-            let previous = (task, receiveTask)
+            let previousTask = task, previousReceive = receiveTask
             if let old = self.connectionID { intentionalClose.insert(old); openedEpochs.remove(old) }
-            openContinuation?.resume(throwing: CancellationError()); openContinuation = nil
+            let previousWaiter = self.connectionID.flatMap { takeOpenWaiterLocked(epoch: $0) }
             task = socket; activeCallID = callID; self.connectionID = connectionID
             taskEpoch[ObjectIdentifier(socket)] = connectionID; epochCallID[connectionID] = callID
             receiveTask = nil; heartbeatTask?.cancel(); heartbeatTask = nil
-            return previous
+            return (previousTask, previousReceive, previousWaiter)
         }
     }
-    private func cancelOpen(_ expected: UUID) { let value = lock.withLock { () -> CheckedContinuation<Void, Error>? in guard connectionID == expected else { return nil }; let result = openContinuation; openContinuation = nil; return result }; value?.resume(throwing: CancellationError()) }
-    private func clearIfCurrent(_ expected: UUID) { lock.withLock { guard connectionID == expected else { return }; openedEpochs.remove(expected); task = nil; receiveTask = nil; heartbeatTask?.cancel(); heartbeatTask = nil; connectionID = nil; activeCallID = nil } }
+    private func cancelOpen(_ expected: UUID) { let value = lock.withLock { takeOpenWaiterLocked(epoch: expected) }; value?.resume(throwing: CancellationError()) }
+    private func clearIfCurrent(_ expected: UUID) {
+        let waiter = lock.withLock { () -> CheckedContinuation<Void, Error>? in
+            guard connectionID == expected else { return takeOpenWaiterLocked(epoch: expected) }
+            openedEpochs.remove(expected); task = nil; receiveTask = nil; heartbeatTask?.cancel(); heartbeatTask = nil; connectionID = nil; activeCallID = nil
+            return takeOpenWaiterLocked(epoch: expected)
+        }
+        waiter?.resume(throwing: CallFailure.mediaConnectionFailed)
+    }
+    private func takeOpenWaiterLocked(epoch: UUID) -> CheckedContinuation<Void, Error>? {
+        guard openWaiter?.epoch == epoch else { return nil }
+        let value = openWaiter?.continuation; openWaiter = nil; return value
+    }
     private func completeCloseTimeout(id: UUID, socket: URLSessionWebSocketTask) {
         let waiter = lock.withLock { () -> CheckedContinuation<Void, Never>? in
             guard taskEpoch[ObjectIdentifier(socket)] == id else { return closeWaiters.removeValue(forKey: id) }

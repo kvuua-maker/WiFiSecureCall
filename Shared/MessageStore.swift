@@ -36,7 +36,10 @@ final class SecureMessageStore: ObservableObject {
         api = MessageAPIClient(accountAPI: accountAPI ?? NotificationRuntime.shared.accountAPI)
         self.identityStore = identityStore
         self.pinStore = pinStore
-        accountObserver = sessions.$activeAccountID.removeDuplicates().sink { [weak self] in self?.publish(accountID: $0) }
+        accountObserver = sessions.$activeAccountID.removeDuplicates().sink { [weak self] accountID in
+            guard let self else { return }
+            self.publish(accountID: accountID)
+        }
     }
 
     convenience init() { self.init(sessions: .shared) }
@@ -107,7 +110,9 @@ final class SecureMessageStore: ObservableObject {
             try Task.checkCancellation()
             updateCache(accountID) { cache in
                 let prior = append ? (cache.messages[conversationID] ?? []) : []
-                cache.messages[conversationID] = Dictionary(uniqueKeysWithValues: (prior + decoded).map { ($0.id, $0) }).values.sorted { $0.createdAt < $1.createdAt }
+                var merged = Dictionary(uniqueKeysWithValues: prior.map { ($0.id, $0) })
+                for message in decoded { merged[message.id] = message }
+                cache.messages[conversationID] = merged.values.sorted { $0.createdAt < $1.createdAt }
                 cache.safetyDevices[conversationID] = devices.sorted { $0.deviceID.uuidString < $1.deviceID.uuidString }
                 cache.keyChangeWarnings[conversationID] = warnings.sorted { $0.deviceID.uuidString < $1.deviceID.uuidString }
                 if let next = page.nextCursor { cache.nextCursor[conversationID] = next } else { cache.nextCursor.removeValue(forKey: conversationID) }
@@ -151,6 +156,10 @@ final class SecureMessageStore: ObservableObject {
             }
             updateCache(accountID) { $0.safetyDevices[conversation.id] = devices; $0.keyChangeWarnings[conversation.id] = warnings }
         } catch { setState(.failed(Self.safeError(error)), accountID: accountID) }
+    }
+
+    func hasOlderMessages(conversationID: UUID, accountID: UUID) -> Bool {
+        caches[accountID]?.nextCursor[conversationID] != nil
     }
 
     func approveKeyChange(_ warning: E2EEKeyChangeWarning) async throws {

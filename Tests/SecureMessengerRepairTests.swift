@@ -265,6 +265,7 @@ final class SecureConversationPeerMetadataTests: XCTestCase {
 
     func testInternationalNumberNormalizationDoesNotGuessCountryOrChangeUsername() {
         XCTAssertEqual(RecipientQueryNormalization.normalize(" +380 (50) 123-45-67 "), "+380501234567")
+        XCTAssertEqual(RecipientQueryNormalization.normalize("00380 (50) 123-45-67"), "+380501234567")
         XCTAssertEqual(RecipientQueryNormalization.normalize("0501234567"), "0501234567")
         XCTAssertEqual(RecipientQueryNormalization.normalize("@friend"), "@friend")
     }

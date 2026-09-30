@@ -63,6 +63,10 @@ struct IOSProductRootView: View {
             }
         }
         .fullScreenCover(isPresented: $showsActiveCall) { ActiveCallView(session: session) }
+        .onChange(of: session.state) { state in
+            if state == .idle || state.isTerminal { showsActiveCall = false }
+            else { showsActiveCall = true }
+        }
         }
         }
     }
@@ -107,13 +111,17 @@ private struct IOSContactsView: View {
                 if let loadError = contactsStore.errorMessage { Text(loadError).foregroundStyle(.red) }
                 if contactsStore.contacts.isEmpty { Text("Контактів із міжнародним номером немає. Скористайтеся ручним пошуком.") }
                 ForEach(visibleContacts) { contact in
-                    ForEach(contact.normalizedNumbers, id: \.self) { number in
+                    ForEach(contact.numbers) { number in
                         NavigationLink {
-                            RecipientSearchView(messageStore: messageStore, runtime: runtime, initialRecipient: number)
+                            if let canonical = number.canonicalE164 {
+                                RecipientSearchView(messageStore: messageStore, runtime: runtime, initialRecipient: canonical)
+                            } else {
+                                IOSCountryPrefixConfirmation(number: number, messageStore: messageStore, runtime: runtime)
+                            }
                         } label: {
                             VStack(alignment: .leading) {
                                 Text(contact.name).font(.headline)
-                                Text(number).font(.caption).foregroundStyle(.secondary)
+                                Text(number.displayValue).font(.caption).foregroundStyle(.secondary)
                                 Text("Статус у сервісі невідомий — перевірити").font(.caption2).foregroundStyle(.secondary)
                             }
                         }
@@ -124,6 +132,33 @@ private struct IOSContactsView: View {
         .navigationTitle("Контакти")
         .searchable(text: $query, prompt: "Ім’я або номер")
         .onAppear { contactsStore.refreshAuthorizationAndContacts() }
+    }
+}
+
+private struct IOSCountryPrefixConfirmation: View {
+    let number: LocalContactNumber
+    @ObservedObject var messageStore: SecureMessageStore
+    let runtime: NotificationRuntime
+    @State private var countryPrefix = "+380"
+
+    var body: some View {
+        Form {
+            Text("Підтвердьте міжнародний код країни перед пошуком. Регіон пристрою не підтверджує країну номера.")
+            TextField("Код країни", text: $countryPrefix).keyboardType(.phonePad)
+            NavigationLink("Перевірити номер") {
+                RecipientSearchView(messageStore: messageStore, runtime: runtime, initialRecipient: internationalNumber ?? "")
+            }
+            .disabled(internationalNumber == nil)
+        }
+        .navigationTitle(number.displayValue)
+    }
+
+    private var internationalNumber: String? {
+        let prefix = RecipientQueryNormalization.normalize(countryPrefix)
+        guard prefix.hasPrefix("+"), prefix.dropFirst().allSatisfy(\.isNumber) else { return nil }
+        let national = number.digits.drop(while: { $0 == "0" })
+        guard !national.isEmpty else { return nil }
+        return prefix + national
     }
 }
 
