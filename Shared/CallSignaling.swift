@@ -1,71 +1,154 @@
 import CryptoKit
 import Foundation
 
+// Synchronous session boundary: logout invalidates results before it returns,
+// even if actor cleanup or a cancellation-ignoring network task runs later.
+final class AccountE2EESessionEpochs: @unchecked Sendable {
+    private let lock = NSLock()
+    private var values: [UUID: UInt64] = [:]
+
+    func current(_ accountID: UUID) -> UInt64 {
+        lock.wscLocked { values[accountID, default: 0] }
+    }
+
+    @discardableResult
+    func advance(_ accountID: UUID) -> UInt64 {
+        lock.wscLocked {
+            values[accountID, default: 0] &+= 1
+            return values[accountID, default: 0]
+        }
+    }
+}
+
 actor AccountE2EEContext {
     static let shared = AccountE2EEContext()
+    private struct SessionKey: Hashable {
+        // Retain the client while cached: its address cannot be reused by a
+        // different API client with different server/session configuration.
+        let client: AccountAPIClient
+        let accountID: UUID
+        let epoch: UInt64
+
+        static func == (lhs: SessionKey, rhs: SessionKey) -> Bool {
+            lhs.client === rhs.client && lhs.accountID == rhs.accountID && lhs.epoch == rhs.epoch
+        }
+        func hash(into hasher: inout Hasher) {
+            hasher.combine(ObjectIdentifier(client))
+            hasher.combine(accountID)
+            hasher.combine(epoch)
+        }
+    }
+    private struct BundleKey: Hashable {
+        let session: SessionKey
+        let userID: UUID
+    }
+    private struct RegistrationKey: Hashable {
+        let session: SessionKey
+        let deviceID: UUID
+        let keyVersion: UInt64
+        let fingerprint: String
+    }
     private struct Timed<T> { let value: T; let expires: Date }
-    private var profiles: [String: Timed<UserProfile>] = [:]
-    private var bundles: [String: Timed<[E2EEPublicDeviceBundle]>] = [:]
-    private var profileTasks: [String: Task<UserProfile, Error>] = [:]
-    private var bundleTasks: [String: Task<[E2EEPublicDeviceBundle], Error>] = [:]
-    private var registrations: [String: Date] = [:]
-    private var registrationTasks: [String: Task<Void, Error>] = [:]
-    private var accountEpochs: [UUID: UInt64] = [:]
+    private struct Flight<T: Sendable> {
+        let id = UUID()
+        let task: Task<T, Error>
+    }
+    nonisolated private let epochs = AccountE2EESessionEpochs()
+    private let profileLoader: @Sendable (AccountAPIClient, UUID) async throws -> UserProfile
+    private let onProfileCoalesced: @Sendable () -> Void
+    private var profiles: [SessionKey: Timed<UserProfile>] = [:]
+    private var bundles: [BundleKey: Timed<[E2EEPublicDeviceBundle]>] = [:]
+    private var profileTasks: [SessionKey: Flight<UserProfile>] = [:]
+    private var bundleTasks: [BundleKey: Flight<[E2EEPublicDeviceBundle]>] = [:]
+    private var registrations: [RegistrationKey: Date] = [:]
+    private var registrationTasks: [RegistrationKey: Flight<Void>] = [:]
+
+    init(profileLoader: @escaping @Sendable (AccountAPIClient, UUID) async throws -> UserProfile = {
+        try await $0.userProfile(accountID: $1)
+    }, onProfileCoalesced: @escaping @Sendable () -> Void = {}) {
+        self.profileLoader = profileLoader
+        self.onProfileCoalesced = onProfileCoalesced
+    }
 
     func profile(client: AccountAPIClient, accountID: UUID) async throws -> UserProfile {
-        let key = cacheKey(client: client, accountID: accountID)
-        let epoch = accountEpochs[accountID, default: 0]
+        let key = sessionKey(client: client, accountID: accountID)
+        try requireCurrent(key)
         if let cached = profiles[key], cached.expires > Date() { return cached.value }
-        if let task = profileTasks[key] { return try await task.value }
-        let task = Task { try await client.userProfile(accountID: accountID) }
-        profileTasks[key] = task
-        defer { profileTasks.removeValue(forKey: key) }
-        let value = try await task.value
-        guard accountEpochs[accountID, default: 0] == epoch else { throw CancellationError() }
+        if let flight = profileTasks[key] {
+            onProfileCoalesced()
+            let value = try await flight.task.value
+            try requireCurrent(key)
+            return value
+        }
+        let loader = profileLoader
+        let flight = Flight(task: Task { try await loader(client, accountID) })
+        profileTasks[key] = flight
+        defer { if profileTasks[key]?.id == flight.id { profileTasks.removeValue(forKey: key) } }
+        let value = try await flight.task.value
+        try requireCurrent(key)
         profiles[key] = .init(value: value, expires: Date().addingTimeInterval(30))
         return value
     }
 
     func ensureRegistered(client: AccountAPIClient, accountID: UUID, identity: E2EEDeviceIdentity) async throws {
-        let key = "\(cacheKey(client: client, accountID: accountID)):\(identity.deviceID.uuidString):\(identity.keyVersion):\(identity.publicBundle.fingerprint)"
-        let epoch = accountEpochs[accountID, default: 0]
+        let session = sessionKey(client: client, accountID: accountID)
+        let key = RegistrationKey(session: session, deviceID: identity.deviceID, keyVersion: identity.keyVersion, fingerprint: identity.publicBundle.fingerprint)
+        try requireCurrent(session)
         if let confirmed = registrations[key], Date().timeIntervalSince(confirmed) < 60 { return }
-        if let task = registrationTasks[key] { return try await task.value }
-        let task = Task { _ = try await client.registerDeviceKey(accountID: accountID, request: identity.registration(requestID: UUID())) }
-        registrationTasks[key] = task
-        defer { registrationTasks.removeValue(forKey: key) }
-        try await task.value
-        guard accountEpochs[accountID, default: 0] == epoch else { throw CancellationError() }
+        if let flight = registrationTasks[key] {
+            try await flight.task.value
+            try requireCurrent(session)
+            return
+        }
+        let flight = Flight<Void>(task: Task { _ = try await client.registerDeviceKey(accountID: accountID, request: identity.registration(requestID: UUID())) })
+        registrationTasks[key] = flight
+        defer { if registrationTasks[key]?.id == flight.id { registrationTasks.removeValue(forKey: key) } }
+        try await flight.task.value
+        try requireCurrent(session)
         registrations[key] = Date()
     }
 
     func deviceKeys(client: AccountAPIClient, accountID: UUID, userID: UUID) async throws -> [E2EEPublicDeviceBundle] {
-        let key = "\(cacheKey(client: client, accountID: accountID)):\(userID.uuidString)"
-        let epoch = accountEpochs[accountID, default: 0]
+        let session = sessionKey(client: client, accountID: accountID)
+        let key = BundleKey(session: session, userID: userID)
+        try requireCurrent(session)
         if let cached = bundles[key], cached.expires > Date() { return cached.value }
-        if let task = bundleTasks[key] { return try await task.value }
-        let task = Task { try await client.deviceKeys(accountID: accountID, userID: userID) }
-        bundleTasks[key] = task
-        defer { bundleTasks.removeValue(forKey: key) }
-        let value = try await task.value
-        guard accountEpochs[accountID, default: 0] == epoch else { throw CancellationError() }
+        if let flight = bundleTasks[key] {
+            let value = try await flight.task.value
+            try requireCurrent(session)
+            return value
+        }
+        let flight = Flight(task: Task { try await client.deviceKeys(accountID: accountID, userID: userID) })
+        bundleTasks[key] = flight
+        defer { if bundleTasks[key]?.id == flight.id { bundleTasks.removeValue(forKey: key) } }
+        let value = try await flight.task.value
+        try requireCurrent(session)
         bundles[key] = .init(value: value, expires: Date().addingTimeInterval(15))
         return value
     }
 
-    func invalidate(accountID: UUID) {
-        accountEpochs[accountID, default: 0] &+= 1
-        let marker = ":" + accountID.uuidString
-        for key in profileTasks.keys.filter({ $0.hasSuffix(marker) }) { profileTasks.removeValue(forKey: key)?.cancel() }
-        for key in bundleTasks.keys.filter({ $0.contains(marker + ":") }) { bundleTasks.removeValue(forKey: key)?.cancel() }
-        for key in registrationTasks.keys.filter({ $0.contains(marker + ":") }) { registrationTasks.removeValue(forKey: key)?.cancel() }
-        profiles = profiles.filter { !$0.key.hasSuffix(":" + accountID.uuidString) }
-        bundles = bundles.filter { !$0.key.contains(":" + accountID.uuidString + ":") }
-        registrations = registrations.filter { !$0.key.contains(":" + accountID.uuidString + ":") }
+    nonisolated func invalidate(accountID: UUID) {
+        let epoch = epochs.advance(accountID)
+        Task { await self.clearInvalidated(accountID: accountID, before: epoch) }
     }
 
-    private func cacheKey(client: AccountAPIClient, accountID: UUID) -> String {
-        "\(ObjectIdentifier(client).hashValue):\(accountID.uuidString)"
+    private func clearInvalidated(accountID: UUID, before epoch: UInt64) {
+        func stale(_ key: SessionKey) -> Bool { key.accountID == accountID && key.epoch < epoch }
+        for key in profileTasks.keys.filter({ stale($0) }) { profileTasks.removeValue(forKey: key)?.task.cancel() }
+        for key in bundleTasks.keys.filter({ stale($0.session) }) { bundleTasks.removeValue(forKey: key)?.task.cancel() }
+        for key in registrationTasks.keys.filter({ stale($0.session) }) { registrationTasks.removeValue(forKey: key)?.task.cancel() }
+        profiles = profiles.filter { !stale($0.key) }
+        bundles = bundles.filter { !stale($0.key.session) }
+        registrations = registrations.filter { !stale($0.key.session) }
+    }
+
+    private func sessionKey(client: AccountAPIClient, accountID: UUID) -> SessionKey {
+        SessionKey(client: client, accountID: accountID, epoch: epochs.current(accountID))
+    }
+
+    private func requireCurrent(_ key: SessionKey) throws {
+        try Task.checkCancellation()
+        guard epochs.current(key.accountID) == key.epoch else { throw CancellationError() }
     }
 }
 

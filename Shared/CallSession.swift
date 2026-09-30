@@ -368,6 +368,7 @@ final class CallSession: ObservableObject {
             guard isCurrent(current) else { throw CancellationError() }
             if let reconciled = try? await callSignaling.rawCall(current.serverCallID), reconciled.state == .ringing || reconciled.state == .accepted {
                 serverCallCreated = true
+                serverCallAccepted = reconciled.state == .accepted
                 let mutation: CallMutation = reconciled.state == .accepted ? .end : .cancel
                 registerTerminalCompensation(current, mutation: mutation, signaling: callSignaling, requestID: UUID())
                 await deliverTerminalCompensation(current)
@@ -569,6 +570,9 @@ final class CallSession: ObservableObject {
                     switch response.state {
                     case .accepted:
                         let signaling = try self.signaling(for: current)
+                        // Server acceptance is authoritative even if fetching or
+                        // verifying the media keys fails while the UI is ringing.
+                        self.serverCallAccepted = true
                         let verified: CallSignalView
                         do { verified = try await signaling.call(current.serverCallID) }
                         catch { await self.fail(current, .invalidServerState); return }
@@ -908,7 +912,8 @@ final class CallSession: ObservableObject {
 
     private func compensateAfterStart(_ current: CallGeneration, signaling: any CallSignaling) async {
         guard isCurrent(current), serverCallCreated else { return }
-        terminalRequestID = terminalRequestID ?? UUID(); registerTerminalCompensation(current, mutation: .cancel, signaling: signaling); await deliverTerminalCompensation(current)
+        let mutation: CallMutation = serverCallAccepted ? .end : .cancel
+        terminalRequestID = terminalRequestID ?? UUID(); registerTerminalCompensation(current, mutation: mutation, signaling: signaling); await deliverTerminalCompensation(current)
     }
     private func compensateAfterAccept(_ current: CallGeneration, signaling: any CallSignaling) async {
         guard isCurrent(current) else { return }
@@ -917,6 +922,7 @@ final class CallSession: ObservableObject {
     private func terminalMutationForIncomingFailure(_ current: CallGeneration, signaling: any CallSignaling) async { terminalRequestID = terminalRequestID ?? UUID(); registerTerminalCompensation(current, mutation: .reject, signaling: signaling); await deliverTerminalCompensation(current) }
 
     private func terminalMutationForCurrentState() -> CallMutation {
+        if serverCallAccepted { return .end }
         switch state { case .outgoingRinging: return .cancel; case .incomingRinging: return .reject; default: return .end }
     }
 
@@ -953,7 +959,7 @@ final class CallSession: ObservableObject {
 
     private func fail(_ current: CallGeneration, _ failure: CallFailure, reportCallKit: Bool = true, reportReason: CallEndReason = .failed) async {
         guard isCurrent(current) else { return }
-        if state.isAcceptedLifecycle, let callSignaling = try? signaling(for: current) {
+        if serverCallAccepted || state.isAcceptedLifecycle, let callSignaling = try? signaling(for: current) {
             registerTerminalCompensation(current, mutation: .end, signaling: callSignaling)
             enqueueTerminalMutation(current, mutation: .end)
         }

@@ -34,6 +34,7 @@ final class AccountSessionStore: ObservableObject {
 
     func add(_ response: AccountSessionResponse) throws {
         try tokenStore.save(response.tokens, for: response.account.accountID)
+        AccountE2EEContext.shared.invalidate(accountID: response.account.accountID)
         if let index = accounts.firstIndex(where: { $0.accountID == response.account.accountID }) { accounts[index] = response.account }
         else { accounts.append(response.account) }
         activeAccountID = response.account.accountID
@@ -44,6 +45,7 @@ final class AccountSessionStore: ObservableObject {
 
     func addLinkedAccount(accountID: UUID, phoneNumber: String, tokens: AccountTokens) throws {
         try tokenStore.save(tokens, for: accountID)
+        AccountE2EEContext.shared.invalidate(accountID: accountID)
         let summary = AccountSummary(accountID: accountID, phoneNumber: phoneNumber)
         if let index = accounts.firstIndex(where: { $0.accountID == accountID }) { accounts[index] = summary } else { accounts.append(summary) }
         activeAccountID = accountID
@@ -57,6 +59,7 @@ final class AccountSessionStore: ObservableObject {
 
     func addLinkedAccount(accountID: UUID, userID: UUID?, phoneNumber: String?, displayLabel: String, tokens: AccountTokens) throws {
         try tokenStore.save(tokens, for: accountID)
+        AccountE2EEContext.shared.invalidate(accountID: accountID)
         let summary = AccountSummary(accountID: accountID, userID: userID, phoneNumber: phoneNumber, displayLabel: displayLabel)
         if let index = accounts.firstIndex(where: { $0.accountID == accountID }) { accounts[index] = summary } else { accounts.append(summary) }
         activeAccountID = accountID
@@ -82,8 +85,8 @@ final class AccountSessionStore: ObservableObject {
     }
 
     private func removeLocal(accountID: UUID) throws {
-        Task { await AccountE2EEContext.shared.invalidate(accountID: accountID) }
         try tokenStore.delete(accountID: accountID)
+        AccountE2EEContext.shared.invalidate(accountID: accountID)
         accounts.removeAll { $0.accountID == accountID }
         profiles.removeValue(forKey: accountID)
         if activeAccountID == accountID { activeAccountID = accounts.first?.accountID }

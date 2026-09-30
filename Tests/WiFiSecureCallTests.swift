@@ -3402,6 +3402,22 @@ final class SecureRingingUpgradeRegressionTests: XCTestCase {
         await session.startCall(signaling: signaling)
         try await adapter.approveStart(try XCTUnwrap(adapter.startedIDs.first))
         await waitUntil { session.state.isTerminal }
+        await waitUntil { signaling.terminalMutations.contains(.end) }
+        XCTAssertTrue(session.state.isTerminal)
+        XCTAssertFalse(session.isEndToEndEncryptedMedia)
+        XCTAssertEqual(signaling.terminalMutations, [.end])
+    }
+
+    func testAcceptedVerificationFailureEndsServerCallWithStableRetryID() async throws {
+        let signaling = RingingUpgradeSignaling(hasVerifiedKeys: false, kind: "network", throwVerification: true, failFirstEnd: true)
+        let session = CallSession(config: config(), audio: AudioEngineMock(), media: MediaTransportMock())
+        let adapter = RetainedCallKitMock(); session.attach(callKit: adapter)
+        await session.startCall(signaling: signaling)
+        try await adapter.approveStart(try XCTUnwrap(adapter.startedIDs.first))
+        await waitUntil { signaling.terminalRequestIDs.count >= 2 }
+        XCTAssertTrue(session.state.isTerminal)
+        XCTAssertEqual(signaling.terminalMutations, [.end, .end])
+        XCTAssertEqual(Set(signaling.terminalRequestIDs).count, 1)
         XCTAssertFalse(session.isEndToEndEncryptedMedia)
     }
 
@@ -3413,23 +3429,131 @@ final class SecureRingingUpgradeRegressionTests: XCTestCase {
     }
 }
 
+@MainActor
+final class AccountE2EESessionBoundaryTests: XCTestCase {
+    func testInvalidationRejectsOldResultAndPreservesNewInFlightRequest() async throws {
+        let loader = HeldE2EEProfileLoader()
+        let joins = E2EEProfileCounter()
+        let context = AccountE2EEContext(profileLoader: { _, _ in try await loader.load() }, onProfileCoalesced: { _ = joins.next() })
+        let client = makeClient(), accountID = UUID()
+        let old = Task { try await context.profile(client: client, accountID: accountID) }
+        await waitUntil { loader.count == 1 }
+        XCTAssertEqual(loader.count, 1)
+        let oldJoined = Task { try await context.profile(client: client, accountID: accountID) }
+        await waitUntil { joins.count == 1 }
+        XCTAssertEqual(joins.count, 1)
+        context.invalidate(accountID: accountID)
+        let fresh = Task { try await context.profile(client: client, accountID: accountID) }
+        await waitUntil { loader.count == 2 }
+        XCTAssertEqual(loader.count, 2)
+        let staleProfile = profile("old"), freshProfile = profile("fresh")
+        loader.complete(0, with: staleProfile)
+        do { _ = try await old.value; XCTFail("A logged-out session returned stale profile data") }
+        catch is CancellationError { }
+        do { _ = try await oldJoined.value; XCTFail("A coalesced waiter returned stale profile data") }
+        catch is CancellationError { }
+        let joined = Task { try await context.profile(client: client, accountID: accountID) }
+        await waitUntil { joins.count == 2 }
+        XCTAssertEqual(joins.count, 2)
+        loader.complete(1, with: freshProfile)
+        let freshResult = try await fresh.value
+        let joinedResult = try await joined.value
+        let cached = try await context.profile(client: client, accountID: accountID)
+        XCTAssertEqual(freshResult, freshProfile)
+        XCTAssertEqual(joinedResult, freshProfile)
+        XCTAssertEqual(cached, freshProfile)
+        XCTAssertEqual(loader.count, 2)
+    }
+
+    func testInvalidationBypassesCachedProfileBeforeActorCleanupRuns() async throws {
+        let firstProfile = profile("first"), secondProfile = profile("second")
+        let counter = E2EEProfileCounter()
+        let context = AccountE2EEContext(profileLoader: { _, _ in
+            counter.next() == 1 ? firstProfile : secondProfile
+        })
+        let client = makeClient(), accountID = UUID()
+        let first = try await context.profile(client: client, accountID: accountID)
+        context.invalidate(accountID: accountID)
+        let second = try await context.profile(client: client, accountID: accountID)
+        XCTAssertEqual(first, firstProfile)
+        XCTAssertEqual(second, secondProfile)
+        XCTAssertEqual(counter.count, 2)
+    }
+
+    private func makeClient() -> AccountAPIClient {
+        let config = AppConfig(apiBaseURL: URL(string: "https://example.invalid/v1")!, mediaURL: URL(string: "wss://example.invalid/media")!, role: .B, bearerToken: String(repeating: "b", count: 64))
+        return AccountAPIClient(config: config, tokenStore: InMemorySecureTokenStore(), session: URLSession(configuration: .ephemeral))
+    }
+    private func profile(_ name: String) -> UserProfile {
+        UserProfile(userID: UUID(), username: name, displayName: name, email: nil, verifiedPhones: [], publicIdentity: "wsc:user:\(name)")
+    }
+    private func waitUntil(_ predicate: @escaping () -> Bool) async {
+        for _ in 0..<200 where !predicate() { try? await Task.sleep(nanoseconds: 5_000_000) }
+    }
+}
+
+private final class E2EEProfileCounter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value = 0
+    var count: Int { lock.wscLocked { value } }
+    func next() -> Int { lock.wscLocked { value += 1; return value } }
+}
+
+// Deliberately ignores cancellation to exercise post-await epoch validation.
+private final class HeldE2EEProfileLoader: @unchecked Sendable {
+    private let lock = NSLock()
+    private var continuations: [Int: CheckedContinuation<UserProfile, Error>] = [:]
+    private var started = 0
+    var count: Int { lock.wscLocked { started } }
+    func load() async throws -> UserProfile {
+        try await withCheckedThrowingContinuation { continuation in
+            let index = lock.wscLocked { () -> Int in
+                let index = started; started += 1
+                continuations[index] = continuation
+                return index
+            }
+            if index > 1 { complete(index, with: UserProfile(userID: UUID(), username: "unexpected", displayName: nil, email: nil, verifiedPhones: [], publicIdentity: "unexpected")) }
+        }
+    }
+    func complete(_ index: Int, with profile: UserProfile) {
+        lock.wscLocked { continuations.removeValue(forKey: index) }?.resume(returning: profile)
+    }
+}
+
 private final class RingingUpgradeSignaling: CallSignaling, @unchecked Sendable {
     let mediaPeerIdentity = MediaPeerIdentity.secureAccount(.caller)
     let historyAccountID: UUID? = UUID()
     private let lock = NSLock()
     private let hasVerifiedKeys: Bool
     private let kind: String
+    private let throwVerification: Bool
+    private let failFirstEnd: Bool
+    private var mutations: [CallMutation] = []
+    private var requestIDs: [UUID] = []
+    var terminalMutations: [CallMutation] { lock.withLock { mutations } }
+    var terminalRequestIDs: [UUID] { lock.withLock { requestIDs } }
     private(set) var rawAcceptedCount = 0
     private(set) var verifiedAcceptedCount = 0
-    init(hasVerifiedKeys: Bool, kind: String) { self.hasVerifiedKeys = hasVerifiedKeys; self.kind = kind }
+    init(hasVerifiedKeys: Bool, kind: String, throwVerification: Bool = false, failFirstEnd: Bool = false) {
+        self.hasVerifiedKeys = hasVerifiedKeys; self.kind = kind
+        self.throwVerification = throwVerification; self.failFirstEnd = failFirstEnd
+    }
     func create(callID: UUID, requestID: UUID) async throws -> CallSignalView { view(callID, state: .ringing, keys: nil) }
     func rawCall(_ id: UUID) async throws -> CallSignalView { lock.withLock { rawAcceptedCount += 1 }; return view(id, state: .accepted, keys: nil) }
     func call(_ id: UUID) async throws -> CallSignalView {
         lock.withLock { verifiedAcceptedCount += 1 }
+        if throwVerification { throw URLError(.networkConnectionLost) }
         let keys = hasVerifiedKeys ? CallAudioKeys(send: SymmetricKey(size: .bits256), receive: SymmetricKey(size: .bits256), epoch: 1, sendDirection: .callerToCallee, receiveDirection: .calleeToCaller) : nil
         return view(id, state: .accepted, keys: keys)
     }
-    func mutate(_ action: CallMutation, callID: UUID, requestID: UUID) async throws -> CallSignalView { view(callID, state: action == .end ? .ended : .cancelled, keys: nil) }
+    func mutate(_ action: CallMutation, callID: UUID, requestID: UUID) async throws -> CallSignalView {
+        let first = lock.withLock { () -> Bool in
+            mutations.append(action); requestIDs.append(requestID)
+            return mutations.count == 1
+        }
+        if first && failFirstEnd { throw URLError(.networkConnectionLost) }
+        return view(callID, state: action == .end ? .ended : .cancelled, keys: nil)
+    }
     private func view(_ id: UUID, state: ServerCallState, keys: CallAudioKeys?) -> CallSignalView {
         CallSignalView(callID: id, localSide: .caller, state: state, expiresAt: Date().addingTimeInterval(60), mediaToken: state == .accepted ? "token-\(kind)" : nil, ringExpiresAt: Date().addingTimeInterval(60), acceptedAt: state == .accepted ? Date() : nil, terminalAt: state == .ended ? Date() : nil, terminalReason: nil, deliveryStatus: nil, peerReady: false, createdNew: true, mutationApplied: true, audioKeys: keys)
     }
