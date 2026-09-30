@@ -9,13 +9,17 @@ final class WatchContactsCache: NSObject, ObservableObject, WCSessionDelegate {
     @Published private(set) var updatedAt: Date?
     @Published private(set) var generation: UInt64 = 0
 
-    private let cacheURL: URL
+    private let diskCache: LocalContactSnapshotDiskCache
 
-    override init() {
+    override convenience init() {
         let root = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first ?? FileManager.default.temporaryDirectory
-        cacheURL = root.appendingPathComponent("WiFiSecureCall/watch-contacts-v1.json")
+        self.init(cacheURL: root.appendingPathComponent("WiFiSecureCall/watch-contacts-v1.json"))
+    }
+
+    init(cacheURL: URL) {
+        diskCache = LocalContactSnapshotDiskCache(url: cacheURL)
         super.init()
-        if let data = try? Data(contentsOf: cacheURL), let snapshot = try? JSONDecoder().decode(LocalContactSnapshot.self, from: data), snapshot.isValid {
+        if let snapshot = diskCache.load() {
             apply(snapshot)
         }
     }
@@ -52,12 +56,8 @@ final class WatchContactsCache: NSObject, ObservableObject, WCSessionDelegate {
     }
 
     private func persistAndApply(_ snapshot: LocalContactSnapshot) {
-        do {
-            let directory = cacheURL.deletingLastPathComponent()
-            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-            try JSONEncoder().encode(snapshot).write(to: cacheURL, options: [.atomic, .completeFileProtectionUnlessOpen])
-            apply(snapshot)
-        } catch { return }
+        guard diskCache.storeIfNewer(snapshot) else { return }
+        apply(snapshot)
     }
 
     private func apply(_ snapshot: LocalContactSnapshot) {
@@ -67,9 +67,6 @@ final class WatchContactsCache: NSObject, ObservableObject, WCSessionDelegate {
     }
 
     private func clear(generation: UInt64) {
-        contacts = []
-        updatedAt = nil
-        self.generation = generation
-        try? FileManager.default.removeItem(at: cacheURL)
+        persistAndApply(LocalContactSnapshot(generation: generation, contacts: []))
     }
 }

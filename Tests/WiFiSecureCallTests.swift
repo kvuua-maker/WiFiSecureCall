@@ -2829,10 +2829,39 @@ final class AccountCallFoundationTests: XCTestCase {
         let callerView = try await caller.create(callID: callID, requestID: UUID())
         XCTAssertEqual(callerView.localSide, .caller)
         XCTAssertEqual(caller.mediaPeerIdentity, .secureAccount(.caller))
-        let callee = AccountCallSignaling(client: client, accountID: accountID, localSide: .callee)
+        let legacySession = accountCallTestSession { _ in
+            (200, self.accountCallResponse(callID: callID, side: .callee, state: .ringing))
+        }
+        let callee = AccountCallSignaling(client: AccountAPIClient(config: accountCallConfig(), tokenStore: secrets, session: legacySession), accountID: accountID, localSide: .callee)
         let calleeView = try await callee.call(callID)
         XCTAssertEqual(calleeView.localSide, .callee)
         XCTAssertEqual(callee.mediaPeerIdentity, .account(.callee))
+    }
+
+    func testSecureAccountAcceptedThenEndedKeepsProtocolTwoWithoutTerminalAudioKeys() async throws {
+        let callID = UUID()
+        let signaling = try secureAccountSignaling(callID: callID, states: [.accepted, .ended])
+        _ = try await signaling.create(callID: callID, requestID: UUID())
+        let accepted = try await signaling.call(callID)
+        XCTAssertNotNil(accepted.audioKeys)
+        XCTAssertNotNil(accepted.mediaToken)
+        let ended = try await signaling.call(callID)
+        XCTAssertEqual(ended.state, .ended)
+        XCTAssertNil(ended.mediaToken)
+        XCTAssertNil(ended.audioKeys)
+        XCTAssertEqual(signaling.mediaPeerIdentity, .secureAccount(.caller))
+    }
+
+    func testSecureAccountAcceptedRejectsMissingCalleePackage() async throws {
+        let callID = UUID()
+        let signaling = try secureAccountSignaling(callID: callID, states: [.accepted], omitCallee: true)
+        _ = try await signaling.create(callID: callID, requestID: UUID())
+        do {
+            _ = try await signaling.call(callID)
+            XCTFail("incomplete secure accepted response was accepted")
+        } catch {
+            XCTAssertEqual(signaling.mediaPeerIdentity, .secureAccount(.caller))
+        }
     }
 
     func testPreferredCallWithActiveAccountDoesNotFallBackWhenTargetMissingOrAmbiguous() async throws {
@@ -3220,20 +3249,100 @@ final class AccountCallFoundationTests: XCTestCase {
         AppConfig(apiBaseURL: URL(string: "https://example.invalid/wifi-secure-call/v1")!, mediaURL: URL(string: "wss://example.invalid/media")!, role: .B, bearerToken: String(repeating: "b", count: 64))
     }
 
+    private func secureAccountSignaling(callID: UUID, states: [ServerCallState], omitCallee: Bool = false) throws -> AccountCallSignaling {
+        let accountID = UUID(), userID = UUID(), callerDeviceID = UUID(), calleeDeviceID = UUID()
+        let callerStorage = InMemoryE2EESecretStorage()
+        let callerIdentityStore = E2EEIdentityStore(storage: callerStorage, deviceID: callerDeviceID)
+        let callerIdentity = try callerIdentityStore.identity()
+        let calleeIdentity = E2EEDeviceIdentity(deviceID: calleeDeviceID, signingPrivateKey: .init(), agreementPrivateKey: .init(), keyVersion: 1)
+        let calleeEphemeral = Curve25519.KeyAgreement.PrivateKey()
+        let calleePackage = try E2EECallKeyAgreement.makePackage(callID: callID, userID: userID, identity: calleeIdentity, side: .callee, ephemeral: calleeEphemeral)
+        let secrets = InMemorySecureTokenStore()
+        try secrets.save(AccountTokens(accessToken: "access", accessExpiresAt: .distantFuture, refreshToken: "refresh", refreshExpiresAt: .distantFuture), for: accountID)
+        let lock = NSLock()
+        var callerPackage: E2EECallKeyPackage?
+        var readIndex = 0
+        AccountURLProtocol.handler = { request in
+            if request.url?.path.hasSuffix("/v3/me") == true {
+                return (200, UserProfile(userID: userID, username: "owner", displayName: "Owner", email: nil, verifiedPhones: [], publicIdentity: "wsc:user:owner"))
+            }
+            if request.url?.path.hasSuffix("/v3/device-keys") == true, request.httpMethod == "POST" {
+                return (200, callerIdentity.publicBundle)
+            }
+            if request.url?.path.contains("/v3/users/") == true, request.url?.path.hasSuffix("/device-keys") == true {
+                return (200, [callerIdentity.publicBundle, calleeIdentity.publicBundle])
+            }
+            if request.httpMethod == "POST", request.url?.path.hasSuffix("/v2/calls") == true {
+                let create = try JSONDecoder.account.decode(AccountCallCreateRequest.self, from: XCTUnwrap(request.httpBody))
+                lock.wscLocked { callerPackage = create.callerKeyPackage }
+                return (200, self.secureAccountResponse(callID: callID, state: .ringing, callerPackage: try XCTUnwrap(create.callerKeyPackage), calleePackage: nil, userID: userID, callerDeviceID: callerDeviceID, calleeDeviceID: calleeDeviceID))
+            }
+            let state = lock.wscLocked { () -> ServerCallState in
+                let value = states[min(readIndex, states.count - 1)]
+                readIndex += 1
+                return value
+            }
+            return (200, self.secureAccountResponse(callID: callID, state: state, callerPackage: try XCTUnwrap(lock.wscLocked { callerPackage }), calleePackage: omitCallee ? nil : calleePackage, userID: userID, callerDeviceID: callerDeviceID, calleeDeviceID: calleeDeviceID))
+        }
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [AccountURLProtocol.self]
+        let client = AccountAPIClient(config: accountCallConfig(), tokenStore: secrets, session: URLSession(configuration: configuration), deviceID: callerDeviceID)
+        return AccountCallSignaling(client: client, accountID: accountID, targetDeviceID: calleeDeviceID, localSide: .caller, identityStore: callerIdentityStore, pinStore: E2EEIdentityPinStore(storage: InMemoryE2EESecretStorage()))
+    }
+
+    private func secureAccountResponse(callID: UUID, state: ServerCallState, callerPackage: E2EECallKeyPackage, calleePackage: E2EECallKeyPackage?, userID: UUID, callerDeviceID: UUID, calleeDeviceID: UUID) -> AccountCallResponse {
+        AccountCallResponse(callID: callID, localSide: .caller, state: state,
+                            expiresAt: Date(timeIntervalSince1970: 2_000_000_000), mediaToken: state == .accepted ? "media" : nil,
+                            ringExpiresAt: Date(timeIntervalSince1970: 2_000_000_000), acceptedAt: state == .accepted ? Date() : nil,
+                            terminalAt: state == .ended ? Date() : nil, terminalReason: state == .ended ? "ended" : nil,
+                            deliveryStatus: "submission_accepted", peerReady: state == .accepted,
+                            createdNew: true, mutationApplied: nil, callerKeyPackage: callerPackage,
+                            calleeKeyPackage: calleePackage, callerUserID: userID, callerDeviceID: callerDeviceID,
+                            calleeUserID: userID, calleeDeviceID: calleeDeviceID)
+    }
+
     private func accountSession(accountID: UUID) -> AccountSessionResponse {
         AccountSessionResponse(account: AccountSummary(accountID: accountID, phoneNumber: "+380501234567"), deviceID: InstallationIdentity.shared.id, accessToken: "access-\(accountID)", accessExpiresAt: .distantFuture, refreshToken: "refresh-\(accountID)", refreshExpiresAt: .distantFuture)
     }
 
     private func accountCallTestSession(handler: @escaping (URLRequest) throws -> (Int, Encodable)) -> URLSession {
+        let lock = NSLock()
+        var bundles: [UUID: E2EEPublicDeviceBundle] = [:]
+        var packages: [UUID: (E2EECallKeyPackage, UUID)] = [:]
+        let fixtureUserID = UUID(uuidString: "99999999-9999-4999-8999-999999999999")!
         AccountURLProtocol.handler = { request in
             if request.url?.path.hasSuffix("/v3/me") == true {
-                return (200, UserProfile(userID: UUID(uuidString: "99999999-9999-4999-8999-999999999999")!, username: "fixture", displayName: "Fixture", email: nil, verifiedPhones: [], publicIdentity: "wsc:user:fixture"))
+                return (200, UserProfile(userID: fixtureUserID, username: "fixture", displayName: "Fixture", email: nil, verifiedPhones: [], publicIdentity: "wsc:user:fixture"))
             }
             if request.url?.path.hasSuffix("/v3/device-keys") == true, request.httpMethod == "POST" {
                 let registration = try JSONDecoder.account.decode(E2EEDeviceRegistrationRequest.self, from: XCTUnwrap(request.httpBody))
-                return (200, E2EEPublicDeviceBundle(deviceID: registration.deviceID, signingPublicKey: registration.signingPublicKey, agreementPublicKey: registration.agreementPublicKey, keyVersion: registration.keyVersion, protocolVersion: registration.protocolVersion, createdAt: Date(), updatedAt: Date()))
+                let bundle = E2EEPublicDeviceBundle(deviceID: registration.deviceID, signingPublicKey: registration.signingPublicKey, agreementPublicKey: registration.agreementPublicKey, keyVersion: registration.keyVersion, protocolVersion: registration.protocolVersion, createdAt: Date(), updatedAt: Date())
+                lock.wscLocked { bundles[bundle.deviceID] = bundle }
+                return (200, bundle)
             }
-            return try handler(request)
+            if request.url?.path.contains("/v3/users/") == true, request.url?.path.hasSuffix("/device-keys") == true {
+                return (200, lock.wscLocked { Array(bundles.values) })
+            }
+            if request.httpMethod == "POST", request.url?.path.hasSuffix("/v2/calls") == true,
+               let body = request.httpBody,
+               let create = try? JSONDecoder.account.decode(AccountCallCreateRequest.self, from: body),
+               let package = create.callerKeyPackage {
+                lock.wscLocked { packages[create.callID] = (package, create.targetDeviceID) }
+            }
+            let result = try handler(request)
+            guard let response = result.1 as? AccountCallResponse,
+                  let secured = lock.wscLocked({ packages[response.callID] }) else { return result }
+            return (result.0, AccountCallResponse(
+                callID: response.callID, localSide: response.localSide, state: response.state,
+                expiresAt: response.expiresAt, mediaToken: response.mediaToken,
+                ringExpiresAt: response.ringExpiresAt, acceptedAt: response.acceptedAt,
+                terminalAt: response.terminalAt, terminalReason: response.terminalReason,
+                deliveryStatus: response.deliveryStatus, peerReady: response.peerReady,
+                createdNew: response.createdNew, mutationApplied: response.mutationApplied,
+                callerKeyPackage: secured.0, calleeKeyPackage: response.calleeKeyPackage,
+                callerUserID: fixtureUserID, callerDeviceID: secured.0.deviceID,
+                calleeUserID: fixtureUserID, calleeDeviceID: secured.1
+            ))
         }
         let configuration = URLSessionConfiguration.ephemeral
         configuration.protocolClasses = [AccountURLProtocol.self]

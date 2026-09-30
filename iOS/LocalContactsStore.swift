@@ -13,7 +13,7 @@ final class LocalContactsStore: ObservableObject {
     @Published private(set) var updatedAt: Date?
 
     private let store = CNContactStore()
-    private var generation: UInt64 = 0
+    private let generationStore = LocalContactGenerationStore()
     private var observer: NSObjectProtocol?
 
     init(notificationCenter: NotificationCenter = .default) {
@@ -48,8 +48,7 @@ final class LocalContactsStore: ObservableObject {
             contacts = []
             updatedAt = nil
             errorMessage = nil
-            generation &+= 1
-            ContactsToWatchSync.shared.publishCleared(generation: max(generation, 1))
+            ContactsToWatchSync.shared.publishCleared(generation: generationStore.next())
             return
         }
         do {
@@ -63,8 +62,7 @@ final class LocalContactsStore: ObservableObject {
                 loaded.append(.init(id: contact.identifier, name: name.isEmpty ? "Без імені" : name, normalizedNumbers: numbers))
             }
             contacts = loaded.sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
-            generation &+= 1
-            let snapshot = LocalContactSnapshot(generation: max(generation, 1), contacts: contacts)
+            let snapshot = LocalContactSnapshot(generation: generationStore.next(), contacts: contacts)
             updatedAt = snapshot.updatedAt
             errorMessage = nil
             ContactsToWatchSync.shared.publish(snapshot)
@@ -72,6 +70,7 @@ final class LocalContactsStore: ObservableObject {
             contacts = []
             updatedAt = nil
             errorMessage = "Не вдалося прочитати контакти. Доступний ручний пошук."
+            ContactsToWatchSync.shared.publishCleared(generation: generationStore.next())
         }
     }
 }

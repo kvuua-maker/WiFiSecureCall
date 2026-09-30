@@ -54,7 +54,7 @@ struct WatchProductRootView: View {
                         NavigationLink("Акаунт") {
                             List {
                                 WatchAccountLinkView(store: accountStore)
-                                Text("Наскрізне шифрування — для дзвінків між різними користувачами").font(.caption)
+                                Text("Нові захищені дзвінки — E2EE protocol 2. Legacy protocol 1 не є E2EE.").font(.caption)
                                 CallKeyChangeWarningsView(accountID: accountStore.activeAccountID)
                                 #if DEBUG
                                 NavigationLink("Developer diagnostics") { WatchRootView(session: session) }

@@ -21,6 +21,59 @@ struct LocalContactSnapshot: Codable, Equatable, Sendable {
     }
 }
 
+final class LocalContactGenerationStore: @unchecked Sendable {
+    private let defaults: UserDefaults
+    private let key: String
+    private let lock = NSLock()
+
+    init(defaults: UserDefaults = .standard, key: String = "localContacts.snapshotGeneration") {
+        self.defaults = defaults
+        self.key = key
+    }
+
+    func next() -> UInt64 {
+        lock.wscLocked {
+            let current = UInt64(max(0, defaults.integer(forKey: key)))
+            let next = current == UInt64.max ? current : current + 1
+            defaults.set(next, forKey: key)
+            return max(next, 1)
+        }
+    }
+
+    var current: UInt64 { lock.wscLocked { UInt64(max(0, defaults.integer(forKey: key))) } }
+}
+
+final class LocalContactSnapshotDiskCache: @unchecked Sendable {
+    private let url: URL
+    private let lock = NSLock()
+
+    init(url: URL) { self.url = url }
+
+    func load() -> LocalContactSnapshot? {
+        lock.wscLocked {
+            guard let data = try? Data(contentsOf: url),
+                  let snapshot = try? JSONDecoder().decode(LocalContactSnapshot.self, from: data),
+                  snapshot.isValid else { return nil }
+            return snapshot
+        }
+    }
+
+    @discardableResult
+    func storeIfNewer(_ snapshot: LocalContactSnapshot) -> Bool {
+        guard snapshot.isValid else { return false }
+        return lock.wscLocked {
+            if let data = try? Data(contentsOf: url),
+               let current = try? JSONDecoder().decode(LocalContactSnapshot.self, from: data),
+               current.isValid, current.generation >= snapshot.generation { return false }
+            do {
+                try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+                try JSONEncoder().encode(snapshot).write(to: url, options: [.atomic, .completeFileProtectionUnlessOpen])
+                return true
+            } catch { return false }
+        }
+    }
+}
+
 struct LocalContactEntry: Codable, Equatable, Identifiable, Sendable {
     let id: String
     let name: String

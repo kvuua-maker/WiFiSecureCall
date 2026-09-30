@@ -116,9 +116,10 @@ final class AccountCallSignaling: CallSignaling, @unchecked Sendable {
     private func map(_ response: AccountCallResponse, expectedCallID: UUID) async throws -> CallSignalView {
         guard response.callID == expectedCallID, response.localSide == localSide else { throw CallSignalingError.invalidResponse }
         let hasKeys = response.callerKeyPackage != nil || response.calleeKeyPackage != nil
-        if hasKeys { lock.wscLocked { secureMode = true } }
+        let requiresSecureProtocol = lock.wscLocked { secureMode } || hasKeys
+        if requiresSecureProtocol { lock.wscLocked { secureMode = true } }
         var audioKeys: CallAudioKeys?
-        if hasKeys {
+        if requiresSecureProtocol {
             guard let caller = response.callerKeyPackage,
                   let callerUserID = response.callerUserID, let callerDeviceID = response.callerDeviceID,
                   let calleeUserID = response.calleeUserID, let calleeDeviceID = response.calleeDeviceID,
@@ -131,10 +132,13 @@ final class AccountCallSignaling: CallSignaling, @unchecked Sendable {
             try await verify(caller, expectedCallID: expectedCallID, expectedSide: .caller, expectedUserID: callerUserID, expectedDeviceID: callerDeviceID)
             if let callee = response.calleeKeyPackage {
                 try await verify(callee, expectedCallID: expectedCallID, expectedSide: .callee, expectedUserID: calleeUserID, expectedDeviceID: calleeDeviceID)
-                guard response.state == .accepted, response.mediaToken != nil,
+            }
+            if response.state == .accepted {
+                guard let callee = response.calleeKeyPackage,
+                      response.mediaToken != nil,
                       let ephemeral = lock.wscLocked({ ephemeralByCall[expectedCallID] }) else { throw CallSignalingError.invalidResponse }
                 audioKeys = try E2EECallKeyAgreement.derive(localSide: localSide, localEphemeral: ephemeral, caller: caller, callee: callee)
-            } else if response.state == .accepted || response.mediaToken != nil {
+            } else if response.mediaToken != nil {
                 throw CallSignalingError.invalidResponse
             }
         }

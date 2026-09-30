@@ -135,8 +135,8 @@ private struct EncryptionDetailsView: View {
 
     var body: some View {
         List {
-            Label("Наскрізне шифрування між різними користувачами", systemImage: "lock.fill")
-            Text("Дзвінки між власними зв’язаними пристроями зараз використовують інший протокол і не позначаються як E2EE. Зміна ключа блокує захищений зв’язок до підтвердження.")
+            Label("Наскрізне шифрування захищених дзвінків", systemImage: "lock.fill")
+            Text("Нові дзвінки між користувачами та між власними зв’язаними пристроями використовують E2EE protocol 2. Старі дзвінки без пакетів ключів використовують legacy protocol 1 і не є E2EE. Зміна ключа блокує захищений зв’язок до підтвердження.")
             CallKeyChangeWarningsView(accountID: accountID)
         }
         .navigationTitle("Шифрування")

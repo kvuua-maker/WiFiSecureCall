@@ -234,6 +234,34 @@ final class SecureConversationPeerMetadataTests: XCTestCase {
         XCTAssertEqual(try JSONDecoder().decode(LocalContactSnapshot.self, from: encoded), snapshot)
     }
 
+    func testContactGenerationSurvivesIPhoneRestartAndPermissionClearAdvancesIt() throws {
+        let suite = "LocalContactGeneration.\(UUID())"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let firstLaunch = LocalContactGenerationStore(defaults: defaults)
+        XCTAssertEqual(firstLaunch.next(), 1)
+        XCTAssertEqual(firstLaunch.next(), 2)
+        let restarted = LocalContactGenerationStore(defaults: defaults)
+        XCTAssertEqual(restarted.current, 2)
+        XCTAssertEqual(restarted.next(), 3, "permission revocation/read failure must publish a newer tombstone")
+    }
+
+    func testWatchRestartRetainsClearTombstoneAndRejectsDelayedOldFile() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("watch-contact-cache-\(UUID())", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let url = root.appendingPathComponent("snapshot.json")
+        let contact = LocalContactEntry(id: "one", name: "Олена", normalizedNumbers: ["+380501234567"])
+        let first = LocalContactSnapshot(generation: 8, updatedAt: Date(timeIntervalSince1970: 80), contacts: [contact])
+        let cleared = LocalContactSnapshot(generation: 9, updatedAt: Date(timeIntervalSince1970: 90), contacts: [])
+        let cache = LocalContactSnapshotDiskCache(url: url)
+        XCTAssertTrue(cache.storeIfNewer(first))
+        XCTAssertTrue(cache.storeIfNewer(cleared))
+        let restarted = LocalContactSnapshotDiskCache(url: url)
+        XCTAssertEqual(restarted.load(), cleared)
+        XCTAssertFalse(restarted.storeIfNewer(first), "delayed pre-revocation file restored contacts")
+        XCTAssertEqual(restarted.load(), cleared)
+    }
+
     func testInternationalNumberNormalizationDoesNotGuessCountryOrChangeUsername() {
         XCTAssertEqual(RecipientQueryNormalization.normalize(" +380 (50) 123-45-67 "), "+380501234567")
         XCTAssertEqual(RecipientQueryNormalization.normalize("0501234567"), "0501234567")
