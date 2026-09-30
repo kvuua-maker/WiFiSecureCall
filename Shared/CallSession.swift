@@ -72,6 +72,10 @@ final class CallSession: ObservableObject {
     @Published private(set) var isMuted = false
     @Published private(set) var elapsedSeconds = 0
     @Published private(set) var incomingCallerName: String?
+    var isEndToEndEncryptedMedia: Bool {
+        activeSignaling?.mediaPeerIdentity.protocolVersion == 2 && callAudioCryptor != nil
+    }
+    var requiresEndToEndEncryptedMedia: Bool { activeSignaling?.mediaPeerIdentity.protocolVersion == 2 }
 
     private let api: APIClient
     private let config: AppConfig
@@ -918,7 +922,8 @@ final class CallSession: ObservableObject {
             accountID: signaling.historyAccountID,
             logicalCallID: serverID,
             direction: outgoing ? .outgoing : .incoming,
-            peerDisplayName: signaling.historyPeerDisplayName
+            peerDisplayName: signaling.historyPeerDisplayName,
+            targetUserID: signaling.historyTargetUserID
         )
         let events = runtimeEventContinuation
         audio.onDiagnostic = { value in events?.yield(.audioDiagnostic(next.id, value)) }

@@ -31,6 +31,7 @@ struct CallHistoryRecord: Codable, Equatable, Identifiable, Sendable {
     var terminalAt: Date?
     var status: CallHistoryStatus
     let deduplicationToken: String?
+    var targetUserID: UUID? = nil
 }
 
 protocol CallHistoryPersisting: AnyObject {
@@ -101,7 +102,7 @@ final class CallHistoryStore: ObservableObject {
     }
 
     @discardableResult
-    func begin(accountID: UUID?, logicalCallID: UUID, direction: CallHistoryDirection, peerDisplayName: String?, at date: Date = Date()) -> UUID {
+    func begin(accountID: UUID?, logicalCallID: UUID, direction: CallHistoryDirection, peerDisplayName: String?, targetUserID: UUID? = nil, at date: Date = Date()) -> UUID {
         let logicalKey = LogicalCallKey(accountID: accountID, logicalCallID: logicalCallID)
         if let existing = logicalRecordIDs[logicalKey] { return existing }
         let token = Self.deduplicationToken(accountID: accountID, logicalCallID: logicalCallID)
@@ -119,7 +120,8 @@ final class CallHistoryStore: ObservableObject {
             startedAt: date,
             terminalAt: nil,
             status: .ringing,
-            deduplicationToken: token
+            deduplicationToken: token,
+            targetUserID: targetUserID
         ), at: 0)
         logicalRecordIDs[logicalKey] = id
         logicalCallOrder.append(logicalKey)

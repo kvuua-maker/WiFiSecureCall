@@ -39,18 +39,22 @@ struct WatchProductRootView: View {
                     WatchAccountLinkView(store: accountStore)
                 } else {
                     List {
-                        NavigationLink("Recent calls") {
+                        if session.state != .idle && !session.state.isTerminal {
+                            NavigationLink("Поточний дзвінок") { ActiveCallView(session: session) }
+                        }
+                        NavigationLink("Чати") { ConversationListView(store: messages, runtime: runtime) }
+                        NavigationLink("Дзвінки") {
                             if session.state == .idle || session.state.isTerminal {
-                                CallHistoryView(store: callHistory, accountID: accountStore.activeAccountID)
+                                CallHistoryView(store: callHistory, accountID: accountStore.activeAccountID, runtime: runtime)
                             }
                             else { ActiveCallView(session: session) }
                         }
-                        NavigationLink("Contacts") { RecipientSearchView(messageStore: messages, runtime: runtime) }
-                        NavigationLink("Chats") { ConversationListView(store: messages) }
-                        NavigationLink("Settings") {
+                        NavigationLink("Контакти") { RecipientSearchView(messageStore: messages, runtime: runtime) }
+                        NavigationLink("Набрати номер") { WatchDialEntry(messageStore: messages, runtime: runtime) }
+                        NavigationLink("Акаунт") {
                             List {
                                 WatchAccountLinkView(store: accountStore)
-                                Text("End-to-end encryption").font(.caption)
+                                Text("Наскрізне шифрування — для дзвінків між різними користувачами").font(.caption)
                                 CallKeyChangeWarningsView(accountID: accountStore.activeAccountID)
                                 #if DEBUG
                                 NavigationLink("Developer diagnostics") { WatchRootView(session: session) }
@@ -75,5 +79,38 @@ struct WatchProductRootView: View {
         routedAccountID = route.accountID
         showsRoutedConversation = true
         _ = navigation.consumeConversation()
+    }
+}
+
+private struct WatchDialEntry: View {
+    @ObservedObject var messageStore: SecureMessageStore
+    let runtime: NotificationRuntime
+    @State private var number = "+"
+    private let columns = Array(repeating: GridItem(.flexible(), spacing: 4), count: 3)
+    private let keys = ["1", "2", "3", "4", "5", "6", "7", "8", "9", "+", "0", "⌫"]
+
+    var body: some View {
+        ScrollView {
+            VStack(spacing: 6) {
+                Text(number).font(.headline.monospacedDigit()).lineLimit(2).minimumScaleFactor(0.7)
+                LazyVGrid(columns: columns, spacing: 4) {
+                    ForEach(keys, id: \.self) { key in
+                        Button(key) {
+                            if key == "⌫" { if !number.isEmpty { number.removeLast() } }
+                            else if key == "+" { if number.isEmpty { number = "+" } }
+                            else if number.count < 16 { number += key }
+                        }
+                        .buttonStyle(.bordered)
+                        .accessibilityLabel(key == "⌫" ? "Видалити" : key)
+                    }
+                }
+                NavigationLink("Знайти користувача") {
+                    RecipientSearchView(messageStore: messageStore, runtime: runtime, initialRecipient: number)
+                }
+                .disabled(number.count < 3 || !number.hasPrefix("+"))
+                Text("Перед дзвінком номер перевіряється у сервісі.").font(.caption2)
+            }
+        }
+        .navigationTitle("Номер")
     }
 }

@@ -51,7 +51,22 @@ struct SecureConversation: Codable, Equatable, Sendable, Identifiable {
     let participants: [UUID]
     let createdAt: Date
     let updatedAt: Date
+    let peer: ResolvedRecipient?
     var id: UUID { conversationID }
+
+    init(conversationID: UUID, participants: [UUID], createdAt: Date, updatedAt: Date, peer: ResolvedRecipient? = nil) {
+        self.conversationID = conversationID
+        self.participants = participants
+        self.createdAt = createdAt
+        self.updatedAt = updatedAt
+        self.peer = peer
+    }
+
+    var peerDisplayName: String {
+        guard let peer else { return "Адресат недоступний" }
+        if let name = peer.displayName?.trimmingCharacters(in: .whitespacesAndNewlines), !name.isEmpty { return name }
+        return "@\(peer.username)"
+    }
 }
 
 struct SecureMessagePage: Codable, Equatable, Sendable {

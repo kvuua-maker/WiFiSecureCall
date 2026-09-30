@@ -22,10 +22,21 @@ struct RecipientSearchOperationGate {
     }
 }
 
+enum RecipientQueryNormalization {
+    static func normalize(_ input: String) -> String {
+        let trimmed = input.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmed.hasPrefix("+") else { return trimmed }
+        let digits = trimmed.dropFirst().filter { $0.isNumber }
+        guard !digits.isEmpty,
+              trimmed.dropFirst().allSatisfy({ $0.isNumber || " -().".contains($0) }) else { return trimmed }
+        return "+" + digits
+    }
+}
+
 struct RecipientSearchView: View {
     @ObservedObject var messageStore: SecureMessageStore
     let runtime: NotificationRuntime
-    @State private var recipient = ""
+    @State private var recipient: String
     @State private var result: ResolvedRecipient?
     @State private var state: ProductLoadingState = .idle
     @State private var selectedAccountID: UUID?
@@ -35,6 +46,12 @@ struct RecipientSearchView: View {
     @State private var operationGate = RecipientSearchOperationGate()
 
     private var accounts: [AccountSummary] { runtime.accountStore.callableAccounts }
+
+    init(messageStore: SecureMessageStore, runtime: NotificationRuntime, initialRecipient: String = "") {
+        self.messageStore = messageStore
+        self.runtime = runtime
+        _recipient = State(initialValue: initialRecipient)
+    }
 
     var body: some View {
         Form {
@@ -49,32 +66,32 @@ struct RecipientSearchView: View {
                 label: { EmptyView() }
             )
             if accounts.count > 1 {
-                Picker("From account", selection: $selectedAccountID) {
+                Picker("Від акаунта", selection: $selectedAccountID) {
                     ForEach(accounts) { account in Text(account.displayLabel).tag(Optional(account.accountID)) }
                 }
             }
-            Section("Find a person") {
-                TextField("@username or verified phone", text: $recipient)
+            Section("Знайти користувача") {
+                TextField("@ім’я або підтверджений номер", text: $recipient)
                     .accessibilityLabel("Recipient search")
-                Button("Search") { Task { await resolve() } }
+                Button("Знайти") { Task { await resolve() } }
                     .disabled(recipient.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || state == .loading)
             }
-            if state == .loading { ProgressView("Searching") }
+            if state == .loading { ProgressView("Пошук") }
             if case let .failed(message) = state { Text(message).foregroundStyle(.red) }
             if let result {
-                Section("Recipient") {
+                Section("Користувач у сервісі") {
                     Text(result.displayName?.isEmpty == false ? result.displayName! : "@\(result.username)").font(.headline)
                     Text("@\(result.username)").foregroundStyle(.secondary)
                     HStack {
-                        Button("Secure call") { Task { await startCall(result) } }
+                        Button("Захищений дзвінок") { Task { await startCall(result) } }
                             .disabled(state == .loading)
-                        Button("Message") { Task { await startMessage(result) } }
+                        Button("Повідомлення") { Task { await startMessage(result) } }
                             .disabled(state == .loading)
                     }
                 }
             }
         }
-        .navigationTitle("Contacts")
+        .navigationTitle("Контакти")
         .onAppear {
             if selectedAccountID == nil {
                 selectedAccountID = accounts.first(where: { $0.accountID == runtime.accountStore.activeAccountID })?.accountID ?? accounts.first?.accountID
@@ -93,9 +110,9 @@ struct RecipientSearchView: View {
     }
 
     private func resolve() async {
-        guard let accountID = currentAccountID else { state = .failed("Sign in to continue"); return }
+        guard let accountID = currentAccountID else { state = .failed("Увійдіть до акаунта"); return }
         let operation = operationGate.begin(accountID: accountID)
-        let query = recipient
+        let query = RecipientQueryNormalization.normalize(recipient)
         state = .loading
         do {
             let resolved = try await runtime.resolveRecipient(query, accountID: accountID)
@@ -106,7 +123,7 @@ struct RecipientSearchView: View {
         catch {
             guard operationGate.accepts(operation, selectedAccountID: currentAccountID) else { return }
             result = nil
-            state = .failed("Recipient is unavailable")
+            state = .failed("Користувача не знайдено або мережа недоступна. Дзвінок через сервіс неможливий.")
         }
     }
 

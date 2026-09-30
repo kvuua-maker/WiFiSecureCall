@@ -37,6 +37,7 @@ protocol CallSignaling: Sendable {
     var historyAccountID: UUID? { get }
     var incomingCallerName: String? { get }
     var historyPeerDisplayName: String? { get }
+    var historyTargetUserID: UUID? { get }
     var requiresIncomingReconciliation: Bool { get }
     func create(callID: UUID, requestID: UUID) async throws -> CallSignalView
     func call(_ id: UUID) async throws -> CallSignalView
@@ -48,6 +49,7 @@ extension CallSignaling {
     var historyAccountID: UUID? { nil }
     var incomingCallerName: String? { nil }
     var historyPeerDisplayName: String? { incomingCallerName }
+    var historyTargetUserID: UUID? { nil }
     var requiresIncomingReconciliation: Bool { false }
     func eraseSecrets() {}
 }
@@ -118,6 +120,7 @@ final class CrossUserCallSignaling: CallSignaling, @unchecked Sendable {
     var historyAccountID: UUID? { accountID }
     var incomingCallerName: String? { pushedCallerIdentity?.callKitName }
     var historyPeerDisplayName: String? { localSide == .caller ? targetDisplayName : pushedCallerIdentity?.callKitName }
+    var historyTargetUserID: UUID? { localSide == .caller ? targetUserID : nil }
     var requiresIncomingReconciliation: Bool { true }
 
     init(client: AccountAPIClient, accountID: UUID, targetUserID: UUID? = nil, targetDisplayName: String? = nil, localSide: CallPartySide, callerIdentity: CrossUserCallerIdentity? = nil, identityStore: E2EEIdentityStore = E2EEIdentityStore(), pinStore: E2EEIdentityPinStore = E2EEIdentityPinStore()) {

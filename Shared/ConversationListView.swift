@@ -2,10 +2,26 @@ import SwiftUI
 
 struct ConversationListView: View {
     @ObservedObject var store: SecureMessageStore
+    let runtime: NotificationRuntime
     @ObservedObject private var navigation = ProductNavigation.shared
+    @State private var query = ""
     @State private var routedConversation: SecureConversation?
     @State private var routedAccountID: UUID?
     @State private var showsRoutedConversation = false
+
+    init(store: SecureMessageStore, runtime: NotificationRuntime) {
+        self.store = store
+        self.runtime = runtime
+    }
+
+    private var filteredConversations: [SecureConversation] {
+        let value = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !value.isEmpty else { return store.conversations }
+        return store.conversations.filter {
+            $0.peerDisplayName.localizedCaseInsensitiveContains(value) ||
+            ($0.peer?.username.localizedCaseInsensitiveContains(value) ?? false)
+        }
+    }
 
     var body: some View {
         Group {
@@ -22,11 +38,12 @@ struct ConversationListView: View {
             if store.conversations.isEmpty {
                 VStack(spacing: 8) {
                     Image(systemName: "bubble.left.and.bubble.right").font(.largeTitle)
-                    Text("No chats yet").font(.headline)
-                    Text("Find a contact to start an end-to-end encrypted conversation.").font(.caption).foregroundStyle(.secondary).multilineTextAlignment(.center)
+                    Text("Розмов поки немає").font(.headline)
+                    Text("Знайдіть користувача за @іменем або підтвердженим номером.").font(.caption).foregroundStyle(.secondary).multilineTextAlignment(.center)
+                    NavigationLink("Написати повідомлення") { RecipientSearchView(messageStore: store, runtime: runtime) }
                 }.padding()
             } else {
-                List(store.conversations) { conversation in
+                List(filteredConversations) { conversation in
                     NavigationLink {
                         if let accountID = store.activeAccountID {
                             ConversationView(store: store, conversation: conversation, accountID: accountID)
@@ -34,12 +51,23 @@ struct ConversationListView: View {
                             EmptyView()
                         }
                     } label: {
-                        Label("Secure conversation", systemImage: "lock.fill")
+                        VStack(alignment: .leading, spacing: 3) {
+                            Text(conversation.peerDisplayName).font(.headline).lineLimit(1)
+                            if let accountID = store.activeAccountID,
+                               let last = store.messages(conversationID: conversation.id, accountID: accountID).last {
+                                Text(last.text).font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                            } else {
+                                Text("Відкрити розмову").font(.caption).foregroundStyle(.secondary)
+                            }
+                            Text(conversation.updatedAt, style: .date).font(.caption2).foregroundStyle(.secondary)
+                        }
                     }
                 }
             }
         }
-        .navigationTitle("Chats")
+        .navigationTitle("Чати")
+        .searchable(text: $query, prompt: "Пошук розмов")
+        .toolbar { NavigationLink("Новий чат") { RecipientSearchView(messageStore: store, runtime: runtime) } }
         .task { await store.refresh() }
         .onReceive(navigation.$pendingConversation) { _ in routeIfPossible() }
         .onChange(of: store.conversations) { _ in routeIfPossible() }

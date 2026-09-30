@@ -87,6 +87,24 @@ private final class RepairNotificationRecorder {
 
 @MainActor
 final class SecureMessengerCallHistoryRepairTests: XCTestCase {
+    func testVerifiedOutgoingTargetSurvivesRestartButLegacyRecordNeverInventsTarget() throws {
+        let persistence = CallHistoryMemoryPersistence()
+        let accountID = UUID(), peerID = UUID()
+        let store = CallHistoryStore(persistence: persistence)
+        let recordID = store.begin(accountID: accountID, logicalCallID: UUID(), direction: .outgoing,
+                                   peerDisplayName: "@peer", targetUserID: peerID)
+        store.finish(recordID, status: .answered)
+        XCTAssertEqual(CallHistoryStore(persistence: persistence).records.first?.targetUserID, peerID)
+
+        let legacy = LegacyCallHistoryRecord(id: UUID(), direction: .incoming, peerDisplayName: "@old",
+                                            startedAt: Date(), terminalAt: Date(), status: .missed,
+                                            deduplicationToken: nil)
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        persistence.data = try encoder.encode([legacy])
+        XCTAssertNil(CallHistoryStore(persistence: persistence).records.first?.targetUserID)
+    }
+
     func testLifecycleUpdatesOneRecordExactlyOnce() throws {
         let persistence = CallHistoryMemoryPersistence()
         let store = CallHistoryStore(persistence: persistence, retentionLimit: 10)
@@ -200,6 +218,35 @@ final class SecureMessengerCallHistoryRepairTests: XCTestCase {
         XCTAssertNil(migrated.records.first?.accountID)
         XCTAssertTrue(migrated.records(for: accountA).isEmpty)
         XCTAssertTrue(migrated.records(for: accountB).isEmpty)
+    }
+}
+
+final class SecureConversationPeerMetadataTests: XCTestCase {
+    func testInternationalNumberNormalizationDoesNotGuessCountryOrChangeUsername() {
+        XCTAssertEqual(RecipientQueryNormalization.normalize(" +380 (50) 123-45-67 "), "+380501234567")
+        XCTAssertEqual(RecipientQueryNormalization.normalize("0501234567"), "0501234567")
+        XCTAssertEqual(RecipientQueryNormalization.normalize("@friend"), "@friend")
+    }
+
+    func testPeerIdentityIsOptionalForOldConversationResponses() throws {
+        let conversation = SecureConversation(conversationID: UUID(), participants: [UUID(), UUID()],
+                                              createdAt: Date(), updatedAt: Date())
+        let legacy = try JSONEncoder().encode(conversation)
+        let decoded = try JSONDecoder().decode(SecureConversation.self, from: legacy)
+        XCTAssertNil(decoded.peer)
+        XCTAssertEqual(decoded.peerDisplayName, "Адресат недоступний")
+    }
+
+    func testAuthenticatedPeerMetadataNamesConversationWithoutUsingPhoneNumber() throws {
+        let peer = ResolvedRecipient(userID: UUID(), username: "peer", displayName: "Олена",
+                                     publicIdentity: "wsc:user:peer", phoneNumber: nil)
+        let conversation = SecureConversation(conversationID: UUID(), participants: [UUID(), peer.userID],
+                                              createdAt: Date(), updatedAt: Date(), peer: peer)
+        let decoded = try JSONDecoder().decode(SecureConversation.self,
+                                               from: JSONEncoder().encode(conversation))
+        XCTAssertEqual(decoded.peerDisplayName, "Олена")
+        XCTAssertEqual(decoded.peer?.userID, peer.userID)
+        XCTAssertNil(decoded.peer?.phoneNumber)
     }
 }
 

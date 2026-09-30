@@ -3,23 +3,40 @@ import SwiftUI
 struct CallHistoryView: View {
     @ObservedObject var store: CallHistoryStore
     let accountID: UUID?
+    let runtime: NotificationRuntime
+
+    init(store: CallHistoryStore, accountID: UUID?, runtime: NotificationRuntime) {
+        self.store = store
+        self.accountID = accountID
+        self.runtime = runtime
+    }
 
     private var visibleRecords: [CallHistoryRecord] { store.records(for: accountID) }
 
     var body: some View {
-        Group {
+        List {
+            Section {
+                NavigationLink("Новий дзвінок") {
+                    RecipientSearchView(messageStore: .shared, runtime: runtime)
+                }
+                #if os(watchOS)
+                Button("Мій iPhone") { startOwnCall(platform: "iOS") }
+                #else
+                Button("Подзвонити на мій Apple Watch") { startOwnCall(platform: "watchOS") }
+                #endif
+            }
             if visibleRecords.isEmpty {
                 VStack(spacing: 8) {
                     Image(systemName: "clock.arrow.circlepath").font(.largeTitle)
-                    Text("No recent calls").font(.headline)
-                    Text("Secure app-to-app calls will appear here.")
+                    Text("Дзвінків поки немає").font(.headline)
+                    Text("Почніть виклик через пошук користувача або свого зв’язаного пристрою.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                         .multilineTextAlignment(.center)
                 }
                 .padding()
             } else {
-                List(visibleRecords) { record in
+                Section("Історія") { ForEach(visibleRecords) { record in
                     HStack(spacing: 10) {
                         Image(systemName: record.direction == .incoming ? "phone.arrow.down.left" : "phone.arrow.up.right")
                             .foregroundStyle(record.status == .missed || record.status == .failed ? .red : .accentColor)
@@ -30,25 +47,37 @@ struct CallHistoryView: View {
                                 .foregroundStyle(.secondary)
                         }
                         Spacer(minLength: 4)
+                        if let targetUserID = record.targetUserID, let accountID = record.accountID {
+                            Button {
+                                Task { await runtime.startUserCall(targetUserID: targetUserID, accountID: accountID, peerDisplayName: record.peerDisplayName) }
+                            } label: { Image(systemName: "phone.arrow.up.right") }
+                                .buttonStyle(.borderless)
+                                .accessibilityLabel("Повторити захищений дзвінок")
+                        }
                         Text(record.startedAt, style: .relative)
                             .font(.caption2)
                             .foregroundStyle(.secondary)
                     }
                     .accessibilityElement(children: .combine)
-                }
+                } }
             }
         }
-        .navigationTitle("Recent calls")
+        .navigationTitle("Дзвінки")
+    }
+
+    private func startOwnCall(platform: String) {
+        guard let accountID else { return }
+        Task { await runtime.startPreferredCall(targetPlatform: platform, accountID: accountID) }
     }
 
     private func statusText(_ status: CallHistoryStatus) -> String {
         switch status {
-        case .ringing: return "Ringing"
-        case .active: return "Active secure call"
-        case .answered: return "Answered"
-        case .missed: return "Missed"
-        case .rejected: return "Rejected"
-        case .failed: return "Failed"
+        case .ringing: return "Виклик"
+        case .active: return "Триває"
+        case .answered: return "Відповіли"
+        case .missed: return "Пропущено"
+        case .rejected: return "Відхилено"
+        case .failed: return "Не вдалося"
         }
     }
 }

@@ -24,6 +24,11 @@ struct ConversationView: View {
                                     .background(message.isSentByCurrentUser ? Color.accentColor.opacity(0.2) : Color.secondary.opacity(0.15), in: RoundedRectangle(cornerRadius: 12))
                                     .foregroundStyle(message.availability == .available ? Color.primary : Color.secondary)
                                     .accessibilityLabel(message.availability == .available ? (message.isSentByCurrentUser ? "Sent secure message" : "Received secure message") : "Secure message unavailable")
+                                VStack(alignment: .trailing, spacing: 2) {
+                                    Text(message.createdAt, style: .time).font(.caption2).foregroundStyle(.secondary)
+                                    if message.isSentByCurrentUser && message.read { Text("Прочитано").font(.caption2) }
+                                    else if message.isSentByCurrentUser && message.delivered { Text("Доставлено").font(.caption2) }
+                                }
                                 if !message.isSentByCurrentUser { Spacer(minLength: 32) }
                             }
                             .id(message.id)
@@ -39,18 +44,21 @@ struct ConversationView: View {
             }
             if let safeError { Text(safeError).font(.caption).foregroundStyle(.red) }
             HStack {
-                TextField("Message", text: $draft)
+                TextField("Повідомлення", text: $draft)
                     #if !os(watchOS)
                     .textFieldStyle(.roundedBorder)
                     #endif
                     .accessibilityLabel("Secure message text")
                 Button {
                     let text = draft
-                    draft = ""
                     sending = true
                     Task {
-                        do { try await store.send(text: text, conversation: conversation, accountID: accountID); safeError = nil }
-                        catch { safeError = SecureMessageStore.safeError(error); draft = text }
+                        do {
+                            try await store.send(text: text, conversation: conversation, accountID: accountID)
+                            if draft == text { draft = "" }
+                            safeError = nil
+                        }
+                        catch { safeError = SecureMessageStore.safeError(error) }
                         sending = false
                     }
                 } label: {
@@ -61,8 +69,14 @@ struct ConversationView: View {
             }
             .padding([.horizontal, .bottom])
         }
-        .navigationTitle("Secure chat")
+        .navigationTitle(conversation.peerDisplayName)
         .toolbar {
+            if let peer = conversation.peer {
+                Button {
+                    Task { await NotificationRuntime.shared.startUserCall(targetUserID: peer.userID, accountID: accountID, peerDisplayName: conversation.peerDisplayName) }
+                } label: { Image(systemName: "phone") }
+                    .accessibilityLabel("Захищений дзвінок")
+            }
             NavigationLink("Safety") {
                 List {
                     let devices = store.safetyDevices(conversationID: conversation.id, accountID: accountID)

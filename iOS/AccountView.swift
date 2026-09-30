@@ -11,6 +11,8 @@ struct AccountView: View {
     @State private var appleState = ""
     @State private var appleDiagnostic: AppleVerificationDiagnostic?
     @State private var appleTransportDetail: String?
+    @State private var confirmsSignOut = false
+    @State private var confirmsDeletion = false
 
     init(store: AccountSessionStore) {
         self.store = store
@@ -18,19 +20,16 @@ struct AccountView: View {
     }
 
     var body: some View {
-        NavigationView {
-            List {
-                if store.profiles.isEmpty {
-                    Section("Free account") {
-                        SignInWithAppleButton(.signIn, onRequest: configureAppleRequest, onCompletion: handleAppleResult)
-                            .signInWithAppleButtonStyle(.black)
-                            .frame(height: 46)
-                        Text("Sign in without SMS. Your username and QR identity do not expose your Apple ID or phone number.")
-                            .font(.footnote).foregroundStyle(.secondary)
-                    }
+        List {
+                Section("Вхід через Apple") {
+                    SignInWithAppleButton(.signIn, onRequest: configureAppleRequest, onCompletion: handleAppleResult)
+                        .signInWithAppleButtonStyle(.black)
+                        .frame(height: 46)
+                    Text("Увійдіть через Apple без SMS. Публічне ім’я не розкриває Apple ID або номер телефону.")
+                        .font(.footnote).foregroundStyle(.secondary)
                 }
                 if store.accounts.isEmpty {
-                    Section("Legacy phone account") { Button("Register phone") { showRegistration = true } }
+                    Section("Акаунт за номером") { Button("Зареєструвати номер") { showRegistration = true } }
                 } else {
                     Section {
                         ForEach(store.accounts) { account in
@@ -40,30 +39,31 @@ struct AccountView: View {
                                 HStack { Text(account.displayLabel); Spacer(); if account.accountID == store.activeAccountID { Image(systemName: "checkmark") } }
                             }
                         }
-                        Button("Add account") { showRegistration = true }
+                        Button("Додати акаунт") { showRegistration = true }
                     } header: {
-                        Text("Accounts")
+                        Text("Акаунти")
                     } footer: {
-                        Text("Multiple accounts can coexist. The checkmark is only the management and Watch-linking default; choose the outgoing Secure Call identity per call.")
+                        Text("Позначка показує активний акаунт. Для дзвінка або повідомлення перевірте вибрану вихідну ідентичність.")
                     }
                     if let active = store.activeAccountID {
                         if let profile = store.profiles[active] {
-                            Section("Public identity") {
+                            Section("Публічна ідентичність") {
                                 Text("@\(profile.username)")
                                 Text(profile.publicIdentity).font(.caption).textSelection(.enabled)
                             }
                         }
-                        Section("Link Apple Watch") {
-                            TextField("6-digit code", text: $watchCode).keyboardType(.numberPad)
-                            Button("Link") { Task { await claimWatch(accountID: active) } }.disabled(watchCode.count != 6)
+                        Section("Зв’язати Apple Watch") {
+                            TextField("Шестизначний код", text: $watchCode).keyboardType(.numberPad)
+                            Button("Зв’язати") { Task { await claimWatch(accountID: active) } }.disabled(watchCode.count != 6)
                         }
                         Section {
-                            Button("Sign out", role: .destructive) { Task { await logout(active) } }
-                            Button("Delete account", role: .destructive) { Task { await delete(active) } }
+                            Button("Вийти", role: .destructive) { confirmsSignOut = true }
+                            Button("Видалити акаунт", role: .destructive) { confirmsDeletion = true }
                         }
                     }
                 }
                 if !message.isEmpty { Text(message).foregroundStyle(.secondary) }
+                #if DEBUG
                 if let appleDiagnostic {
                     Text("Diagnostic: \(appleDiagnostic.rawValue)")
                         .font(.caption.monospaced())
@@ -76,10 +76,20 @@ struct AccountView: View {
                             .textSelection(.enabled)
                     }
                 }
+                #endif
             }
-            .navigationTitle("Account")
+            .navigationTitle("Акаунт")
             .sheet(isPresented: $showRegistration) { NavigationView { PhoneRegistrationView(store: store, client: client) } }
-        }
+            .confirmationDialog("Вийти з активного акаунта?", isPresented: $confirmsSignOut) {
+                Button("Вийти", role: .destructive) {
+                    if let active = store.activeAccountID { Task { await logout(active) } }
+                }
+            }
+            .confirmationDialog("Видалити активний акаунт і його дані?", isPresented: $confirmsDeletion) {
+                Button("Видалити акаунт", role: .destructive) {
+                    if let active = store.activeAccountID { Task { await delete(active) } }
+                }
+            }
     }
 
     private func configureAppleRequest(_ request: ASAuthorizationAppleIDRequest) {
