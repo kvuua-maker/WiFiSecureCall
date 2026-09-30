@@ -367,6 +367,12 @@ final class CallSession: ObservableObject {
         catch {
             guard isCurrent(current) else { throw CancellationError() }
             if let reconciled = try? await callSignaling.rawCall(current.serverCallID), reconciled.state == .ringing || reconciled.state == .accepted {
+                guard isCurrent(current) else {
+                    let mutation: CallMutation = reconciled.state == .accepted ? .end : .cancel
+                    registerTerminalCompensation(current, mutation: mutation, signaling: callSignaling, requestID: UUID())
+                    await deliverTerminalCompensation(current)
+                    throw CancellationError()
+                }
                 serverCallCreated = true
                 serverCallAccepted = reconciled.state == .accepted
                 let mutation: CallMutation = reconciled.state == .accepted ? .end : .cancel
@@ -412,6 +418,14 @@ final class CallSession: ObservableObject {
         } catch {
             guard isCurrent(current) else { throw CancellationError() }
             if let reconciled = try? await callSignaling.rawCall(current.serverCallID) {
+                guard isCurrent(current) else {
+                    if reconciled.state == .accepted || reconciled.state == .ringing {
+                        let mutation: CallMutation = reconciled.state == .accepted ? .end : .reject
+                        registerTerminalCompensation(current, mutation: mutation, signaling: callSignaling, requestID: UUID())
+                        await deliverTerminalCompensation(current)
+                    }
+                    throw CancellationError()
+                }
                 let mutation: CallMutation
                 if reconciled.state == .accepted { serverCallAccepted = true; mutation = .end }
                 else if reconciled.state == .ringing { mutation = .reject }
