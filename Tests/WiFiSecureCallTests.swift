@@ -3409,7 +3409,7 @@ final class SecureRingingUpgradeRegressionTests: XCTestCase {
     }
 
     func testAcceptedVerificationFailureEndsServerCallWithStableRetryID() async throws {
-        let signaling = RingingUpgradeSignaling(hasVerifiedKeys: false, kind: "network", throwVerification: true, failFirstEnd: true)
+        let signaling = RingingUpgradeSignaling(hasVerifiedKeys: false, kind: "invalid", permanentVerificationFailure: true, failFirstEnd: true)
         let session = CallSession(config: config(), audio: AudioEngineMock(), media: MediaTransportMock())
         let adapter = RetainedCallKitMock(); session.attach(callKit: adapter)
         await session.startCall(signaling: signaling)
@@ -3419,6 +3419,18 @@ final class SecureRingingUpgradeRegressionTests: XCTestCase {
         XCTAssertEqual(signaling.terminalMutations, [.end, .end])
         XCTAssertEqual(Set(signaling.terminalRequestIDs).count, 1)
         XCTAssertFalse(session.isEndToEndEncryptedMedia)
+    }
+
+    func testAcceptedTransientVerificationFailureRetriesWithoutPlaintext() async throws {
+        let signaling = RingingUpgradeSignaling(hasVerifiedKeys: true, kind: "transient", transientVerificationFailures: 1)
+        let session = CallSession(config: config(), audio: AudioEngineMock(), media: MediaTransportMock())
+        let adapter = RetainedCallKitMock(); session.attach(callKit: adapter)
+        await session.startCall(signaling: signaling)
+        try await adapter.approveStart(try XCTUnwrap(adapter.startedIDs.first))
+        await waitUntil { if case .connecting = session.state { return true }; return false }
+        XCTAssertGreaterThanOrEqual(signaling.verifiedAcceptedCount, 2)
+        XCTAssertTrue(session.isEndToEndEncryptedMedia)
+        XCTAssertTrue(signaling.terminalMutations.isEmpty)
     }
 
     private func config() -> AppConfig {
@@ -3526,7 +3538,8 @@ private final class RingingUpgradeSignaling: CallSignaling, @unchecked Sendable 
     private let lock = NSLock()
     private let hasVerifiedKeys: Bool
     private let kind: String
-    private let throwVerification: Bool
+    private let permanentVerificationFailure: Bool
+    private var transientVerificationFailures: Int
     private let failFirstEnd: Bool
     private var mutations: [CallMutation] = []
     private var requestIDs: [UUID] = []
@@ -3534,15 +3547,23 @@ private final class RingingUpgradeSignaling: CallSignaling, @unchecked Sendable 
     var terminalRequestIDs: [UUID] { lock.withLock { requestIDs } }
     private(set) var rawAcceptedCount = 0
     private(set) var verifiedAcceptedCount = 0
-    init(hasVerifiedKeys: Bool, kind: String, throwVerification: Bool = false, failFirstEnd: Bool = false) {
+    init(hasVerifiedKeys: Bool, kind: String, permanentVerificationFailure: Bool = false, transientVerificationFailures: Int = 0, failFirstEnd: Bool = false) {
         self.hasVerifiedKeys = hasVerifiedKeys; self.kind = kind
-        self.throwVerification = throwVerification; self.failFirstEnd = failFirstEnd
+        self.permanentVerificationFailure = permanentVerificationFailure
+        self.transientVerificationFailures = transientVerificationFailures
+        self.failFirstEnd = failFirstEnd
     }
     func create(callID: UUID, requestID: UUID) async throws -> CallSignalView { view(callID, state: .ringing, keys: nil) }
     func rawCall(_ id: UUID) async throws -> CallSignalView { lock.withLock { rawAcceptedCount += 1 }; return view(id, state: .accepted, keys: nil) }
     func call(_ id: UUID) async throws -> CallSignalView {
-        lock.withLock { verifiedAcceptedCount += 1 }
-        if throwVerification { throw URLError(.networkConnectionLost) }
+        let shouldFailTransiently = lock.withLock { () -> Bool in
+            verifiedAcceptedCount += 1
+            guard transientVerificationFailures > 0 else { return false }
+            transientVerificationFailures -= 1
+            return true
+        }
+        if permanentVerificationFailure { throw CallSignalingError.invalidResponse }
+        if shouldFailTransiently { throw URLError(.networkConnectionLost) }
         let keys = hasVerifiedKeys ? CallAudioKeys(send: SymmetricKey(size: .bits256), receive: SymmetricKey(size: .bits256), epoch: 1, sendDirection: .callerToCallee, receiveDirection: .calleeToCaller) : nil
         return view(id, state: .accepted, keys: keys)
     }

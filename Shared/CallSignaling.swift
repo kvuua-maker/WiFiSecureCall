@@ -184,7 +184,13 @@ struct CallSignalView: Sendable, Equatable {
 enum CallSignalingError: Error {
     case invalidResponse
     case missingTarget
-    case postCommitValidation(callID: UUID, state: ServerCallState, mutationApplied: Bool?, reason: String)
+    case postCommitValidation(callID: UUID, state: ServerCallState, mutationApplied: Bool?, permanent: Bool, underlying: Error)
+}
+
+func isPermanentSecureCallValidationError(_ error: Error) -> Bool {
+    if error is E2EEKeyAgreementError { return true }
+    if case CallSignalingError.invalidResponse = error { return true }
+    return false
 }
 
 protocol CallSignaling: Sendable {
@@ -274,7 +280,7 @@ final class AccountCallSignaling: CallSignaling, @unchecked Sendable {
         do { return try await map(response, expectedCallID: callID) }
         catch {
             if action == .accept, response.state == .accepted {
-                throw CallSignalingError.postCommitValidation(callID: response.callID, state: response.state, mutationApplied: response.mutationApplied, reason: "secure_media_validation_failed")
+                throw CallSignalingError.postCommitValidation(callID: response.callID, state: response.state, mutationApplied: response.mutationApplied, permanent: isPermanentSecureCallValidationError(error), underlying: error)
             }
             throw error
         }
@@ -398,7 +404,7 @@ final class CrossUserCallSignaling: CallSignaling, @unchecked Sendable {
         do { return try await map(response, expectedCallID: callID) }
         catch {
             if action == .accept, response.state == .accepted {
-                throw CallSignalingError.postCommitValidation(callID: response.callID, state: response.state, mutationApplied: response.mutationApplied, reason: "secure_media_validation_failed")
+                throw CallSignalingError.postCommitValidation(callID: response.callID, state: response.state, mutationApplied: response.mutationApplied, permanent: isPermanentSecureCallValidationError(error), underlying: error)
             }
             throw error
         }

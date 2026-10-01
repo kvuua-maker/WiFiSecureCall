@@ -127,6 +127,8 @@ final class CallSession: ObservableObject {
     private var audioOperational = false
     private var audioFlow = AudioFlowMilestones()
     private var audioRecoveryBudget = AudioRecoveryBudget()
+    private var audioProgressCounter: UInt64 = 0
+    private var decryptFailureCount = 0
     private var firstRemoteNonzeroReported = false
     private var firstSentNonzeroReported = false
     private var sendBackpressureDropReported = false
@@ -408,13 +410,17 @@ final class CallSession: ObservableObject {
         let response: CallSignalView
         do {
             response = try await callSignaling.mutate(.accept, callID: current.serverCallID, requestID: requestID)
-        } catch let CallSignalingError.postCommitValidation(callID, state, mutationApplied, _) where callID == current.serverCallID && state == .accepted {
+        } catch let CallSignalingError.postCommitValidation(callID, state, mutationApplied, permanent, underlying) where callID == current.serverCallID && state == .accepted {
             serverCallAccepted = true
-            terminalRequestID = terminalRequestID ?? UUID()
-            registerTerminalCompensation(current, mutation: .end, signaling: callSignaling)
-            await deliverTerminalCompensation(current)
-            recordRuntimeDiagnostic("accepted_media_validation_failed", status: mutationApplied == false ? "reconciled" : "committed", callID: current.serverCallID)
-            throw CallFailure.invalidServerState
+            if !permanent, let recovered = try? await verifiedAcceptedResponse(callSignaling, current: current, deadline: deadline) {
+                response = recovered
+            } else {
+                terminalRequestID = terminalRequestID ?? UUID()
+                registerTerminalCompensation(current, mutation: .end, signaling: callSignaling)
+                await deliverTerminalCompensation(current)
+                recordRuntimeDiagnostic("accepted_media_validation_failed", status: permanent ? "permanent" : (mutationApplied == false ? "reconciled" : "bounded_timeout"), callID: current.serverCallID, domain: (underlying as NSError).domain, code: (underlying as NSError).code)
+                throw CallFailure.invalidServerState
+            }
         } catch {
             guard isCurrent(current) else { throw CancellationError() }
             if let reconciled = try? await callSignaling.rawCall(current.serverCallID) {
@@ -588,7 +594,7 @@ final class CallSession: ObservableObject {
                         // verifying the media keys fails while the UI is ringing.
                         self.serverCallAccepted = true
                         let verified: CallSignalView
-                        do { verified = try await signaling.call(current.serverCallID) }
+                        do { verified = try await self.verifiedAcceptedResponse(signaling, current: current, deadline: ringExpiresAt) }
                         catch { await self.fail(current, .invalidServerState); return }
                         guard self.isCurrent(current), verified.callID == current.serverCallID,
                               verified.state == .accepted, let token = verified.mediaToken, !token.isEmpty else {
@@ -690,14 +696,14 @@ final class CallSession: ObservableObject {
                     if response.state == .accepted { self.startMediaReconnect(current, token: token) }
                     else { await self.remoteTerminal(response, generation: current) }
                 }
-                catch { await self.fail(current, .networkLost) }
+                catch { self.startMediaReconnect(current, token: token, reconcileServerState: true) }
             }
             return
         }
         startMediaReconnect(current, token: token)
     }
 
-    private func startMediaReconnect(_ current: CallGeneration, token: String) {
+    private func startMediaReconnect(_ current: CallGeneration, token: String, reconcileServerState: Bool = false) {
         guard isCurrent(current), state.isAcceptedLifecycle else { return }
         transition(.reconnecting(current.serverCallID))
         reconnectTask?.cancel()
@@ -707,6 +713,16 @@ final class CallSession: ObservableObject {
             while !Task.isCancelled, ProcessInfo.processInfo.systemUptime < deadline {
                 do { try await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000)) } catch { return }
                 guard self.isCurrent(current) else { return }
+                if reconcileServerState {
+                    do {
+                        let response = try await self.signaling(for: current).rawCall(current.serverCallID)
+                        guard self.isCurrent(current) else { return }
+                        if response.state != .accepted { await self.remoteTerminal(response, generation: current); return }
+                    } catch {
+                        delay = min(delay * 2, 2)
+                        continue
+                    }
+                }
                 do {
                     let epoch = try await self.media.connect(callID: current.serverCallID, peer: try self.signaling(for: current).mediaPeerIdentity, token: token)
                     guard self.isCurrent(current) else { await self.media.close(connectionID: epoch); return }
@@ -752,6 +768,7 @@ final class CallSession: ObservableObject {
                     try await self.media.send(packet, connectionID: epoch)
                     guard self.generation?.id == generationID else { continue }
                     self.audioFlow.networkFrameSent = true
+                    self.audioProgressCounter &+= 1
                     self.updateAudioOperational()
                     if !self.firstSentFrameReported {
                         self.firstSentFrameReported = true
@@ -777,9 +794,17 @@ final class CallSession: ObservableObject {
         do {
             if let cryptor = callAudioCryptor { packet = try cryptor.decrypt(receivedPacket) }
             else { guard receivedPacket.protocolVersion == AudioPacket.legacyVersion else { return }; packet = receivedPacket }
-        } catch { return }
+        } catch {
+            decryptFailureCount += 1
+            if decryptFailureCount == 1 || decryptFailureCount.isMultiple(of: 10) {
+                recordRuntimeDiagnostic("encrypted_audio_authentication_drop", status: "count=\(decryptFailureCount)", callID: current.serverCallID)
+            }
+            if decryptFailureCount >= 20 { mediaDisconnected(.init(callID: current.serverCallID, connectionID: mediaEpoch, closeCode: nil, reason: .protocolViolation)) }
+            return
+        }
         guard packet.payload.count == AudioEngine.bytesPerFrame else { return }
         audioFlow.remoteFrameReceived = true
+        audioProgressCounter &+= 1
         updateAudioOperational()
         let metrics = AudioEngine.signalMetrics(forCanonicalPCM: packet.payload)
         if let metrics, metrics.hasNonzeroSignal {
@@ -884,16 +909,21 @@ final class CallSession: ObservableObject {
         audioOperational = audioFlow.isOperational(transportActive: transportActive)
         if audioOperational, !wasOperational, let callID = generation?.serverCallID {
             recordRuntimeDiagnostic("audio_operational", status: "transport=ready audio=ready", callID: callID)
-            audioFlowWatchdog?.cancel()
+            if let current = generation { beginAudioFlowWatchdog(current) }
         }
     }
 
     private func beginAudioFlowWatchdog(_ current: CallGeneration) {
         audioFlowWatchdog?.cancel()
+        let baseline = audioProgressCounter
         audioFlowWatchdog = Task { [weak self] in
             do { try await Task.sleep(nanoseconds: 5_000_000_000) } catch { return }
-            guard let self, self.isCurrent(current), self.transportActive, !self.audioOperational else { return }
-            guard let stage = self.audioFlow.failureStage else { self.updateAudioOperational(); return }
+            guard let self, self.isCurrent(current), self.transportActive else { return }
+            if self.audioOperational, self.audioProgressCounter != baseline {
+                self.beginAudioFlowWatchdog(current)
+                return
+            }
+            let stage = self.audioFlow.failureStage ?? .noMicCallback
             self.recordRuntimeDiagnostic("audio_flow_watchdog", status: stage.rawValue, callID: current.serverCallID)
             let recoveryAvailable = AudioWatchdogPolicy.action(for: stage, recoveryAvailable: !self.audioRecoveryBudget.used) == .recover
             if recoveryAvailable, self.audioRecoveryBudget.claim() {
@@ -905,11 +935,28 @@ final class CallSession: ObservableObject {
         }
     }
 
+    private func verifiedAcceptedResponse(_ signaling: any CallSignaling, current: CallGeneration, deadline: Date) async throws -> CallSignalView {
+        var lastError: Error = CallSignalingError.invalidResponse
+        while isCurrent(current), Date() < deadline {
+            do {
+                let response = try await signaling.call(current.serverCallID)
+                guard response.callID == current.serverCallID, response.state == .accepted,
+                      response.mediaToken?.isEmpty == false else { throw CallSignalingError.invalidResponse }
+                return response
+            } catch {
+                if isPermanentSecureCallValidationError(error) { throw error }
+                lastError = error
+                try await Task.sleep(nanoseconds: 250_000_000)
+            }
+        }
+        throw lastError
+    }
+
     private func recoverAudioOnly(_ current: CallGeneration) {
         guard isCurrent(current), activatedCallKitUUID == current.localCallKitUUID else { return }
         playout.stop()
         audio.stop()
-        audioFlow = AudioFlowMilestones()
+        audioFlow = AudioFlowMilestones(); audioProgressCounter = 0; decryptFailureCount = 0
         audioOperational = false
         do {
             try audio.start(muted: isMuted)
