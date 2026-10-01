@@ -840,13 +840,14 @@ final class CallSession: ObservableObject {
             firstRemoteFrameReported = true
             recordRuntimeDiagnostic("first_remote_audio_frame_received", status: "sequence=\(packet.sequence) bytes=\(packet.payload.count) rms=\(metrics?.rms ?? 0) peak=\(metrics?.peak ?? 0) nonzero=\(metrics?.nonzeroCount ?? 0)", callID: packet.callID)
         }
-        playout.insert(packet)
+        playout.insert(packet, epoch: mediaEpoch)
     }
 
     private func startPlayout(_ current: CallGeneration, mediaEpoch: UUID) {
         let audio = self.audio
         let events = runtimeEventContinuation
         playout.start(
+            epoch: mediaEpoch,
             onFrame: { payload in audio.play(payload) },
             onDiagnostic: { value in events?.yield(.playoutDiagnostic(current.id, value)) }
         )

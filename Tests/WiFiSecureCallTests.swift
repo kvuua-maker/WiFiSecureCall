@@ -1163,16 +1163,38 @@ final class WiFiSecureCallTests: XCTestCase {
         let controller = AudioPlayoutController()
         let expectation = expectation(description: "playout")
         let once = LockedOnce()
-        controller.start(onFrame: { _ in
+        let epoch = UUID()
+        controller.start(epoch: epoch, onFrame: { _ in
             guard once.claim() else { return }
             XCTAssertFalse(Thread.isMainThread)
             expectation.fulfill()
         }, onDiagnostic: { _ in })
         let id = UUID()
         for sequence in 1...5 {
-            controller.insert(AudioPacket(type: .audio, callID: id, sequence: UInt64(sequence), timestampMicroseconds: UInt64(sequence * 20_000), payload: Data(repeating: UInt8(sequence), count: 640)))
+            controller.insert(AudioPacket(type: .audio, callID: id, sequence: UInt64(sequence), timestampMicroseconds: UInt64(sequence * 20_000), payload: Data(repeating: UInt8(sequence), count: 640)), epoch: epoch)
         }
         wait(for: [expectation], timeout: 2)
+        controller.stop()
+    }
+
+    func testPlayoutRejectsPacketsFromPreviousMediaEpoch() {
+        let controller = AudioPlayoutController()
+        let oldEpoch = UUID(), newEpoch = UUID(), callID = UUID()
+        let rendered = expectation(description: "new epoch rendered")
+        let once = LockedOnce()
+        controller.start(epoch: oldEpoch, onFrame: { _ in }, onDiagnostic: { _ in })
+        controller.start(epoch: newEpoch, onFrame: { payload in
+            guard once.claim() else { return }
+            XCTAssertEqual(payload.first, 2)
+            rendered.fulfill()
+        }, onDiagnostic: { _ in })
+        let old = AudioPacket(type: .audio, callID: callID, sequence: 1, timestampMicroseconds: 20_000, payload: Data(repeating: 1, count: 640))
+        controller.insert(old, epoch: oldEpoch)
+        for sequence in 1...5 {
+            let packet = AudioPacket(type: .audio, callID: callID, sequence: UInt64(sequence), timestampMicroseconds: UInt64(sequence * 20_000), payload: Data(repeating: 2, count: 640))
+            controller.insert(packet, epoch: newEpoch)
+        }
+        wait(for: [rendered], timeout: 2)
         controller.stop()
     }
 

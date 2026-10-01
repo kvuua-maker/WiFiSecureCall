@@ -231,6 +231,8 @@ final class AudioEngine: AudioEngineHandling, @unchecked Sendable {
     private var watchdog: DispatchWorkItem?
     private var watchdogGeneration: UInt64 = 0
     private var renderedBufferCount: UInt64 = 0
+    // Access only on playbackQueue; callbacks from an earlier graph must not mark a new graph rendered.
+    private var playbackGeneration: UInt64 = 0
     private var captureLifecycle = CaptureSourceLifecycle()
     private var starting = false
     private var scheduledBuffers = 0
@@ -511,9 +513,11 @@ final class AudioEngine: AudioEngineHandling, @unchecked Sendable {
         if !player.isPlaying { player.play() }
         scheduledBuffers += 1
         peakScheduledBuffers = max(peakScheduledBuffers, scheduledBuffers)
+        let generation = playbackGeneration
         player.scheduleBuffer(converted, completionCallbackType: .dataRendered) { [weak self] _ in
             guard let self else { return }
             self.playbackQueue.async {
+                guard self.playbackGeneration == generation else { return }
                 self.scheduledBuffers = max(0, self.scheduledBuffers - 1)
                 if !self.firstPlaybackRenderedReported { self.firstPlaybackRenderedReported = true; self.emit("first_playback_buffer_rendered", "rendered") }
                 self.renderedBufferCount &+= 1
@@ -525,7 +529,7 @@ final class AudioEngine: AudioEngineHandling, @unchecked Sendable {
 
     private func cleanupGraph() {
         watchdogGeneration &+= 1; watchdog?.cancel(); watchdog = nil; captureTimer?.cancel(); captureTimer = nil
-        playbackQueue.sync {}
+        playbackQueue.sync { playbackGeneration &+= 1; scheduledBuffers = 0 }
         player.stop(); if engine.isRunning { engine.stop() }
         captureQueue.sync {}
         let sink = captureSink
