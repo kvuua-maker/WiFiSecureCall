@@ -2405,6 +2405,55 @@ final class AccountFoundationTests: XCTestCase {
         XCTAssertEqual(relaunched.activeAccountID, response.account.accountID)
     }
 
+    func testLegacyPendingCleanupMarkerMigratesAndBlocksLeakedToken() throws {
+        let suite = "AccountFoundationTests.LegacyRevoked.\(UUID())"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let secrets = FailingDeleteSecureTokenStore()
+        let response = accountResponse(phone: "+380501111111")
+        let initial = AccountSessionStore(tokenStore: secrets, defaults: defaults)
+        try initial.add(response)
+        defaults.set([response.account.accountID.uuidString], forKey: "wsc.pendingAccountCleanup.v1")
+        defaults.removeObject(forKey: "WiFiSecureCall.revokedPendingCleanup.v1")
+
+        let relaunched = AccountSessionStore(tokenStore: secrets, defaults: defaults)
+        XCTAssertFalse(relaunched.hasCallableSession(accountID: response.account.accountID))
+        XCTAssertNil(relaunched.activeAccountID)
+        XCTAssertNil(defaults.object(forKey: "wsc.pendingAccountCleanup.v1"))
+        XCTAssertEqual(defaults.stringArray(forKey: "WiFiSecureCall.revokedPendingCleanup.v1"), [response.account.accountID.uuidString])
+
+        relaunched.retryRevokedPendingCleanup()
+        XCTAssertFalse(relaunched.hasCallableSession(accountID: response.account.accountID))
+        XCTAssertNotNil(try secrets.tokens(for: response.account.accountID))
+    }
+
+    func testRecoveryRequiresExactAccountIdentity() throws {
+        let expected = UUID()
+        XCTAssertNoThrow(try validateRecoveredAccount(expectedAccountID: expected, actualAccountID: expected))
+        XCTAssertThrowsError(try validateRecoveredAccount(expectedAccountID: expected, actualAccountID: UUID())) { error in
+            XCTAssertEqual(error as? AccountRecoveryValidationError, .unexpectedAccount)
+        }
+        XCTAssertNoThrow(try validateRecoveredAccount(expectedAccountID: nil, actualAccountID: UUID()))
+    }
+
+    func testSafeCallDiagnosticsSurviveRelaunchWithoutUnscopedEvents() throws {
+        let suite = "AccountFoundationTests.Diagnostics.\(UUID())"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let callID = UUID()
+        let diagnostics = Diagnostics(defaults: defaults)
+        diagnostics.record(role: .A, callID: callID, category: "network_audio", value: "sent=12")
+        diagnostics.record(role: .A, category: "network_audio", value: "unscoped")
+        diagnostics.record(role: .A, callID: callID, category: "token", value: "must-not-persist")
+
+        let relaunched = Diagnostics(defaults: defaults)
+        let report = relaunched.lastCallReport()
+        XCTAssertTrue(report.contains(callID.uuidString))
+        XCTAssertTrue(report.contains("sent=12"))
+        XCTAssertFalse(report.contains("unscoped"))
+        XCTAssertFalse(report.contains("must-not-persist"))
+    }
+
     func testWatchSwitchFailureAndActiveCallGatePreserveVisibleAccount() throws {
         let defaults = try XCTUnwrap(UserDefaults(suiteName: "WatchSwitchGate.\(UUID())"))
         let secrets = InMemorySecureTokenStore()

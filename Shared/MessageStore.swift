@@ -56,13 +56,15 @@ final class SecureMessageStore: ObservableObject {
         if reportsLoading { setState(.loading, accountID: accountID) }
         do {
             try await ensureIdentity(accountID: accountID)
+            try requireCallable(accountID)
             try Task.checkCancellation()
             let values = try await api.conversations(accountID: accountID)
             try Task.checkCancellation()
+            try requireCallable(accountID)
             updateCache(accountID) { $0.conversations = values; $0.state = .loaded }
             return true
         } catch {
-            guard !Task.isCancelled, !Self.isCancellation(error) else { return false }
+            guard sessions.hasCallableSession(accountID: accountID), !Task.isCancelled, !Self.isCancellation(error) else { return false }
             setState(.failed(Self.safeError(error)), accountID: accountID)
             return false
         }
@@ -72,7 +74,9 @@ final class SecureMessageStore: ObservableObject {
         guard let accountID = requestedAccountID ?? sessions.activeAccountID,
               sessions.hasCallableSession(accountID: accountID) else { throw AccountAPIError.missingSession }
         try await ensureIdentity(accountID: accountID)
+        try requireCallable(accountID)
         let value = try await api.createConversation(accountID: accountID, targetUserID: targetUserID)
+        try requireCallable(accountID)
         updateCache(accountID) { if !$0.conversations.contains(where: { $0.id == value.id }) { $0.conversations.insert(value, at: 0) } }
         return value
     }
@@ -84,13 +88,16 @@ final class SecureMessageStore: ObservableObject {
         if reportsLoading { setState(.loading, accountID: accountID) }
         do {
             try await ensureIdentity(accountID: accountID)
+            try requireCallable(accountID)
             try Task.checkCancellation()
             let identity = try identityStore.identity()
             let profile = try await api.accountAPI.userProfile(accountID: accountID)
+            try requireCallable(accountID)
             try Task.checkCancellation()
             let cursor = append ? caches[accountID]?.nextCursor[conversationID] : nil
             let page = try await api.messages(accountID: accountID, conversationID: conversationID, cursor: cursor)
             try Task.checkCancellation()
+            try requireCallable(accountID)
             var decoded: [DecryptedMessage] = []
             var devices = caches[accountID]?.safetyDevices[conversationID] ?? []
             var warnings = caches[accountID]?.keyChangeWarnings[conversationID] ?? []
@@ -102,13 +109,17 @@ final class SecureMessageStore: ObservableObject {
                 }
                 let value = try await decode(record, accountID: accountID, conversationID: conversationID, profile: profile, identity: identity, safetyDevices: &devices, keyChanges: &warnings)
                 try Task.checkCancellation()
+                try requireCallable(accountID)
                 decoded.append(value)
                 if value.availability == .available, !value.isSentByCurrentUser {
+                    try requireCallable(accountID)
                     _ = try? await api.delivered(accountID: accountID, conversationID: conversationID, messageID: record.messageID)
                     try Task.checkCancellation()
+                    try requireCallable(accountID)
                 }
             }
             try Task.checkCancellation()
+            try requireCallable(accountID)
             updateCache(accountID) { cache in
                 let prior = append ? (cache.messages[conversationID] ?? []) : []
                 var merged = Dictionary(uniqueKeysWithValues: prior.map { ($0.id, $0) })
@@ -121,7 +132,7 @@ final class SecureMessageStore: ObservableObject {
             }
             return true
         } catch {
-            guard !Task.isCancelled, !Self.isCancellation(error) else { return false }
+            guard sessions.hasCallableSession(accountID: accountID), !Task.isCancelled, !Self.isCancellation(error) else { return false }
             setState(.failed(Self.safeError(error)), accountID: accountID)
             return false
         }
@@ -145,9 +156,12 @@ final class SecureMessageStore: ObservableObject {
         guard sessions.hasCallableSession(accountID: accountID) else { return }
         do {
             try await ensureIdentity(accountID: accountID)
+            try requireCallable(accountID)
             let profile = try await api.accountAPI.userProfile(accountID: accountID)
+            try requireCallable(accountID)
             guard let peerID = conversation.participants.first(where: { $0 != profile.userID }) else { return }
             let bundles = try await api.deviceKeys(accountID: accountID, userID: peerID)
+            try requireCallable(accountID)
             var devices: [E2EESafetyDevice] = [], warnings: [E2EEKeyChangeWarning] = []
             for bundle in bundles {
                 let pinned = try pinStore.pinnedBundle(userID: peerID, deviceID: bundle.deviceID, accountID: accountID)
@@ -156,7 +170,7 @@ final class SecureMessageStore: ObservableObject {
                 if trust == .keyChanged, let pinned { warnings.append(warning(accountID: accountID, conversationID: conversation.id, userID: peerID, pinned: pinned, observed: bundle)) }
             }
             updateCache(accountID) { $0.safetyDevices[conversation.id] = devices; $0.keyChangeWarnings[conversation.id] = warnings }
-        } catch { setState(.failed(Self.safeError(error)), accountID: accountID) }
+        } catch { if sessions.hasCallableSession(accountID: accountID) { setState(.failed(Self.safeError(error)), accountID: accountID) } }
     }
 
     func hasOlderMessages(conversationID: UUID, accountID: UUID) -> Bool {
@@ -166,6 +180,7 @@ final class SecureMessageStore: ObservableObject {
     func approveKeyChange(_ warning: E2EEKeyChangeWarning) async throws {
         guard sessions.hasCallableSession(accountID: warning.accountID) else { throw AccountAPIError.missingSession }
         let fresh = try await api.deviceKeys(accountID: warning.accountID, userID: warning.userID)
+        try requireCallable(warning.accountID)
         guard let bundle = fresh.first(where: { $0.deviceID == warning.deviceID }),
               bundle.signingPublicKey == warning.observedBundle.signingPublicKey,
               bundle.agreementPublicKey == warning.observedBundle.agreementPublicKey,
@@ -189,11 +204,15 @@ final class SecureMessageStore: ObservableObject {
         guard sessions.hasCallableSession(accountID: accountID),
               caches[accountID]?.conversations.contains(where: { $0.id == conversation.id }) == true else { throw AccountAPIError.missingSession }
         try await ensureIdentity(accountID: accountID)
+        try requireCallable(accountID)
         let profile = try await api.accountAPI.userProfile(accountID: accountID)
+        try requireCallable(accountID)
         guard let recipient = conversation.participants.first(where: { $0 != profile.userID }) else { throw SecureMessageCryptoError.noRecipientDevices }
         let identity = try identityStore.identity()
         let recipientDevices = try await api.deviceKeys(accountID: accountID, userID: recipient)
+        try requireCallable(accountID)
         let ownDevices = try await api.deviceKeys(accountID: accountID, userID: profile.userID)
+        try requireCallable(accountID)
         var safety: [E2EESafetyDevice] = [], warnings: [E2EEKeyChangeWarning] = []
         for bundle in recipientDevices {
             let pinned = try pinStore.pinnedBundle(userID: recipient, deviceID: bundle.deviceID, accountID: accountID)
@@ -203,8 +222,10 @@ final class SecureMessageStore: ObservableObject {
         }
         updateCache(accountID) { $0.safetyDevices[conversation.id] = safety; $0.keyChangeWarnings[conversation.id] = warnings }
         guard warnings.isEmpty else { throw E2EEIdentityError.keyChanged }
+        try requireCallable(accountID)
         let input = try SecureMessageCrypto.encrypt(text: text, conversationID: conversation.id, senderUserID: profile.userID, identity: identity, recipientDevices: recipientDevices, senderOtherDevices: ownDevices)
         let record = try await api.send(accountID: accountID, conversationID: conversation.id, input: input)
+        try requireCallable(accountID)
         let local = DecryptedMessage(id: record.messageID, conversationID: conversation.id, senderUserID: profile.userID, text: text, createdAt: record.createdAt, isSentByCurrentUser: true, delivered: record.receipts.contains { $0.deliveredAt != nil }, read: record.receipts.contains { $0.readAt != nil })
         updateCache(accountID) { $0.messages[conversation.id, default: []].append(local) }
     }
@@ -212,7 +233,11 @@ final class SecureMessageStore: ObservableObject {
     func markRead(conversationID: UUID, accountID: UUID) async {
         guard sessions.hasCallableSession(accountID: accountID),
               let values = caches[accountID]?.messages[conversationID] else { return }
-        for message in values where !message.isSentByCurrentUser && message.availability == .available { _ = try? await api.read(accountID: accountID, conversationID: conversationID, messageID: message.id) }
+        for message in values where !message.isSentByCurrentUser && message.availability == .available {
+            guard sessions.hasCallableSession(accountID: accountID) else { return }
+            _ = try? await api.read(accountID: accountID, conversationID: conversationID, messageID: message.id)
+            guard sessions.hasCallableSession(accountID: accountID) else { return }
+        }
     }
 
     func messages(conversationID: UUID, accountID: UUID) -> [DecryptedMessage] {
@@ -233,6 +258,7 @@ final class SecureMessageStore: ObservableObject {
             .init(id: record.messageID, conversationID: record.conversationID, senderUserID: record.senderUserID, text: text, createdAt: record.createdAt, isSentByCurrentUser: own, delivered: record.receipts.contains { $0.deliveredAt != nil }, read: record.receipts.contains { $0.readAt != nil }, availability: availability)
         }
         let bundles = try await api.deviceKeys(accountID: accountID, userID: record.senderUserID)
+        try requireCallable(accountID)
         guard let sender = bundles.first(where: { $0.deviceID == record.senderDeviceID }) else { return result("Secure message could not be verified", .securityFailure) }
         let pinned = try pinStore.pinnedBundle(userID: record.senderUserID, deviceID: sender.deviceID, accountID: accountID)
         let trust = try pinStore.evaluate(userID: record.senderUserID, bundle: sender, accountID: accountID)
@@ -298,19 +324,26 @@ final class SecureMessageStore: ObservableObject {
     }
 
     private func ensureIdentity(accountID: UUID) async throws {
+        try requireCallable(accountID)
         guard !registeredAccounts.contains(accountID) else { return }
         try Task.checkCancellation()
         let identity = try identityStore.identity()
         let bundle = try await api.registerIdentity(accountID: accountID, registration: identity.registration(requestID: UUID()))
         try Task.checkCancellation()
+        try requireCallable(accountID)
         guard bundle.deviceID == identity.deviceID, bundle.signingPublicKey == identity.publicBundle.signingPublicKey, bundle.agreementPublicKey == identity.publicBundle.agreementPublicKey else { throw E2EEIdentityError.keyChanged }
         registeredAccounts.insert(accountID)
     }
 
     private func updateCache(_ accountID: UUID, _ update: (inout AccountCache) -> Void) {
+        guard sessions.hasCallableSession(accountID: accountID) else { return }
         var cache = caches[accountID] ?? AccountCache(); update(&cache); caches[accountID] = cache
         if sessions.activeAccountID == accountID { publish(accountID: accountID) }
         else { objectWillChange.send() }
+    }
+
+    private func requireCallable(_ accountID: UUID) throws {
+        guard sessions.hasCallableSession(accountID: accountID) else { throw AccountAPIError.missingSession }
     }
 
     private func setState(_ value: SecureMessageViewState, accountID: UUID) { updateCache(accountID) { $0.state = value } }

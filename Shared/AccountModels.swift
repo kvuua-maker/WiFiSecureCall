@@ -190,11 +190,14 @@ struct UserProfile: Codable, Equatable, Sendable {
     let publicIdentity: String
 }
 
+enum AccountIdentityKind: String, Codable, Equatable, Sendable { case apple, phone, linked, unknown }
+
 struct AccountSummary: Codable, Identifiable, Equatable, Sendable {
     let accountID: UUID
     let userID: UUID?
     let phoneNumber: String?
     let displayLabel: String
+    let identityKind: AccountIdentityKind
     var id: UUID { accountID }
 
     init(accountID: UUID, phoneNumber: String) {
@@ -202,22 +205,25 @@ struct AccountSummary: Codable, Identifiable, Equatable, Sendable {
         self.userID = nil
         self.phoneNumber = phoneNumber
         self.displayLabel = phoneNumber
+        self.identityKind = .phone
     }
 
-    init(accountID: UUID, userID: UUID?, phoneNumber: String?, displayLabel: String) {
+    init(accountID: UUID, userID: UUID?, phoneNumber: String?, displayLabel: String, identityKind: AccountIdentityKind? = nil) {
         self.accountID = accountID
         self.userID = userID
         self.phoneNumber = phoneNumber
         self.displayLabel = displayLabel.isEmpty ? (phoneNumber ?? "Secure account") : displayLabel
+        self.identityKind = identityKind ?? (phoneNumber == nil ? .apple : .phone)
     }
 
-    private enum CodingKeys: String, CodingKey { case accountID, userID, phoneNumber, displayLabel }
+    private enum CodingKeys: String, CodingKey { case accountID, userID, phoneNumber, displayLabel, identityKind }
     init(from decoder: Decoder) throws {
         let values = try decoder.container(keyedBy: CodingKeys.self)
         accountID = try values.decode(UUID.self, forKey: .accountID)
         userID = try values.decodeIfPresent(UUID.self, forKey: .userID)
         phoneNumber = try values.decodeIfPresent(String.self, forKey: .phoneNumber)
         displayLabel = try values.decodeIfPresent(String.self, forKey: .displayLabel) ?? phoneNumber ?? "Secure account"
+        identityKind = try values.decodeIfPresent(AccountIdentityKind.self, forKey: .identityKind) ?? (phoneNumber == nil ? .unknown : .phone)
     }
 }
 

@@ -5,8 +5,9 @@ struct PhoneRegistrationView: View {
     let client: AccountAPIClient
     let canActivateAccount: () -> Bool
     let onAccountAdded: (UUID, Bool) -> Void
+    let expectedAccountID: UUID?
     @Environment(\.dismiss) private var dismiss
-    @State private var phone = ""
+    @State private var phone: String
     @State private var code = ""
     @State private var verificationID: UUID?
     @State private var busy = false
@@ -15,11 +16,15 @@ struct PhoneRegistrationView: View {
     init(
         store: AccountSessionStore,
         client: AccountAPIClient,
+        expectedAccountID: UUID? = nil,
+        knownPhoneNumber: String? = nil,
         canActivateAccount: @escaping () -> Bool = { true },
         onAccountAdded: @escaping (UUID, Bool) -> Void = { _, _ in }
     ) {
         self.store = store
         self.client = client
+        self.expectedAccountID = expectedAccountID
+        _phone = State(initialValue: knownPhoneNumber ?? "")
         self.canActivateAccount = canActivateAccount
         self.onAccountAdded = onAccountAdded
     }
@@ -53,12 +58,18 @@ struct PhoneRegistrationView: View {
         busy = true; defer { busy = false }
         do {
             let response = try await client.verifyPhone(verificationID: verificationID, code: code)
+            try validateRecoveredAccount(expectedAccountID: expectedAccountID, actualAccountID: response.account.accountID)
+            guard canActivateAccount() || expectedAccountID == nil else {
+                message = "Завершіть виклик перед відновленням акаунта."
+                return
+            }
             let decision = accountSessionIntegrationDecision(canChangeActiveAccount: canActivateAccount(), activeAccountID: store.activeAccountID, incomingAccountID: response.account.accountID)
-            try store.add(response, activate: decision.activate, invalidateE2EE: decision.invalidateE2EE)
+            try store.add(response, activate: decision.activate, invalidateE2EE: decision.invalidateE2EE, identityKind: .phone)
             await AccountPushRegistrationCoordinator.shared.registerKnownTokens(for: response.account.accountID)
             onAccountAdded(response.account.accountID, decision.activate)
             dismiss()
         }
+        catch let error as AccountRecoveryValidationError { message = error.localizedDescription }
         catch { message = "Не вдалося підтвердити код" }
     }
 }

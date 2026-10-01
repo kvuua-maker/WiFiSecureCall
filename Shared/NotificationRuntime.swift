@@ -122,6 +122,7 @@ final class NotificationRuntime {
             return
         }
         guard mutatingAccountID != accountID else { callSession.failToStart(.accountMutationInProgress); return }
+        guard accountStore.hasCallableSession(accountID: accountID) else { callSession.failToStart(.accountSessionInvalid); return }
         guard matches.count == 1 else {
             callSession.failToStart(matches.isEmpty ? .targetUnavailable : .targetAmbiguous)
             return
@@ -135,7 +136,9 @@ final class NotificationRuntime {
         guard accountStore.hasCallableSession(accountID: accountID) else {
             throw AccountAPIError.missingSession
         }
-        return try await accountAPI.resolveRecipient(input, accountID: accountID)
+        let recipient = try await accountAPI.resolveRecipient(input, accountID: accountID)
+        guard accountStore.hasCallableSession(accountID: accountID) else { throw AccountAPIError.missingSession }
+        return recipient
     }
 
     func startUserCall(targetUserID: UUID, accountID: UUID, peerDisplayName: String? = nil) async {
@@ -144,6 +147,7 @@ final class NotificationRuntime {
             callSession.failToStart(.accountSessionInvalid)
             return
         }
+        guard mutatingAccountID != accountID, accountStore.hasCallableSession(accountID: accountID) else { callSession.failToStart(.accountSessionInvalid); return }
         _ = ensureCallKit()
         let signaling = CrossUserCallSignaling(client: accountAPI, accountID: accountID, targetUserID: targetUserID, targetDisplayName: peerDisplayName, localSide: .caller)
         await callSession.startCall(signaling: signaling)
@@ -160,6 +164,10 @@ final class NotificationRuntime {
 
     func handleIncomingVoIP(callID: UUID, accountID: UUID) async {
         guard await awaitAccountMutation(accountID: accountID, callID: callID) else { return }
+        guard accountStore.hasCallableSession(accountID: accountID) else {
+            callSession.recordLifecycleDiagnostic("account_session_invalid", status: "missing_tokens", callID: callID)
+            return
+        }
         callSession.recordLifecycleDiagnostic("push_received", status: "account", callID: callID)
         guard let signaling = accountIncomingSignaling(accountID: accountID, callID: callID) else {
             if !accountStore.accounts.contains(where: { $0.accountID == accountID }) {
@@ -202,6 +210,10 @@ final class NotificationRuntime {
 
     func handleIncomingBackgroundNotification(callID: UUID, accountID: UUID) async -> Bool {
         guard await awaitAccountMutation(accountID: accountID, callID: callID) else { return false }
+        guard accountStore.hasCallableSession(accountID: accountID) else {
+            callSession.recordLifecycleDiagnostic("account_session_invalid", status: "missing_tokens", callID: callID)
+            return false
+        }
         callSession.recordLifecycleDiagnostic("watch_background_notification_received", status: "account", callID: callID)
         if let duplicate = duplicateIncomingResult(callID: callID) { return duplicate }
         guard let signaling = accountIncomingSignaling(accountID: accountID, callID: callID) else { return false }
@@ -220,12 +232,20 @@ final class NotificationRuntime {
 
     func handleIncomingAlert(callID: UUID, accountID: UUID, requestAnswer: Bool) async {
         guard await awaitAccountMutation(accountID: accountID, callID: callID) else { return }
+        guard accountStore.hasCallableSession(accountID: accountID) else {
+            callSession.recordLifecycleDiagnostic("account_session_invalid", status: "missing_tokens", callID: callID)
+            return
+        }
         guard let signaling = accountIncomingSignaling(accountID: accountID, callID: callID), ensureCallKit() != nil else { return }
         await callSession.handleIncoming(callID: callID, requestAnswer: requestAnswer, signaling: signaling)
     }
 
     func handleIncomingUserVoIP(callID: UUID, accountID: UUID, caller: CrossUserCallerIdentity) async {
         guard await awaitAccountMutation(accountID: accountID, callID: callID) else { return }
+        guard accountStore.hasCallableSession(accountID: accountID) else {
+            callSession.recordLifecycleDiagnostic("account_session_invalid", status: "missing_tokens", callID: callID)
+            return
+        }
         callSession.recordLifecycleDiagnostic("push_received", status: "user", callID: callID)
         guard let signaling = userIncomingSignaling(accountID: accountID, caller: caller), ensureCallKit() != nil else { return }
         await callSession.handleIncomingVoIP(callID: callID, signaling: signaling)
@@ -233,6 +253,10 @@ final class NotificationRuntime {
 
     func handleIncomingUserBackgroundNotification(callID: UUID, accountID: UUID, caller: CrossUserCallerIdentity) async -> Bool {
         guard await awaitAccountMutation(accountID: accountID, callID: callID) else { return false }
+        guard accountStore.hasCallableSession(accountID: accountID) else {
+            callSession.recordLifecycleDiagnostic("account_session_invalid", status: "missing_tokens", callID: callID)
+            return false
+        }
         callSession.recordLifecycleDiagnostic("watch_background_notification_received", status: "user", callID: callID)
         if let duplicate = duplicateIncomingResult(callID: callID) { return duplicate }
         guard let signaling = userIncomingSignaling(accountID: accountID, caller: caller), ensureCallKit() != nil else { return false }
@@ -242,6 +266,10 @@ final class NotificationRuntime {
 
     func handleIncomingUserAlert(callID: UUID, accountID: UUID, caller: CrossUserCallerIdentity, requestAnswer: Bool) async {
         guard await awaitAccountMutation(accountID: accountID, callID: callID) else { return }
+        guard accountStore.hasCallableSession(accountID: accountID) else {
+            callSession.recordLifecycleDiagnostic("account_session_invalid", status: "missing_tokens", callID: callID)
+            return
+        }
         guard let signaling = userIncomingSignaling(accountID: accountID, caller: caller), ensureCallKit() != nil else { return }
         await callSession.handleIncoming(callID: callID, requestAnswer: requestAnswer, signaling: signaling)
     }

@@ -18,6 +18,7 @@ struct AccountView: View {
     @State private var confirmsDeletion = false
     @State private var showsAppleSignIn = false
     @State private var pendingSwitchAccountID: UUID?
+    @State private var recoveryAccount: AccountSummary?
 
     init(store: AccountSessionStore, runtime: NotificationRuntime = .shared, canSwitchAccounts: @escaping () -> Bool = { true }) {
         self.store = store
@@ -67,10 +68,12 @@ struct AccountView: View {
                         }
                         Button("Додати акаунт через Apple") {
                             guard canSwitchAccounts() else { message = "Завершіть виклик перед додаванням акаунта."; return }
+                            recoveryAccount = nil
                             showsAppleSignIn = true
                         }
                         Button("Додати акаунт за номером") {
                             guard canSwitchAccounts() else { message = "Завершіть виклик перед додаванням акаунта."; return }
+                            recoveryAccount = nil
                             showRegistration = true
                         }
                     } header: {
@@ -88,11 +91,15 @@ struct AccountView: View {
                                     HStack {
                                         Button("Увійти знову") {
                                             guard canSwitchAccounts() else { message = "Завершіть виклик перед повторним входом."; return }
-                                            if account.phoneNumber != nil {
+                                            if account.identityKind == .phone || account.identityKind == .linked, account.phoneNumber != nil {
+                                                recoveryAccount = account
                                                 showRegistration = true
                                                 message = "Підтвердьте номер цього акаунта. Інший акаунт не замінить вибраний запис."
-                                            } else {
+                                            } else if account.identityKind == .apple {
+                                                recoveryAccount = account
                                                 showsAppleSignIn = true
+                                            } else {
+                                                message = "Спосіб входу цього старого запису невідомий. Вилучіть запис і додайте акаунт знову."
                                             }
                                         }
                                         Button("Вилучити запис", role: .destructive) { removeOrphaned(account.accountID) }
@@ -169,7 +176,7 @@ struct AccountView: View {
             .navigationTitle("Профіль")
             .sheet(isPresented: $showRegistration) {
                 NavigationView {
-                    PhoneRegistrationView(store: store, client: client, canActivateAccount: canSwitchAccounts) { accountID, activated in
+                    PhoneRegistrationView(store: store, client: client, expectedAccountID: recoveryAccount?.accountID, knownPhoneNumber: recoveryAccount?.phoneNumber, canActivateAccount: canSwitchAccounts) { accountID, activated in
                         if !activated {
                             pendingSwitchAccountID = accountID
                             message = "Акаунт додано. Перемкніться після завершення виклику."
@@ -204,6 +211,8 @@ struct AccountView: View {
             request.requestedScopes = [.fullName, .email]
             request.nonce = AppleSignInNonceContract.requestNonce(forRawNonce: rawNonce)
             request.state = state
+        } catch let error as AccountRecoveryValidationError {
+            message = error.localizedDescription
         } catch {
             appleNonce = ""
             appleState = ""
@@ -240,9 +249,10 @@ struct AccountView: View {
     @MainActor private func finishAppleSignIn(identityToken: String, authorizationCode: String, nonce: String, displayName: String, email: String) async {
         do {
             let response = try await client.signInWithApple(identityToken: identityToken, authorizationCode: authorizationCode, nonce: nonce, displayName: displayName, email: email)
+            try validateRecoveredAccount(expectedAccountID: recoveryAccount?.accountID, actualAccountID: response.account.accountID)
             let alreadyAdded = store.accounts.contains(where: { $0.accountID == response.account.accountID })
             let decision = accountSessionIntegrationDecision(canChangeActiveAccount: canSwitchAccounts(), activeAccountID: store.activeAccountID, incomingAccountID: response.account.accountID)
-            try store.add(response, activate: decision.activate, invalidateE2EE: decision.invalidateE2EE)
+            try store.add(response, activate: decision.activate, invalidateE2EE: decision.invalidateE2EE, identityKind: .apple)
             await AccountPushRegistrationCoordinator.shared.registerKnownTokens(for: response.account.accountID)
             appleDiagnostic = nil
             appleTransportDetail = nil
