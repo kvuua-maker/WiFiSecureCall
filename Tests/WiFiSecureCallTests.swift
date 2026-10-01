@@ -2478,6 +2478,52 @@ final class AccountFoundationTests: XCTestCase {
         XCTAssertFalse(store.accounts.contains { $0.accountID == accountID })
     }
 
+    @MainActor
+    func testRemoteSuccessWithLocalFailureRevokesTokensAndRestartFinishesCleanup() async throws {
+        let accountID = UUID()
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: "DurableMutationCleanup.\(UUID())"))
+        let secrets = InMemorySecureTokenStore()
+        let store = AccountSessionStore(tokenStore: secrets, defaults: defaults)
+        try store.add(accountResponse(accountID: accountID, phone: "+380501111111"))
+        let runtime = NotificationRuntime(config: accountConfig(), accountStore: store, accountAPI: AccountAPIClient(config: accountConfig(), tokenStore: secrets), audio: AudioEngineMock(), media: MediaTransportMock())
+
+        do {
+            try await runtime.performExclusiveAccountMutation(
+                accountID: accountID,
+                remote: {},
+                local: { throw CocoaError(.fileWriteUnknown) }
+            )
+            XCTFail("local cleanup failure was hidden")
+        } catch {
+            XCTAssertEqual(error as? AccountMutationError, .localCleanupFailedAfterRemoteSuccess)
+        }
+        XCTAssertNil(try secrets.tokens(for: accountID))
+        XCTAssertFalse(store.callableAccounts.contains { $0.accountID == accountID })
+
+        _ = NotificationRuntime(config: accountConfig(), accountStore: store, accountAPI: AccountAPIClient(config: accountConfig(), tokenStore: secrets), audio: AudioEngineMock(), media: MediaTransportMock())
+        XCTAssertFalse(store.accounts.contains { $0.accountID == accountID })
+        XCTAssertFalse(store.callableAccounts.contains { $0.accountID == accountID })
+    }
+
+    @MainActor
+    func testServerFailureKeepsSessionAndHasDistinctResult() async throws {
+        let accountID = UUID()
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: "RemoteMutationFailure.\(UUID())"))
+        let secrets = InMemorySecureTokenStore()
+        let store = AccountSessionStore(tokenStore: secrets, defaults: defaults)
+        try store.add(accountResponse(accountID: accountID, phone: "+380501111111"))
+        let runtime = NotificationRuntime(config: accountConfig(), accountStore: store, accountAPI: AccountAPIClient(config: accountConfig(), tokenStore: secrets), audio: AudioEngineMock(), media: MediaTransportMock())
+
+        do {
+            try await runtime.performExclusiveAccountMutation(accountID: accountID, remote: { throw URLError(.timedOut) }, local: { XCTFail("local cleanup ran after remote failure") })
+            XCTFail("server failure was hidden")
+        } catch {
+            XCTAssertEqual(error as? AccountMutationError, .serverActionFailed)
+        }
+        XCTAssertNotNil(try secrets.tokens(for: accountID))
+        XCTAssertTrue(store.callableAccounts.contains { $0.accountID == accountID })
+    }
+
     func testNotificationRoutingNeverCrossesAccountsDuringCallOrUsesOrphan() throws {
         let defaults = try XCTUnwrap(UserDefaults(suiteName: "NotificationRoutingAccounts.\(UUID())"))
         let secrets = InMemorySecureTokenStore()
@@ -3249,6 +3295,43 @@ final class AccountCallFoundationTests: XCTestCase {
 
         XCTAssertEqual(adapter.incomingIDs.count, 1)
         XCTAssertEqual(runtime.callSession.activeAccountID, incomingID)
+        await gate.release()
+        _ = try await mutation.value
+    }
+
+    func testSlowSameAccountMutationBoundsVoIPAndBackgroundPushHandling() async throws {
+        let accountID = UUID(), voipCallID = UUID(), backgroundCallID = UUID()
+        let secrets = InMemorySecureTokenStore()
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: "BoundedIncomingMutation.\(UUID())"))
+        let store = AccountSessionStore(tokenStore: secrets, defaults: defaults)
+        try store.add(accountSession(accountID: accountID))
+        let session = accountCallTestSession { _ in
+            XCTFail("timed-out push must not reach signaling")
+            return (500, AccountAPIErrorResponse(error: "unexpected", retryAt: nil))
+        }
+        let runtime = NotificationRuntime(
+            config: accountCallConfig(),
+            accountStore: store,
+            accountAPI: AccountAPIClient(config: accountCallConfig(), tokenStore: secrets, session: session),
+            audio: AudioEngineMock(),
+            media: MediaTransportMock(),
+            accountMutationPushWaitNanoseconds: 50_000_000
+        )
+        let adapter = RetainedCallKitMock()
+        runtime.configureCallKitFactory { adapter }
+        let gate = AccountMutationTestGate()
+        let mutation = Task { @MainActor in
+            try await runtime.performExclusiveAccountMutation(accountID: accountID, remote: { await gate.wait() }, local: {})
+        }
+        await gate.waitUntilReached()
+
+        let started = Date()
+        await runtime.handleIncomingVoIP(callID: voipCallID, accountID: accountID)
+        let backgroundHandled = await runtime.handleIncomingBackgroundNotification(callID: backgroundCallID, accountID: accountID)
+
+        XCTAssertLessThan(Date().timeIntervalSince(started), 0.5)
+        XCTAssertFalse(backgroundHandled)
+        XCTAssertTrue(adapter.incomingIDs.isEmpty)
         await gate.release()
         _ = try await mutation.value
     }

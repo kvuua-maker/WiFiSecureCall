@@ -3,6 +3,8 @@ import Foundation
 enum AccountMutationError: Error, Equatable {
     case callInProgress
     case mutationInProgress
+    case serverActionFailed
+    case localCleanupFailedAfterRemoteSuccess
 }
 
 func callStateBlocksAccountMutation(_ state: CallState) -> Bool {
@@ -44,6 +46,8 @@ final class NotificationRuntime {
     private(set) var callKitCreationCount = 0
     private var mutatingAccountID: UUID?
     private var accountMutationOutcomes: [UUID: Bool] = [:]
+    private let accountMutationPushWaitNanoseconds: UInt64
+    private static let pendingCleanupKey = "wsc.pendingAccountCleanup.v1"
 
     init(
         config: AppConfig = AppConfig.load(),
@@ -53,7 +57,8 @@ final class NotificationRuntime {
         audio: AudioEngineHandling = AudioEngine(),
         media: MediaTransport? = nil,
         accountIdentityStore: E2EEIdentityStore = E2EEIdentityStore(),
-        accountPinStore: E2EEIdentityPinStore = E2EEIdentityPinStore()
+        accountPinStore: E2EEIdentityPinStore = E2EEIdentityPinStore(),
+        accountMutationPushWaitNanoseconds: UInt64 = 1_500_000_000
     ) {
         let effectiveAPI = api ?? APIClient(config: config)
         self.api = effectiveAPI
@@ -62,7 +67,9 @@ final class NotificationRuntime {
         self.accountAPI = accountAPI ?? AccountAPIClient(config: config, tokenStore: effectiveAccountStore.tokenStore)
         self.accountIdentityStore = accountIdentityStore
         self.accountPinStore = accountPinStore
+        self.accountMutationPushWaitNanoseconds = accountMutationPushWaitNanoseconds
         callSession = CallSession(config: config, api: effectiveAPI, audio: audio, media: media)
+        recoverPendingAccountCleanup()
     }
 
     func configureCallKitFactory(_ factory: @escaping () -> CallKitHandling) {
@@ -271,13 +278,21 @@ final class NotificationRuntime {
         accountMutationOutcomes.removeValue(forKey: accountID)
         do {
             try await remote()
-            // Calls for this account remain gated until its local credentials are
-            // removed, so a successful server logout cannot leave a usable local session.
-            try local()
-            finishAccountMutation(succeeded: true)
         } catch {
             finishAccountMutation(succeeded: false)
-            throw error
+            throw AccountMutationError.serverActionFailed
+        }
+        markPendingAccountCleanup(accountID)
+        do {
+            try local()
+            clearPendingAccountCleanup(accountID)
+            finishAccountMutation(succeeded: true)
+        } catch {
+            // The remote session is already revoked. Remove local credentials even
+            // if metadata cleanup failed, and retain a durable cleanup marker.
+            try? accountStore.tokenStore.delete(accountID: accountID)
+            finishAccountMutation(succeeded: true)
+            throw AccountMutationError.localCleanupFailedAfterRemoteSuccess
         }
     }
 
@@ -289,7 +304,12 @@ final class NotificationRuntime {
     func awaitAccountMutation(accountID: UUID, callID: UUID) async -> Bool {
         guard mutatingAccountID == accountID else { return true }
         callSession.recordLifecycleDiagnostic("incoming_waiting_for_account_mutation", status: "pending", callID: callID)
+        let deadline = DispatchTime.now().uptimeNanoseconds &+ accountMutationPushWaitNanoseconds
         while mutatingAccountID == accountID {
+            if DispatchTime.now().uptimeNanoseconds >= deadline {
+                callSession.recordLifecycleDiagnostic("incoming_account_mutation_wait_timeout", status: "not_reported", callID: callID)
+                return false
+            }
             do { try await Task.sleep(nanoseconds: 10_000_000) }
             catch { return false }
         }
@@ -299,6 +319,33 @@ final class NotificationRuntime {
         }
         callSession.recordLifecycleDiagnostic("incoming_resumed_after_account_mutation", status: "mutation_failed", callID: callID)
         return true
+    }
+
+    private func pendingAccountCleanupIDs() -> Set<UUID> {
+        Set((UserDefaults.standard.stringArray(forKey: Self.pendingCleanupKey) ?? []).compactMap(UUID.init(uuidString:)))
+    }
+
+    private func markPendingAccountCleanup(_ accountID: UUID) {
+        var pending = pendingAccountCleanupIDs()
+        pending.insert(accountID)
+        UserDefaults.standard.set(pending.map(\.uuidString).sorted(), forKey: Self.pendingCleanupKey)
+    }
+
+    private func clearPendingAccountCleanup(_ accountID: UUID) {
+        var pending = pendingAccountCleanupIDs()
+        pending.remove(accountID)
+        UserDefaults.standard.set(pending.map(\.uuidString).sorted(), forKey: Self.pendingCleanupKey)
+    }
+
+    private func recoverPendingAccountCleanup() {
+        for accountID in pendingAccountCleanupIDs() {
+            do {
+                try accountStore.logout(accountID: accountID)
+                clearPendingAccountCleanup(accountID)
+            } catch {
+                try? accountStore.tokenStore.delete(accountID: accountID)
+            }
+        }
     }
 
     private func userIncomingSignaling(accountID: UUID, caller: CrossUserCallerIdentity) -> CrossUserCallSignaling? {
