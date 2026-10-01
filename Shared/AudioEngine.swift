@@ -66,13 +66,13 @@ struct AudioFlowMilestones: Equatable, Sendable {
     }
 }
 
-enum AudioWatchdogAction: Equatable, Sendable { case recover, preserveCall }
+enum AudioWatchdogAction: Equatable, Sendable { case recover, terminate }
 
 enum AudioWatchdogPolicy {
     static func action(for stage: AudioFlowFailureStage, recoveryAvailable: Bool) -> AudioWatchdogAction {
         let structural = stage == .noMicCallback || stage == .conversionFailure ||
             stage == .playbackScheduleFailure || stage == .renderFailure
-        return structural && recoveryAvailable ? .recover : .preserveCall
+        return structural && recoveryAvailable ? .recover : .terminate
     }
 }
 

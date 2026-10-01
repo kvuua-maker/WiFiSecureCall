@@ -1111,11 +1111,11 @@ final class WiFiSecureCallTests: XCTestCase {
         XCTAssertFalse(budget.claim())
     }
 
-    func testAudioWatchdogPreservesCallAfterRecoveryBudgetAndForTransportStages() {
+    func testAudioWatchdogTerminatesAfterRecoveryBudgetOrUnrecoverableTransportStall() {
         XCTAssertEqual(AudioWatchdogPolicy.action(for: .noMicCallback, recoveryAvailable: true), .recover)
-        XCTAssertEqual(AudioWatchdogPolicy.action(for: .noMicCallback, recoveryAvailable: false), .preserveCall)
-        XCTAssertEqual(AudioWatchdogPolicy.action(for: .sendFailure, recoveryAvailable: true), .preserveCall)
-        XCTAssertEqual(AudioWatchdogPolicy.action(for: .receiveAbsent, recoveryAvailable: true), .preserveCall)
+        XCTAssertEqual(AudioWatchdogPolicy.action(for: .noMicCallback, recoveryAvailable: false), .terminate)
+        XCTAssertEqual(AudioWatchdogPolicy.action(for: .sendFailure, recoveryAvailable: true), .terminate)
+        XCTAssertEqual(AudioWatchdogPolicy.action(for: .receiveAbsent, recoveryAvailable: true), .terminate)
     }
 
     func testJitterBufferReordersDropsDuplicatesAndLatePackets() {
@@ -1663,8 +1663,8 @@ final class WiFiSecureCallTests: XCTestCase {
     @MainActor
     func testSystemEndAfterCallBecomesActiveEndsNormally() async throws {
         let capture = RequestCapture(); capture.mutationState = .ended
-        let media = MediaTransportMock()
-        let (session, adapter, serverID, localID) = try await prepareOutgoingRinging(capture: capture, media: media)
+        let audio = AudioEngineMock(), media = MediaTransportMock()
+        let (session, adapter, serverID, localID) = try await prepareOutgoingRinging(capture: capture, audio: audio, media: media)
         adapter.onAudioActivated?(localID)
         capture.getState = .accepted
         let preserved = try await adapter.approveEnd(localID, origin: .system)
@@ -1672,6 +1672,7 @@ final class WiFiSecureCallTests: XCTestCase {
         await eventually { !media.connectionIDs.isEmpty }
         let epoch = try XCTUnwrap(media.connectionIDs.last)
         media.onPeerReady?(serverID, epoch)
+        establishAudioFlow(audio: audio, media: media, callID: serverID, epoch: epoch)
         await eventually { session.state == .active(serverID) }
 
         let disposition = try await adapter.approveEnd(localID, origin: .system)
@@ -1769,13 +1770,18 @@ final class WiFiSecureCallTests: XCTestCase {
         XCTAssertTrue(adapter.connectedIDs.isEmpty)
         let epoch = try XCTUnwrap(media.connectionIDs.last)
         media.onPeerReady?(serverID, epoch)
+        let capturedFrame = Data(repeating: 3, count: AudioEngine.bytesPerFrame)
+        audio.onDiagnostic?(.init(event: "first_mic_callback", status: "test", errorDomain: nil, errorCode: nil))
+        audio.onDiagnostic?(.init(event: "first_network_pcm_generated", status: "test", errorDomain: nil, errorCode: nil))
+        audio.onFrame?(capturedFrame)
+        await eventually { media.sentPackets.count == 1 }
+        media.onPacket?(AudioPacket(type: .audio, callID: serverID, sequence: 1, timestampMicroseconds: 20_000, payload: Data(repeating: 0, count: AudioEngine.bytesPerFrame)), epoch)
+        audio.onDiagnostic?(.init(event: "first_playback_buffer_scheduled", status: "test", errorDomain: nil, errorCode: nil))
+        audio.onDiagnostic?(.init(event: "first_playback_buffer_rendered", status: "test", errorDomain: nil, errorCode: nil))
         await eventually { adapter.connectedIDs == [localID] }
         XCTAssertEqual(adapter.connectedIDs, [localID])
         XCTAssertNotEqual(serverID, localID)
 
-        let capturedFrame = Data(repeating: 3, count: AudioEngine.bytesPerFrame)
-        audio.onFrame?(capturedFrame)
-        await eventually { media.sentPackets.count == 1 }
         XCTAssertEqual(media.sentPackets.first?.callID, serverID)
         XCTAssertEqual(media.sentPackets.first?.payload, capturedFrame)
 
@@ -1808,7 +1814,7 @@ final class WiFiSecureCallTests: XCTestCase {
     }
 
     @MainActor
-    func testRepeatedAudioHealthFailureUsesOneRecoveryAndPreservesActiveCall() async throws {
+    func testRepeatedAudioHealthFailureUsesOneRecoveryThenEndsBrokenCall() async throws {
         let capture = RequestCapture(); capture.getState = .accepted
         let audio = AudioEngineMock(), media = MediaTransportMock()
         let session = makeSession(capture: capture, audio: audio, media: media)
@@ -1822,6 +1828,7 @@ final class WiFiSecureCallTests: XCTestCase {
         await eventually { audio.startCount == 1 && !media.connectionIDs.isEmpty }
         let epoch = try XCTUnwrap(media.connectionIDs.last)
         media.onPeerReady?(serverID, epoch)
+        establishAudioFlow(audio: audio, media: media, callID: serverID, epoch: epoch)
         await eventually { session.state == .active(serverID) }
 
         audio.onFailure?(.configurationChanged)
@@ -1830,8 +1837,7 @@ final class WiFiSecureCallTests: XCTestCase {
         try? await Task.sleep(nanoseconds: 50_000_000)
 
         XCTAssertEqual(audio.startCount, 2)
-        XCTAssertEqual(session.state, .active(serverID))
-        XCTAssertFalse(session.state.isTerminal)
+        XCTAssertTrue(session.state.isTerminal)
     }
 
     @MainActor
@@ -2096,6 +2102,15 @@ final class WiFiSecureCallTests: XCTestCase {
             try? await Task.sleep(nanoseconds: 10_000_000)
         }
     }
+
+    private func establishAudioFlow(audio: AudioEngineMock, media: MediaTransportMock, callID: UUID, epoch: UUID) {
+        audio.onDiagnostic?(.init(event: "first_mic_callback", status: "test", errorDomain: nil, errorCode: nil))
+        audio.onDiagnostic?(.init(event: "first_network_pcm_generated", status: "test", errorDomain: nil, errorCode: nil))
+        audio.onFrame?(Data(repeating: 0, count: AudioEngine.bytesPerFrame))
+        media.onPacket?(AudioPacket(type: .audio, callID: callID, sequence: 1, timestampMicroseconds: 20_000, payload: Data(repeating: 0, count: AudioEngine.bytesPerFrame)), epoch)
+        audio.onDiagnostic?(.init(event: "first_playback_buffer_scheduled", status: "test", errorDomain: nil, errorCode: nil))
+        audio.onDiagnostic?(.init(event: "first_playback_buffer_rendered", status: "test", errorDomain: nil, errorCode: nil))
+    }
 }
 
 private final class LockedOnce: @unchecked Sendable {
@@ -2359,6 +2374,35 @@ final class AccountFoundationTests: XCTestCase {
         let relaunched = AccountSessionStore(tokenStore: secrets, defaults: defaults)
         XCTAssertEqual(relaunched.activeAccountID, first.account.accountID)
         XCTAssertEqual(relaunched.callableAccounts.map(\.accountID), [first.account.accountID])
+    }
+
+    func testRevokedMarkerBlocksLeakedKeychainTokenAcrossRestartAndClearsOnConfirmedLogin() throws {
+        let suite = "AccountFoundationTests.Revoked.\(UUID())"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let secrets = FailingDeleteSecureTokenStore()
+        let response = accountResponse(phone: "+380501111111")
+        let store = AccountSessionStore(tokenStore: secrets, defaults: defaults)
+        try store.add(response)
+        store.markRevokedPendingCleanup(accountID: response.account.accountID)
+
+        XCTAssertFalse(store.hasCallableSession(accountID: response.account.accountID))
+        XCTAssertNil(store.activeAccountID)
+        XCTAssertEqual(store.switchAccount(to: response.account.accountID), .missingSession)
+        XCTAssertNotNil(try secrets.tokens(for: response.account.accountID), "simulated Keychain deletion has not succeeded")
+
+        let relaunched = AccountSessionStore(tokenStore: secrets, defaults: defaults)
+        relaunched.retryRevokedPendingCleanup()
+        XCTAssertFalse(relaunched.hasCallableSession(accountID: response.account.accountID))
+        XCTAssertNil(relaunched.activeAccountID)
+
+        secrets.failDelete = false
+        relaunched.retryRevokedPendingCleanup()
+        XCTAssertFalse(relaunched.accounts.contains(where: { $0.accountID == response.account.accountID }))
+
+        try relaunched.add(response)
+        XCTAssertTrue(relaunched.hasCallableSession(accountID: response.account.accountID))
+        XCTAssertEqual(relaunched.activeAccountID, response.account.accountID)
     }
 
     func testWatchSwitchFailureAndActiveCallGatePreserveVisibleAccount() throws {
@@ -4006,6 +4050,26 @@ private final class InMemorySecureTokenStore: SecureTokenStore, @unchecked Senda
     @discardableResult
     func deleteIfRefreshTokenMatches(accountID: UUID, refreshToken: String) throws -> Bool {
         lock.withLock {
+            guard values[accountID]?.refreshToken == refreshToken else { return false }
+            values[accountID] = nil
+            return true
+        }
+    }
+}
+
+private final class FailingDeleteSecureTokenStore: SecureTokenStore, @unchecked Sendable {
+    private let lock = NSLock()
+    private var values: [UUID: AccountTokens] = [:]
+    var failDelete = true
+    func tokens(for accountID: UUID) throws -> AccountTokens? { lock.withLock { values[accountID] } }
+    func save(_ tokens: AccountTokens, for accountID: UUID) throws { lock.withLock { values[accountID] = tokens } }
+    func delete(accountID: UUID) throws {
+        if failDelete { throw CocoaError(.fileWriteUnknown) }
+        lock.withLock { values[accountID] = nil }
+    }
+    func deleteIfRefreshTokenMatches(accountID: UUID, refreshToken: String) throws -> Bool {
+        if failDelete { throw CocoaError(.fileWriteUnknown) }
+        return lock.withLock {
             guard values[accountID]?.refreshToken == refreshToken else { return false }
             values[accountID] = nil
             return true

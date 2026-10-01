@@ -689,7 +689,6 @@ final class CallSession: ObservableObject {
         peerWatchdog?.cancel()
         transportActive = true
         suppressedSystemEndDuringAcceptance = false
-        if state != .active(callID) { transition(.active(callID)); startDuration(current); if isOutgoingCall { callKit?.reportOutgoingConnected(id: current.localCallKitUUID) } }
         recordRuntimeDiagnostic("media_peer_ready", status: "ready", callID: callID)
         beginAudioFlowWatchdog(current)
     }
@@ -911,7 +910,8 @@ final class CallSession: ObservableObject {
             recordRuntimeDiagnostic("audio_watchdog_recovery_started", status: "runtime_failure=\(String(describing: failure))", callID: current.serverCallID)
             recoverAudioOnly(current)
         } else {
-            recordRuntimeDiagnostic("audio_watchdog_degraded_but_call_preserved", status: "runtime_failure=\(String(describing: failure))", callID: current.serverCallID)
+            recordRuntimeDiagnostic("audio_watchdog_terminal_failure", status: "runtime_failure=\(String(describing: failure))", callID: current.serverCallID)
+            spawn { [weak self] in guard let self else { return }; await self.fail(current, .audioFailed) }
         }
     }
 
@@ -933,7 +933,13 @@ final class CallSession: ObservableObject {
         audioOperational = audioFlow.isOperational(transportActive: transportActive)
         if audioOperational, !wasOperational, let callID = generation?.serverCallID {
             recordRuntimeDiagnostic("audio_operational", status: "transport=ready audio=ready", callID: callID)
-            if let current = generation { beginAudioFlowWatchdog(current) }
+            if let current = generation {
+                if state != .active(callID) {
+                    transition(.active(callID)); startDuration(current)
+                    if isOutgoingCall { callKit?.reportOutgoingConnected(id: current.localCallKitUUID) }
+                }
+                beginAudioFlowWatchdog(current)
+            }
         }
     }
 
@@ -957,7 +963,8 @@ final class CallSession: ObservableObject {
                     self.recoverAudioOnly(current)
                 }
             } else {
-                self.recordRuntimeDiagnostic("audio_watchdog_degraded_but_call_preserved", status: stage.rawValue, callID: current.serverCallID)
+                self.recordRuntimeDiagnostic("audio_watchdog_terminal_failure", status: stage.rawValue, callID: current.serverCallID)
+                await self.fail(current, .audioFailed)
             }
         }
     }
