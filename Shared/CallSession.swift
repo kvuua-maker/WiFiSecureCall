@@ -103,6 +103,7 @@ final class CallSession: ObservableObject {
     private var callKitReported = false
     private var activatedCallKitUUID: UUID?
     private var audioStartedForCallKitUUID: UUID?
+    private var audioActivationEpoch: UInt64 = 0
     private var serverCallCreated = false
     private var serverCallAccepted = false
     private var suppressedSystemEndDuringAcceptance = false
@@ -570,6 +571,7 @@ final class CallSession: ObservableObject {
 
     private func didActivate(localID: UUID) {
         guard let current = generation, current.localCallKitUUID == localID else { return }
+        if activatedCallKitUUID != localID { audioActivationEpoch &+= 1 }
         activatedCallKitUUID = localID
         recordRuntimeDiagnostic("callkit_did_activate", status: "success", callID: current.serverCallID)
         startMediaIfReady(current)
@@ -577,12 +579,24 @@ final class CallSession: ObservableObject {
 
     private func didDeactivate(localID: UUID?) {
         guard let current = generation, localID == nil || current.localCallKitUUID == localID else { return }
+        audioActivationEpoch &+= 1
         activatedCallKitUUID = nil
         audioStartedForCallKitUUID = nil
+        mediaConnectTask?.cancel(); mediaConnectTask = nil
+        reconnectTask?.cancel(); reconnectTask = nil
+        peerWatchdog?.cancel(); peerWatchdog = nil
+        let oldEpoch = mediaEpoch; mediaEpoch = nil
+        pendingPeerReadyEpochs.removeAll(keepingCapacity: false)
+        transportActive = false
         playout.stop()
         audioFlowWatchdog?.cancel(); audioFlowWatchdog = nil
-        audioFlow = AudioFlowMilestones(); audioOperational = false
+        audioFlow = AudioFlowMilestones(); audioProgress = AudioProgressCounters(); audioOperational = false
         audio.stop()
+        if let oldEpoch {
+            let media = self.media
+            Task { await media.close(connectionID: oldEpoch) }
+        }
+        if state.isAcceptedLifecycle { beginActivationWatchdog(current) }
         recordRuntimeDiagnostic("callkit_did_deactivate", status: "success", callID: current.serverCallID)
     }
 
@@ -655,26 +669,30 @@ final class CallSession: ObservableObject {
               state.isMediaEstablishing else { return }
         activationWatchdog?.cancel()
         audioStartedForCallKitUUID = current.localCallKitUUID
+        let activation = audioActivationEpoch
         configureFramePump(current)
         mediaConnectTask?.cancel()
         mediaConnectTask = Task { [weak self] in
             guard let self, self.isCurrent(current) else { return }
             do {
                 try self.audio.start(muted: self.isMuted)
-                guard self.isCurrent(current), self.activatedCallKitUUID == current.localCallKitUUID else { return }
+                guard self.isCurrent(current), self.activatedCallKitUUID == current.localCallKitUUID,
+                      self.audioActivationEpoch == activation else { return }
                 if let existingEpoch = self.mediaEpoch {
                     self.startPlayout(current, mediaEpoch: existingEpoch)
                     if self.transportActive { self.beginAudioFlowWatchdog(current) }
                     return
                 }
                 let epoch = try await self.media.connect(callID: current.serverCallID, peer: try self.signaling(for: current).mediaPeerIdentity, token: token)
-                guard self.isCurrent(current) else { await self.media.close(connectionID: epoch); return }
+                guard self.isCurrent(current), self.activatedCallKitUUID == current.localCallKitUUID,
+                      self.audioActivationEpoch == activation else { await self.media.close(connectionID: epoch); return }
                 self.mediaEpoch = epoch
                 self.startPlayout(current, mediaEpoch: epoch)
                 if self.pendingPeerReadyEpochs.remove(epoch) != nil { self.peerReady(callID: current.serverCallID, mediaEpoch: epoch) }
                 else { self.beginPeerWatchdog(current, mediaEpoch: epoch) }
             } catch {
-                guard self.isCurrent(current) else { return }
+                guard self.isCurrent(current), self.activatedCallKitUUID == current.localCallKitUUID,
+                      self.audioActivationEpoch == activation else { return }
                 await self.fail(current, (error as? CallFailure) == .audioFailed ? .audioFailed : .mediaConnectionFailed)
             }
         }
@@ -728,17 +746,20 @@ final class CallSession: ObservableObject {
     private func startMediaReconnect(_ current: CallGeneration, token: String, reconcileServerState: Bool = false) {
         guard isCurrent(current), state.isAcceptedLifecycle else { return }
         transition(.reconnecting(current.serverCallID))
+        let activation = audioActivationEpoch
         reconnectTask?.cancel()
         reconnectTask = Task { [weak self] in
             guard let self else { return }
             let deadline = ProcessInfo.processInfo.systemUptime + CallTimeouts.reconnectTotal; var delay = 0.25
             while !Task.isCancelled, ProcessInfo.processInfo.systemUptime < deadline {
                 do { try await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000)) } catch { return }
-                guard self.isCurrent(current) else { return }
+                guard self.isCurrent(current), self.activatedCallKitUUID == current.localCallKitUUID,
+                      self.audioActivationEpoch == activation else { return }
                 if reconcileServerState {
                     do {
                         let response = try await self.signaling(for: current).rawCall(current.serverCallID)
-                        guard self.isCurrent(current) else { return }
+                        guard self.isCurrent(current), self.activatedCallKitUUID == current.localCallKitUUID,
+                              self.audioActivationEpoch == activation else { return }
                         if response.state != .accepted { await self.remoteTerminal(response, generation: current); return }
                     } catch {
                         delay = min(delay * 2, 2)
@@ -747,14 +768,19 @@ final class CallSession: ObservableObject {
                 }
                 do {
                     let epoch = try await self.media.connect(callID: current.serverCallID, peer: try self.signaling(for: current).mediaPeerIdentity, token: token)
-                    guard self.isCurrent(current) else { await self.media.close(connectionID: epoch); return }
+                    guard self.isCurrent(current), self.activatedCallKitUUID == current.localCallKitUUID,
+                          self.audioActivationEpoch == activation else { await self.media.close(connectionID: epoch); return }
                     self.mediaEpoch = epoch; self.startPlayout(current, mediaEpoch: epoch)
                     if self.pendingPeerReadyEpochs.remove(epoch) != nil { self.peerReady(callID: current.serverCallID, mediaEpoch: epoch) }
                     else { self.beginPeerWatchdog(current, mediaEpoch: epoch) }
                     return
-                } catch { delay = min(delay * 2, 2) }
+                } catch {
+                    guard !Task.isCancelled, self.audioActivationEpoch == activation else { return }
+                    delay = min(delay * 2, 2)
+                }
             }
-            guard self.isCurrent(current) else { return }
+            guard self.isCurrent(current), self.activatedCallKitUUID == current.localCallKitUUID,
+                  self.audioActivationEpoch == activation else { return }
             await self.fail(current, .networkLost)
         }
     }

@@ -2032,6 +2032,31 @@ final class WiFiSecureCallTests: XCTestCase {
     }
 
     @MainActor
+    func testDelayedConnectCannotAttachAfterDeactivationAndReactivation() async throws {
+        let capture = RequestCapture(); capture.getState = .accepted
+        let audio = AudioEngineMock(), media = MediaTransportMock()
+        media.pauseNextConnect = true
+        let session = makeSession(capture: capture, audio: audio, media: media)
+        let adapter = RetainedCallKitMock(); session.attach(callKit: adapter)
+        await session.startCall()
+        let localID = try XCTUnwrap(adapter.startedIDs.first)
+        try await adapter.approveStart(localID)
+        await eventually { if case .connecting = session.state { return true }; return false }
+        adapter.onAudioActivated?(localID)
+        await eventually { media.hasPausedConnect }
+        let oldEpoch = try XCTUnwrap(media.connectionIDs.first)
+        adapter.onAudioDeactivated?(localID)
+        adapter.onAudioActivated?(localID)
+        await eventually { media.connectionIDs.count == 2 }
+        let currentEpoch = try XCTUnwrap(media.connectionIDs.last)
+        media.resumePausedConnect()
+        await eventually { media.closedIDs.contains(oldEpoch) }
+        XCTAssertFalse(media.closedIDs.contains(currentEpoch))
+        XCTAssertEqual(audio.startCount, 2)
+        XCTAssertFalse(session.state.isTerminal)
+    }
+
+    @MainActor
     func testAppMuteUsesCallKitAndAuthoritativeAudioMuteCallback() async throws {
         let capture = RequestCapture()
         let audio = AudioEngineMock()
@@ -2216,9 +2241,21 @@ private final class MediaTransportMock: MediaTransport, @unchecked Sendable {
     private(set) var connectedPeers: [MediaPeerIdentity] = []
     private(set) var sentPackets: [AudioPacket] = []
     private(set) var connectionIDs: [UUID] = []
-    func connect(callID: UUID, peer: MediaPeerIdentity, token: String) async throws -> UUID { let id = UUID(); connectedCallIDs.append(callID); connectedPeers.append(peer); connectionIDs.append(id); return id }
+    private(set) var closedIDs: [UUID] = []
+    var pauseNextConnect = false
+    private var pausedConnect: CheckedContinuation<Void, Never>?
+    var hasPausedConnect: Bool { pausedConnect != nil }
+    func resumePausedConnect() { pausedConnect?.resume(); pausedConnect = nil }
+    func connect(callID: UUID, peer: MediaPeerIdentity, token: String) async throws -> UUID {
+        let id = UUID(); connectedCallIDs.append(callID); connectedPeers.append(peer); connectionIDs.append(id)
+        if pauseNextConnect {
+            pauseNextConnect = false
+            await withCheckedContinuation { pausedConnect = $0 }
+        }
+        return id
+    }
     func send(_ packet: AudioPacket, connectionID: UUID) async throws { sentPackets.append(packet) }
-    func close(connectionID: UUID?) async {}
+    func close(connectionID: UUID?) async { if let connectionID { closedIDs.append(connectionID) } }
 }
 
 private final class RequestCapture: @unchecked Sendable {
