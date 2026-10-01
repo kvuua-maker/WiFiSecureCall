@@ -90,36 +90,36 @@ struct ConversationView: View {
                 } label: { Image(systemName: "phone") }
                     .accessibilityLabel("Захищений дзвінок")
             }
-            NavigationLink("Safety") {
+            NavigationLink("Безпека") {
                 List {
                     let devices = store.safetyDevices(conversationID: conversation.id, accountID: accountID)
                     let warnings = store.keyChangeWarnings(conversationID: conversation.id, accountID: accountID)
                     if devices.isEmpty {
-                        Text("Retrieving peer device fingerprints…")
+                        Text("Отримуємо відбитки пристроїв співрозмовника…")
                     } else {
                         ForEach(Array(devices.enumerated()), id: \.element.id) { index, device in
                             VStack(alignment: .leading, spacing: 4) {
-                                Text("Peer device \(index + 1)").font(.caption)
+                                Text("Пристрій співрозмовника \(index + 1)").font(.caption)
                                 Text(device.fingerprint).font(.caption.monospaced())
                                     #if !os(watchOS)
                                     .textSelection(.enabled)
                                     #endif
-                                Text(device.trustState == .keyChanged ? "KEY_CHANGED — secure communication blocked" : "Stored by trust on first use; not independently verified")
+                                Text(device.trustState == .keyChanged ? "Ключ безпеки змінився. Захищений зв’язок заблоковано." : "Збережено під час першого з’єднання; незалежно не перевірено")
                                     .font(.caption2).foregroundStyle(device.trustState == .keyChanged ? .red : .secondary)
                             }
                         }
                     }
                     ForEach(warnings) { warning in
                         VStack(alignment: .leading, spacing: 5) {
-                            Text("KEY_CHANGED").font(.headline).foregroundStyle(.red)
-                            Text("Previously pinned").font(.caption)
+                            Text("Ключ безпеки змінився").font(.headline).foregroundStyle(.red)
+                            Text("Раніше збережений відбиток").font(.caption)
                             Text(warning.pinnedFingerprint).font(.caption2.monospaced())
-                            Text("Newly observed").font(.caption)
+                            Text("Новий відбиток").font(.caption)
                             Text(warning.observedFingerprint).font(.caption2.monospaced())
                             #if os(watchOS)
-                            Text("Approve this change in WiFi Secure Call on the paired/account iPhone before retrying.").font(.caption)
+                            Text("Підтвердьте зміну у WiFi Secure Call на зв’язаному iPhone, перш ніж повторити дію.").font(.caption)
                             #else
-                            Button("Approve new fingerprint") {
+                            Button("Підтвердити новий відбиток") {
                                 pendingApproval = warning
                                 showsApprovalConfirmation = true
                             }
@@ -128,13 +128,13 @@ struct ConversationView: View {
                         }
                     }
                 }
-                .navigationTitle("Safety")
+                .navigationTitle("Безпека")
                 .task { await store.prepareSafety(conversation: conversation, accountID: accountID) }
             }
         }
         #if !os(watchOS)
-        .confirmationDialog("Approve changed fingerprint?", isPresented: $showsApprovalConfirmation, titleVisibility: .visible) {
-            Button("Approve new fingerprint", role: .destructive) {
+        .confirmationDialog("Підтвердити змінений відбиток?", isPresented: $showsApprovalConfirmation, titleVisibility: .visible) {
+            Button("Підтвердити новий відбиток", role: .destructive) {
                 guard let warning = pendingApproval else { return }
                 approvingDeviceID = warning.deviceID
                 Task {
@@ -144,9 +144,9 @@ struct ConversationView: View {
                     pendingApproval = nil
                 }
             }
-            Button("Cancel", role: .cancel) { pendingApproval = nil }
+            Button("Скасувати", role: .cancel) { pendingApproval = nil }
         } message: {
-            Text("Only approve after independently confirming the new fingerprint. Cancel keeps the previous pin and secure communication blocked.")
+            Text("Підтверджуйте лише після незалежної звірки нового відбитка. Скасування збереже попередній відбиток і блокування захищеного зв’язку.")
         }
         #endif
         .task {

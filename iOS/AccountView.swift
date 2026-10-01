@@ -1,5 +1,6 @@
 import AuthenticationServices
 import SwiftUI
+import UIKit
 
 struct AccountView: View {
     @ObservedObject var store: AccountSessionStore
@@ -87,7 +88,12 @@ struct AccountView: View {
                                     HStack {
                                         Button("Увійти знову") {
                                             guard canSwitchAccounts() else { message = "Завершіть виклик перед повторним входом."; return }
-                                            showsAppleSignIn = true
+                                            if account.phoneNumber != nil {
+                                                showRegistration = true
+                                                message = "Підтвердьте номер цього акаунта. Інший акаунт не замінить вибраний запис."
+                                            } else {
+                                                showsAppleSignIn = true
+                                            }
                                         }
                                         Button("Вилучити запис", role: .destructive) { removeOrphaned(account.accountID) }
                                     }
@@ -109,6 +115,13 @@ struct AccountView: View {
                                     Text("Нові захищені виклики використовують E2EE protocol 2. Зміна ключа блокує зв’язок до підтвердження.")
                                     CallKeyChangeWarningsView(accountID: active)
                                 }.navigationTitle("Безпека")
+                            }
+                            NavigationLink("Допомога") {
+                                List {
+                                    NavigationLink("Діагностика останнього дзвінка") {
+                                        LastCallDiagnosticsView()
+                                    }
+                                }.navigationTitle("Допомога")
                             }
                         }
                         Section {
@@ -285,5 +298,20 @@ struct AccountView: View {
             _ = try store.removeOrphanedLocalAccount(accountID: accountID)
             message = "Локальний запис вилучено"
         } catch { message = "Не вдалося вилучити локальний запис" }
+    }
+}
+
+private struct LastCallDiagnosticsView: View {
+    @ObservedObject private var diagnostics = Diagnostics.shared
+    @State private var copied = false
+    var body: some View {
+        List {
+            Text("Звіт містить лише етапи й технічні стани. Номери, повідомлення, ключі, токени та аудіодані не включаються.")
+                .font(.footnote).foregroundStyle(.secondary)
+            Text(diagnostics.lastCallReport()).font(.caption.monospaced()).textSelection(.enabled)
+            Button(copied ? "Скопійовано" : "Скопіювати звіт") {
+                UIPasteboard.general.string = diagnostics.lastCallReport(); copied = true
+            }
+        }.navigationTitle("Останній дзвінок")
     }
 }

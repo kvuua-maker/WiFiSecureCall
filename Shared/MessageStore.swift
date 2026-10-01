@@ -51,7 +51,7 @@ final class SecureMessageStore: ObservableObject {
 
     @discardableResult
     func refresh(accountID: UUID, reportsLoading: Bool = true) async -> Bool {
-        guard sessions.accounts.contains(where: { $0.accountID == accountID }) else { return false }
+        guard sessions.hasCallableSession(accountID: accountID) else { return false }
         guard !Task.isCancelled else { return false }
         if reportsLoading { setState(.loading, accountID: accountID) }
         do {
@@ -69,7 +69,8 @@ final class SecureMessageStore: ObservableObject {
     }
 
     func createConversation(targetUserID: UUID, accountID requestedAccountID: UUID? = nil) async throws -> SecureConversation {
-        guard let accountID = requestedAccountID ?? sessions.activeAccountID else { throw AccountAPIError.missingSession }
+        guard let accountID = requestedAccountID ?? sessions.activeAccountID,
+              sessions.hasCallableSession(accountID: accountID) else { throw AccountAPIError.missingSession }
         try await ensureIdentity(accountID: accountID)
         let value = try await api.createConversation(accountID: accountID, targetUserID: targetUserID)
         updateCache(accountID) { if !$0.conversations.contains(where: { $0.id == value.id }) { $0.conversations.insert(value, at: 0) } }
@@ -78,7 +79,7 @@ final class SecureMessageStore: ObservableObject {
 
     @discardableResult
     func loadMessages(conversationID: UUID, accountID: UUID, append: Bool = false, reportsLoading: Bool = true) async -> Bool {
-        guard sessions.accounts.contains(where: { $0.accountID == accountID }) else { return false }
+        guard sessions.hasCallableSession(accountID: accountID) else { return false }
         guard !Task.isCancelled else { return false }
         if reportsLoading { setState(.loading, accountID: accountID) }
         do {
@@ -141,7 +142,7 @@ final class SecureMessageStore: ObservableObject {
     }
 
     func prepareSafety(conversation: SecureConversation, accountID: UUID) async {
-        guard sessions.accounts.contains(where: { $0.accountID == accountID }) else { return }
+        guard sessions.hasCallableSession(accountID: accountID) else { return }
         do {
             try await ensureIdentity(accountID: accountID)
             let profile = try await api.accountAPI.userProfile(accountID: accountID)
@@ -163,7 +164,7 @@ final class SecureMessageStore: ObservableObject {
     }
 
     func approveKeyChange(_ warning: E2EEKeyChangeWarning) async throws {
-        guard sessions.accounts.contains(where: { $0.accountID == warning.accountID }) else { throw AccountAPIError.missingSession }
+        guard sessions.hasCallableSession(accountID: warning.accountID) else { throw AccountAPIError.missingSession }
         let fresh = try await api.deviceKeys(accountID: warning.accountID, userID: warning.userID)
         guard let bundle = fresh.first(where: { $0.deviceID == warning.deviceID }),
               bundle.signingPublicKey == warning.observedBundle.signingPublicKey,
@@ -185,7 +186,7 @@ final class SecureMessageStore: ObservableObject {
     }
 
     func send(text: String, conversation: SecureConversation, accountID: UUID) async throws {
-        guard sessions.accounts.contains(where: { $0.accountID == accountID }),
+        guard sessions.hasCallableSession(accountID: accountID),
               caches[accountID]?.conversations.contains(where: { $0.id == conversation.id }) == true else { throw AccountAPIError.missingSession }
         try await ensureIdentity(accountID: accountID)
         let profile = try await api.accountAPI.userProfile(accountID: accountID)
@@ -209,7 +210,7 @@ final class SecureMessageStore: ObservableObject {
     }
 
     func markRead(conversationID: UUID, accountID: UUID) async {
-        guard sessions.accounts.contains(where: { $0.accountID == accountID }),
+        guard sessions.hasCallableSession(accountID: accountID),
               let values = caches[accountID]?.messages[conversationID] else { return }
         for message in values where !message.isSentByCurrentUser && message.availability == .available { _ = try? await api.read(accountID: accountID, conversationID: conversationID, messageID: message.id) }
     }

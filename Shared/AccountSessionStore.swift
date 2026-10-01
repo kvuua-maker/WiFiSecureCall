@@ -69,7 +69,9 @@ final class AccountSessionStore: ObservableObject {
     private let accountsKey = "WiFiSecureCall.accounts.v1"
     private let activeKey = "WiFiSecureCall.activeAccountID.v1"
     private let profilesKey = "WiFiSecureCall.userProfiles.v1"
+    private let revokedPendingKey = "WiFiSecureCall.revokedPendingCleanup.v1"
     private let accountAdded: ((UUID) -> Void)?
+    @Published private(set) var revokedPendingCleanupAccountIDs: Set<UUID>
 
     init(tokenStore: SecureTokenStore = KeychainSecureTokenStore(), defaults: UserDefaults = .standard, accountAdded: ((UUID) -> Void)? = nil) {
         self.tokenStore = tokenStore
@@ -77,13 +79,15 @@ final class AccountSessionStore: ObservableObject {
         self.accountAdded = accountAdded
         accounts = (defaults.data(forKey: accountsKey)).flatMap { try? JSONDecoder().decode([AccountSummary].self, from: $0) } ?? []
         profiles = (defaults.data(forKey: profilesKey)).flatMap { try? JSONDecoder().decode([UUID: UserProfile].self, from: $0) } ?? [:]
+        revokedPendingCleanupAccountIDs = Set((defaults.stringArray(forKey: revokedPendingKey) ?? []).compactMap(UUID.init(uuidString:)))
         activeAccountID = defaults.string(forKey: activeKey).flatMap(UUID.init(uuidString:))
         if let activeAccountID,
            accounts.contains(where: { $0.accountID == activeAccountID }),
+           !revokedPendingCleanupAccountIDs.contains(activeAccountID),
            (try? tokenStore.tokens(for: activeAccountID)) != nil {
             self.activeAccountID = activeAccountID
         } else {
-            self.activeAccountID = accounts.first(where: { (try? tokenStore.tokens(for: $0.accountID)) != nil })?.accountID
+            self.activeAccountID = accounts.first(where: { !revokedPendingCleanupAccountIDs.contains($0.accountID) && (try? tokenStore.tokens(for: $0.accountID)) != nil })?.accountID
         }
     }
 
@@ -91,12 +95,19 @@ final class AccountSessionStore: ObservableObject {
 
     var callableAccounts: [AccountSummary] {
         accounts.filter { account in
-            (try? tokenStore.tokens(for: account.accountID)) != nil
+            !revokedPendingCleanupAccountIDs.contains(account.accountID) && (try? tokenStore.tokens(for: account.accountID)) != nil
         }
+    }
+
+    func hasCallableSession(accountID: UUID) -> Bool {
+        accounts.contains(where: { $0.accountID == accountID }) &&
+            !revokedPendingCleanupAccountIDs.contains(accountID) &&
+            (try? tokenStore.tokens(for: accountID)) != nil
     }
 
     func add(_ response: AccountSessionResponse, activate: Bool = true, invalidateE2EE: Bool = true) throws {
         try tokenStore.save(response.tokens, for: response.account.accountID)
+        clearRevokedPendingCleanup(response.account.accountID)
         if invalidateE2EE { AccountE2EEContext.shared.invalidate(accountID: response.account.accountID) }
         if let index = accounts.firstIndex(where: { $0.accountID == response.account.accountID }) { accounts[index] = response.account }
         else { accounts.append(response.account) }
@@ -108,6 +119,7 @@ final class AccountSessionStore: ObservableObject {
 
     func addLinkedAccount(accountID: UUID, phoneNumber: String, tokens: AccountTokens) throws {
         try tokenStore.save(tokens, for: accountID)
+        clearRevokedPendingCleanup(accountID)
         AccountE2EEContext.shared.invalidate(accountID: accountID)
         let summary = AccountSummary(accountID: accountID, phoneNumber: phoneNumber)
         if let index = accounts.firstIndex(where: { $0.accountID == accountID }) { accounts[index] = summary } else { accounts.append(summary) }
@@ -122,6 +134,7 @@ final class AccountSessionStore: ObservableObject {
 
     func addLinkedAccount(accountID: UUID, userID: UUID?, phoneNumber: String?, displayLabel: String, tokens: AccountTokens, activate: Bool = true) throws {
         try tokenStore.save(tokens, for: accountID)
+        clearRevokedPendingCleanup(accountID)
         AccountE2EEContext.shared.invalidate(accountID: accountID)
         let summary = AccountSummary(accountID: accountID, userID: userID, phoneNumber: phoneNumber, displayLabel: displayLabel)
         if let index = accounts.firstIndex(where: { $0.accountID == accountID }) { accounts[index] = summary } else { accounts.append(summary) }
@@ -133,7 +146,7 @@ final class AccountSessionStore: ObservableObject {
     @discardableResult
     func switchAccount(to accountID: UUID) -> AccountSwitchResult {
         guard accounts.contains(where: { $0.accountID == accountID }) else { return .unknownAccount }
-        guard (try? tokenStore.tokens(for: accountID)) != nil else { return .missingSession }
+        guard hasCallableSession(accountID: accountID) else { return .missingSession }
         activeAccountID = accountID
         persistMetadata()
         return .switched
@@ -141,6 +154,21 @@ final class AccountSessionStore: ObservableObject {
 
     func logout(accountID: UUID) throws { try removeLocal(accountID: accountID) }
     func delete(accountID: UUID) throws { try removeLocal(accountID: accountID) }
+
+    /// Called immediately after the server has revoked the session. This is the
+    /// authoritative local gate even when Keychain or metadata cleanup fails.
+    func markRevokedPendingCleanup(accountID: UUID) {
+        revokedPendingCleanupAccountIDs.insert(accountID)
+        if activeAccountID == accountID { activeAccountID = callableAccounts.first?.accountID }
+        persistMetadata()
+    }
+
+    func retryRevokedPendingCleanup() {
+        for accountID in revokedPendingCleanupAccountIDs {
+            do { try removeLocal(accountID: accountID) }
+            catch { /* marker deliberately remains durable */ }
+        }
+    }
 
     @discardableResult
     func removeOrphanedLocalAccount(accountID: UUID) throws -> Bool {
@@ -155,8 +183,9 @@ final class AccountSessionStore: ObservableObject {
         AccountE2EEContext.shared.invalidate(accountID: accountID)
         accounts.removeAll { $0.accountID == accountID }
         profiles.removeValue(forKey: accountID)
+        revokedPendingCleanupAccountIDs.remove(accountID)
         if activeAccountID == accountID || activeAccountID.map({ (try? tokenStore.tokens(for: $0)) == nil }) == true {
-            activeAccountID = accounts.first(where: { (try? tokenStore.tokens(for: $0.accountID)) != nil })?.accountID
+            activeAccountID = callableAccounts.first?.accountID
         }
         persistMetadata()
     }
@@ -165,5 +194,11 @@ final class AccountSessionStore: ObservableObject {
         defaults.set(try? JSONEncoder().encode(accounts), forKey: accountsKey)
         defaults.set(activeAccountID?.uuidString, forKey: activeKey)
         defaults.set(try? JSONEncoder().encode(profiles), forKey: profilesKey)
+        defaults.set(revokedPendingCleanupAccountIDs.map(\.uuidString).sorted(), forKey: revokedPendingKey)
+    }
+
+    private func clearRevokedPendingCleanup(_ accountID: UUID) {
+        guard revokedPendingCleanupAccountIDs.remove(accountID) != nil else { return }
+        persistMetadata()
     }
 }

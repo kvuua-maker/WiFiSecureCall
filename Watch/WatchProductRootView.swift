@@ -66,8 +66,6 @@ private struct WatchChatsHomeView: View {
                         } label: { Label("Акаунт", systemImage: "chevron.right").labelStyle(.titleAndIcon) }
                             .font(.caption2).buttonStyle(.plain)
                     }
-                    NavigationLink { CallHistoryView(store: callHistory, accountID: accountStore.activeAccountID, runtime: runtime) } label: { Label("Дзвінки", systemImage: "phone") }
-                    NavigationLink { WatchContactsView(messageStore: messages, runtime: runtime) } label: { Label("Контакти", systemImage: "person.2") }
                     HStack {
                         NavigationLink { RecipientSearchView(messageStore: messages, runtime: runtime) } label: { Label("Новий чат", systemImage: "square.and.pencil") }
                         Button { showsSearch.toggle(); if !showsSearch { query = "" } } label: { Image(systemName: "magnifyingglass").accessibilityLabel("Пошук чатів") }

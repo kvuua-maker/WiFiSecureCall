@@ -22,8 +22,7 @@ func routeSecureMessageNotification(
     callState: CallState,
     open: (UUID, UUID) -> Void
 ) -> Bool {
-    guard accountStore.accounts.contains(where: { $0.accountID == accountID }),
-          (try? accountStore.tokenStore.tokens(for: accountID)) != nil else { return false }
+    guard accountStore.hasCallableSession(accountID: accountID) else { return false }
     if accountStore.activeAccountID != accountID {
         guard !callStateBlocksAccountMutation(callState),
               accountStore.switchAccount(to: accountID) == .switched else { return false }
@@ -47,7 +46,6 @@ final class NotificationRuntime {
     private var mutatingAccountID: UUID?
     private var accountMutationOutcomes: [UUID: Bool] = [:]
     private let accountMutationPushWaitNanoseconds: UInt64
-    private static let pendingCleanupKey = "wsc.pendingAccountCleanup.v1"
 
     init(
         config: AppConfig = AppConfig.load(),
@@ -69,7 +67,7 @@ final class NotificationRuntime {
         self.accountPinStore = accountPinStore
         self.accountMutationPushWaitNanoseconds = accountMutationPushWaitNanoseconds
         callSession = CallSession(config: config, api: effectiveAPI, audio: audio, media: media)
-        recoverPendingAccountCleanup()
+        effectiveAccountStore.retryRevokedPendingCleanup()
     }
 
     func configureCallKitFactory(_ factory: @escaping () -> CallKitHandling) {
@@ -109,16 +107,7 @@ final class NotificationRuntime {
 
     func startPreferredCall(targetPlatform: String, accountID: UUID) async {
         guard mutatingAccountID != accountID else { callSession.failToStart(.accountMutationInProgress); return }
-        guard accountStore.accounts.contains(where: { $0.accountID == accountID }) else {
-            callSession.failToStart(.accountSessionInvalid)
-            return
-        }
-        do {
-            guard try accountStore.tokenStore.tokens(for: accountID) != nil else {
-                callSession.failToStart(.accountSessionInvalid)
-                return
-            }
-        } catch {
+        guard accountStore.hasCallableSession(accountID: accountID) else {
             callSession.failToStart(.accountSessionInvalid)
             return
         }
@@ -143,8 +132,7 @@ final class NotificationRuntime {
     }
 
     func resolveRecipient(_ input: String, accountID: UUID) async throws -> ResolvedRecipient {
-        guard accountStore.accounts.contains(where: { $0.accountID == accountID }),
-              try accountStore.tokenStore.tokens(for: accountID) != nil else {
+        guard accountStore.hasCallableSession(accountID: accountID) else {
             throw AccountAPIError.missingSession
         }
         return try await accountAPI.resolveRecipient(input, accountID: accountID)
@@ -152,16 +140,7 @@ final class NotificationRuntime {
 
     func startUserCall(targetUserID: UUID, accountID: UUID, peerDisplayName: String? = nil) async {
         guard mutatingAccountID != accountID else { callSession.failToStart(.accountMutationInProgress); return }
-        guard accountStore.accounts.contains(where: { $0.accountID == accountID }) else {
-            callSession.failToStart(.accountSessionInvalid)
-            return
-        }
-        do {
-            guard try accountStore.tokenStore.tokens(for: accountID) != nil else {
-                callSession.failToStart(.accountSessionInvalid)
-                return
-            }
-        } catch {
+        guard accountStore.hasCallableSession(accountID: accountID) else {
             callSession.failToStart(.accountSessionInvalid)
             return
         }
@@ -282,10 +261,9 @@ final class NotificationRuntime {
             finishAccountMutation(succeeded: false)
             throw AccountMutationError.serverActionFailed
         }
-        markPendingAccountCleanup(accountID)
+        accountStore.markRevokedPendingCleanup(accountID: accountID)
         do {
             try local()
-            clearPendingAccountCleanup(accountID)
             finishAccountMutation(succeeded: true)
         } catch {
             // The remote session is already revoked. Remove local credentials even
@@ -321,42 +299,13 @@ final class NotificationRuntime {
         return true
     }
 
-    private func pendingAccountCleanupIDs() -> Set<UUID> {
-        Set((UserDefaults.standard.stringArray(forKey: Self.pendingCleanupKey) ?? []).compactMap(UUID.init(uuidString:)))
-    }
-
-    private func markPendingAccountCleanup(_ accountID: UUID) {
-        var pending = pendingAccountCleanupIDs()
-        pending.insert(accountID)
-        UserDefaults.standard.set(pending.map(\.uuidString).sorted(), forKey: Self.pendingCleanupKey)
-    }
-
-    private func clearPendingAccountCleanup(_ accountID: UUID) {
-        var pending = pendingAccountCleanupIDs()
-        pending.remove(accountID)
-        UserDefaults.standard.set(pending.map(\.uuidString).sorted(), forKey: Self.pendingCleanupKey)
-    }
-
-    private func recoverPendingAccountCleanup() {
-        for accountID in pendingAccountCleanupIDs() {
-            do {
-                try accountStore.logout(accountID: accountID)
-                clearPendingAccountCleanup(accountID)
-            } catch {
-                try? accountStore.tokenStore.delete(accountID: accountID)
-            }
-        }
-    }
-
     private func userIncomingSignaling(accountID: UUID, caller: CrossUserCallerIdentity) -> CrossUserCallSignaling? {
-        guard accountStore.accounts.map(\.accountID).contains(accountID),
-              (try? accountStore.tokenStore.tokens(for: accountID)) != nil else { return nil }
+        guard accountStore.hasCallableSession(accountID: accountID) else { return nil }
         return CrossUserCallSignaling(client: accountAPI, accountID: accountID, localSide: .callee, callerIdentity: caller)
     }
 
     private func accountIncomingSignaling(accountID: UUID, callID: UUID) -> AccountCallSignaling? {
-        guard accountStore.accounts.contains(where: { $0.accountID == accountID }) else { return nil }
-        guard (try? accountStore.tokenStore.tokens(for: accountID)) != nil else {
+        guard accountStore.hasCallableSession(accountID: accountID) else {
             callSession.recordLifecycleDiagnostic("account_session_invalid", status: "missing_tokens", callID: callID)
             return nil
         }
