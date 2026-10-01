@@ -22,21 +22,94 @@ struct WatchProductRootView: View {
     var body: some View {
         NavigationStack {
             if accountStore.callableAccounts.isEmpty { WatchAccountLinkView(store: accountStore) }
-            else { ConversationListView(store: messages, runtime: runtime) }
+            else { WatchChatsHomeView(session: session, accountStore: accountStore, messages: messages, callHistory: callHistory, runtime: runtime) }
         }
-        .overlay(alignment: .top) {
+    }
+}
+
+private struct WatchChatsHomeView: View {
+    @ObservedObject var session: CallSession
+    @ObservedObject var accountStore: AccountSessionStore
+    @ObservedObject var messages: SecureMessageStore
+    @ObservedObject var callHistory: CallHistoryStore
+    let runtime: NotificationRuntime
+    @State private var query = ""
+    @State private var showsSearch = false
+
+    private var visible: [SecureConversation] {
+        let term = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !term.isEmpty else { return messages.conversations }
+        return messages.conversations.filter {
+            $0.peerDisplayName.localizedCaseInsensitiveContains(term) ||
+            ($0.peer?.username.localizedCaseInsensitiveContains(term) ?? false)
+        }
+    }
+
+    private var loadError: String? {
+        if case .failed(let message) = messages.state { return message }
+        return nil
+    }
+
+    var body: some View {
+        ScrollView(showsIndicators: false) {
+            LazyVStack(spacing: 5) {
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 6) {
+                        NavigationLink { RecipientSearchView(messageStore: messages, runtime: runtime) } label: { Label("Новий чат", systemImage: "square.and.pencil") }
+                        Button { showsSearch.toggle(); if !showsSearch { query = "" } } label: { Image(systemName: "magnifyingglass").accessibilityLabel("Пошук чатів") }
+                        NavigationLink { CallHistoryView(store: callHistory, accountID: accountStore.activeAccountID, runtime: runtime) } label: { Image(systemName: "phone").accessibilityLabel("Дзвінки") }
+                        NavigationLink { WatchMoreView(session: session, accountStore: accountStore, messages: messages, callHistory: callHistory, runtime: runtime) } label: { Image(systemName: "ellipsis").accessibilityLabel("Інші дії") }
+                    }
+                    .font(.caption)
+                    .buttonStyle(.bordered)
+                }
+                if showsSearch { TextField("Пошук", text: $query).textInputAutocapitalization(.never) }
+                if messages.state == .loading { ProgressView().accessibilityLabel("Завантаження чатів") }
+                else if loadError != nil {
+                    Text("Не вдалося завантажити чати").font(.caption)
+                    Button("Повторити") { Task { await messages.refresh() } }.font(.caption)
+                } else if visible.isEmpty {
+                    Text(query.isEmpty ? "Розмов поки немає" : "Нічого не знайдено").font(.caption).foregroundStyle(.secondary)
+                    if query.isEmpty { NavigationLink("Новий чат") { RecipientSearchView(messageStore: messages, runtime: runtime) }.font(.caption) }
+                } else {
+                    ForEach(visible) { conversation in
+                        if let accountID = messages.activeAccountID {
+                            NavigationLink { ConversationView(store: messages, conversation: conversation, accountID: accountID) } label: { row(conversation, accountID: accountID) }
+                                .buttonStyle(.plain)
+                        }
+                    }
+                }
+            }
+        }
+        .navigationTitle("Чати")
+        .toolbar {
+            ToolbarItem(placement: .primaryAction) {
+                NavigationLink { WatchAccountLinkView(store: accountStore) } label: { Image(systemName: "chevron.right").accessibilityLabel("Акаунти") }
+            }
+        }
+        .safeAreaInset(edge: .bottom) {
             if session.state != .idle && !session.state.isTerminal {
                 NavigationLink("Поточний дзвінок") { ActiveCallView(session: session) }
                     .font(.caption.bold()).buttonStyle(.borderedProminent)
             }
         }
-        .toolbar {
-            ToolbarItem(placement: .cancellationAction) {
-                NavigationLink {
-                    WatchMoreView(session: session, accountStore: accountStore, messages: messages, callHistory: callHistory, runtime: runtime)
-                } label: { Image(systemName: "line.3.horizontal").accessibilityLabel("Меню") }
+        .task(id: messages.activeAccountID) { await messages.refresh() }
+    }
+
+    private func row(_ conversation: SecureConversation, accountID: UUID) -> some View {
+        HStack(spacing: 6) {
+            Text(String(conversation.peerDisplayName.prefix(1)).uppercased())
+                .font(.caption.bold()).frame(width: 30, height: 30).background(Circle().fill(.blue.opacity(0.25)))
+            VStack(alignment: .leading, spacing: 2) {
+                Text(conversation.peerDisplayName).font(.caption.bold()).lineLimit(1).truncationMode(.tail)
+                Text(messages.messages(conversationID: conversation.id, accountID: accountID).last?.text ?? "Відкрити розмову")
+                    .font(.caption2).foregroundStyle(.secondary).lineLimit(1).truncationMode(.tail)
             }
+            Spacer(minLength: 2)
+            Text(conversation.updatedAt, style: .time).font(.system(size: 9)).foregroundStyle(.secondary)
         }
+        .frame(minHeight: 48)
+        .contentShape(Rectangle())
     }
 }
 

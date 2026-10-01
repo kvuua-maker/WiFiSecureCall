@@ -13,6 +13,7 @@ struct AccountView: View {
     @State private var appleTransportDetail: String?
     @State private var confirmsSignOut = false
     @State private var confirmsDeletion = false
+    @State private var showsAppleSignIn = false
 
     init(store: AccountSessionStore) {
         self.store = store
@@ -21,12 +22,15 @@ struct AccountView: View {
 
     var body: some View {
         List {
-                Section("Вхід через Apple") {
+                if store.accounts.isEmpty || showsAppleSignIn {
+                Section(store.accounts.isEmpty ? "Вхід через Apple" : "Додати акаунт через Apple") {
                     SignInWithAppleButton(.signIn, onRequest: configureAppleRequest, onCompletion: handleAppleResult)
                         .signInWithAppleButtonStyle(.black)
                         .frame(height: 46)
                     Text("Увійдіть через Apple без SMS. Публічне ім’я не розкриває Apple ID або номер телефону.")
                         .font(.footnote).foregroundStyle(.secondary)
+                    if !store.accounts.isEmpty { Button("Скасувати") { showsAppleSignIn = false } }
+                }
                 }
                 if store.accounts.isEmpty {
                     Section("Акаунт за номером") { Button("Зареєструвати номер") { showRegistration = true } }
@@ -39,7 +43,8 @@ struct AccountView: View {
                                 HStack { Text(account.displayLabel); Spacer(); if account.accountID == store.activeAccountID { Image(systemName: "checkmark") } }
                             }
                         }
-                        Button("Додати акаунт") { showRegistration = true }
+                        Button("Додати акаунт через Apple") { showsAppleSignIn = true }
+                        Button("Додати акаунт за номером") { showRegistration = true }
                     } header: {
                         Text("Акаунти")
                     } footer: {
@@ -144,6 +149,7 @@ struct AccountView: View {
             appleDiagnostic = nil
             appleTransportDetail = nil
             message = "Apple account ready"
+            showsAppleSignIn = false
         } catch {
             appleDiagnostic = AppleVerificationDiagnostic.classify(error)
             appleTransportDetail = AppleVerificationDiagnostic.safeTransportDetail(error)
