@@ -949,6 +949,14 @@ final class CallSession: ObservableObject {
         audioFlowWatchdog = Task { [weak self] in
             do { try await Task.sleep(nanoseconds: 5_000_000_000) } catch { return }
             guard let self, self.isCurrent(current), self.transportActive else { return }
+            let sent = self.audioProgress.sent >= baseline.sent ? self.audioProgress.sent - baseline.sent : 0
+            let received = self.audioProgress.received >= baseline.received ? self.audioProgress.received - baseline.received : 0
+            let rendered = self.audioProgress.rendered >= baseline.rendered ? self.audioProgress.rendered - baseline.rendered : 0
+            self.recordRuntimeDiagnostic(
+                "audio_flow_progress",
+                status: "sent=\(sent) received=\(received) rendered=\(rendered)",
+                callID: current.serverCallID
+            )
             if self.audioOperational, self.audioProgress.stalledStage(since: baseline) == nil {
                 self.beginAudioFlowWatchdog(current)
                 return
@@ -1010,6 +1018,7 @@ final class CallSession: ObservableObject {
 
     private func recoverAudioOnly(_ current: CallGeneration) {
         guard isCurrent(current), activatedCallKitUUID == current.localCallKitUUID else { return }
+        audioFlowWatchdog?.cancel()
         playout.stop()
         audio.stop()
         audioFlow = AudioFlowMilestones(); audioProgress = AudioProgressCounters(); decryptFailureCount = 0

@@ -19,6 +19,7 @@ struct AccountView: View {
     @State private var showsAppleSignIn = false
     @State private var pendingSwitchAccountID: UUID?
     @State private var recoveryAccount: AccountSummary?
+    @State private var showsRecoveryChoice = false
 
     init(store: AccountSessionStore, runtime: NotificationRuntime = .shared, canSwitchAccounts: @escaping () -> Bool = { true }) {
         self.store = store
@@ -99,7 +100,8 @@ struct AccountView: View {
                                                 recoveryAccount = account
                                                 showsAppleSignIn = true
                                             } else {
-                                                message = "Спосіб входу цього старого запису невідомий. Вилучіть запис і додайте акаунт знову."
+                                                recoveryAccount = account
+                                                showsRecoveryChoice = true
                                             }
                                         }
                                         Button("Вилучити запис", role: .destructive) { removeOrphaned(account.accountID) }
@@ -184,6 +186,19 @@ struct AccountView: View {
                     }
                 }
             }
+            .confirmationDialog("Як ви входили до цього акаунта?", isPresented: $showsRecoveryChoice, titleVisibility: .visible) {
+                Button("Через Apple") {
+                    guard recoveryAccount != nil else { return }
+                    showsAppleSignIn = true
+                }
+                Button("За номером телефону") {
+                    guard recoveryAccount != nil else { return }
+                    showRegistration = true
+                }
+                Button("Скасувати", role: .cancel) { recoveryAccount = nil }
+            } message: {
+                Text("Після входу буде перевірено точний акаунт. Інший акаунт не замінить цей запис.")
+            }
             .confirmationDialog("Вийти з активного акаунта?", isPresented: $confirmsSignOut) {
                 Button("Вийти", role: .destructive) {
                     if let active = store.activeAccountID { Task { await logout(active) } }
@@ -242,14 +257,15 @@ struct AccountView: View {
             let email = credential.email ?? ""
             let nonce = AppleSignInNonceContract.serverNonce(forRawNonce: appleNonce)
             appleNonce = ""; appleState = ""
-            Task { await finishAppleSignIn(identityToken: identityToken, authorizationCode: authorizationCode, nonce: nonce, displayName: displayName, email: email) }
+            let expectedAccountID = recoveryAccount?.accountID
+            Task { await finishAppleSignIn(identityToken: identityToken, authorizationCode: authorizationCode, nonce: nonce, displayName: displayName, email: email, expectedAccountID: expectedAccountID) }
         }
     }
 
-    @MainActor private func finishAppleSignIn(identityToken: String, authorizationCode: String, nonce: String, displayName: String, email: String) async {
+    @MainActor private func finishAppleSignIn(identityToken: String, authorizationCode: String, nonce: String, displayName: String, email: String, expectedAccountID: UUID?) async {
         do {
             let response = try await client.signInWithApple(identityToken: identityToken, authorizationCode: authorizationCode, nonce: nonce, displayName: displayName, email: email)
-            try validateRecoveredAccount(expectedAccountID: recoveryAccount?.accountID, actualAccountID: response.account.accountID)
+            try validateRecoveredAccount(expectedAccountID: expectedAccountID, actualAccountID: response.account.accountID)
             let alreadyAdded = store.accounts.contains(where: { $0.accountID == response.account.accountID })
             let decision = accountSessionIntegrationDecision(canChangeActiveAccount: canSwitchAccounts(), activeAccountID: store.activeAccountID, incomingAccountID: response.account.accountID)
             try store.add(response, activate: decision.activate, invalidateE2EE: decision.invalidateE2EE, identityKind: .apple)
@@ -263,6 +279,7 @@ struct AccountView: View {
                 message = alreadyAdded ? "Сесію оновлено без зміни активного виклику." : "Акаунт додано. Перемкніться після завершення виклику."
             }
             showsAppleSignIn = false
+            recoveryAccount = nil
         } catch {
             appleDiagnostic = AppleVerificationDiagnostic.classify(error)
             appleTransportDetail = AppleVerificationDiagnostic.safeTransportDetail(error)

@@ -33,7 +33,8 @@ final class Diagnostics: ObservableObject {
     init(defaults: UserDefaults = .standard) {
         self.defaults = defaults
         let cutoff = Date().addingTimeInterval(-retention)
-        events = (defaults.data(forKey: storageKey)).flatMap { try? JSONDecoder().decode([DiagnosticEvent].self, from: $0) }?.filter { $0.timestamp >= cutoff } ?? []
+        events = (defaults.data(forKey: storageKey)).flatMap { try? JSONDecoder().decode([DiagnosticEvent].self, from: $0) }?.filter { $0.timestamp >= cutoff }.compactMap(Self.safeEvent) ?? []
+        persistSafeEvents()
     }
 
     func record(role: DeviceRole, callID: UUID? = nil, category: String, value: String) {
@@ -47,25 +48,58 @@ final class Diagnostics: ObservableObject {
         persistSafeEvents()
     }
 
-    private func persistSafeEvents() {
-        let cutoff = Date().addingTimeInterval(-retention)
-        let safe = events.filter { event in
-            event.timestamp >= cutoff && event.callID != nil && Self.permittedCategory(event.category)
-        }.suffix(persistedCapacity)
-        defaults.set(try? JSONEncoder().encode(Array(safe)), forKey: storageKey)
+    private static let permittedCategories: Set<String> = [
+        "state", "media_peer_ready", "media_connect_started", "media_connect_succeeded",
+        "media_connect_failed", "media_disconnected", "first_mic_callback",
+        "first_mic_nonzero_signal", "first_network_pcm_generated",
+        "first_network_pcm_nonzero", "first_network_audio_frame_generated",
+        "first_network_audio_frame_sent", "first_network_audio_nonzero_sent",
+        "first_network_audio_frame_send_failure", "first_remote_audio_frame_received",
+        "first_remote_audio_nonzero", "first_playback_buffer_scheduled",
+        "first_playback_buffer_rendered", "first_playback_nonzero_input",
+        "playback_render_progress", "playback_overflow", "encrypted_audio_authentication_drop",
+        "audio_operational", "audio_flow_watchdog", "audio_flow_progress", "audio_watchdog_recovery_started",
+        "audio_watchdog_recovery_succeeded", "audio_watchdog_terminal_failure",
+        "audio_recovery", "capture_watchdog_failed", "first_capture_conversion_failure",
+        "first_playback_failure", "audio_engine_start_failure", "audio_route_changed",
+        "audio_interruption", "audio_send_backpressure_drop"
+    ]
+
+    private static let metricKeys: Set<String> = [
+        "bytes", "rms", "peak", "nonzero", "sequence", "count", "frames",
+        "frameLength", "sampleRate", "channelCount", "depth",
+        "sent", "received", "rendered", "relayed", "dropped"
+    ]
+
+    private static func safeEvent(_ event: DiagnosticEvent) -> DiagnosticEvent? {
+        guard event.callID != nil, permittedCategories.contains(event.category) else { return nil }
+        let numeric = event.value.split(separator: " ").compactMap { field -> String? in
+            let parts = field.split(separator: "=", maxSplits: 1)
+            guard parts.count == 2, metricKeys.contains(String(parts[0])),
+                  parts[1].count <= 20, Double(parts[1]) != nil else { return nil }
+            return "\(parts[0])=\(parts[1])"
+        }
+        let states = ["idle", "outgoingRinging", "incomingRinging", "connecting",
+                      "active", "reconnecting", "ending", "ended", "failed"]
+        let safeState = event.category == "state"
+            ? states.first(where: { event.value.hasPrefix($0) }) : nil
+        let detail = safeState ?? (numeric.isEmpty ? "подія" : numeric.prefix(8).joined(separator: " "))
+        return DiagnosticEvent(id: event.id, timestamp: event.timestamp, platform: event.platform,
+                               role: event.role, callID: event.callID, category: event.category, value: detail)
     }
 
-    private static func permittedCategory(_ category: String) -> Bool {
-        ["mic", "pcm", "network_audio", "media_peer", "encrypted_audio", "playback", "audio_", "state"].contains(where: category.contains)
+    private func persistSafeEvents() {
+        let cutoff = Date().addingTimeInterval(-retention)
+        let safe = events.filter { $0.timestamp >= cutoff }.compactMap(Self.safeEvent).suffix(persistedCapacity)
+        defaults.set(try? JSONEncoder().encode(Array(safe)), forKey: storageKey)
     }
 
     func lastCallReport() -> String {
         guard let callID = events.reversed().compactMap(\.callID).first else {
             return "Діагностика останнього дзвінка відсутня."
         }
-        let permitted = ["mic", "pcm", "network_audio", "media_peer", "encrypted_audio", "playback", "audio_", "state"]
         let formatter = ISO8601DateFormatter()
-        let rows = events.filter { $0.callID == callID && permitted.contains(where: $0.category.contains) }
+        let rows = events.filter { $0.callID == callID }.compactMap(Self.safeEvent)
         return (["WiFi Secure Call — діагностика останнього дзвінка", "callID: \(callID.uuidString)"] + rows.map {
             "\(formatter.string(from: $0.timestamp)) \($0.platform)/\($0.role.rawValue) \($0.category): \($0.value)"
         }).joined(separator: "\n")

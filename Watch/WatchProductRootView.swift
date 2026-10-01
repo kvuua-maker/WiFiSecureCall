@@ -55,23 +55,32 @@ private struct WatchChatsHomeView: View {
     var body: some View {
         ScrollView(showsIndicators: false) {
             LazyVStack(spacing: 5) {
-                VStack(spacing: 4) {
-                    HStack {
-                        Text(accountStore.activeAccount?.displayLabel ?? "WiFi Secure Call")
-                            .font(.caption2).foregroundStyle(.secondary).lineLimit(1).truncationMode(.tail)
-                        Spacer()
-                        Button {
-                            if session.state == .idle || session.state.isTerminal { showsAccounts = true }
-                            else { accountSwitchWarning = true }
-                        } label: { Label("Акаунт", systemImage: "chevron.right").labelStyle(.titleAndIcon) }
-                            .font(.caption2).buttonStyle(.plain)
+                HStack(spacing: 8) {
+                    NavigationLink {
+                        WatchMoreView(session: session, accountStore: accountStore, messages: messages, callHistory: callHistory, runtime: runtime)
+                    } label: {
+                        Image(systemName: "line.3.horizontal")
+                            .frame(maxWidth: .infinity, minHeight: 30)
                     }
-                    HStack {
-                        NavigationLink { RecipientSearchView(messageStore: messages, runtime: runtime) } label: { Label("Новий чат", systemImage: "square.and.pencil") }
-                        Button { showsSearch.toggle(); if !showsSearch { query = "" } } label: { Image(systemName: "magnifyingglass").accessibilityLabel("Пошук чатів") }
+                    .accessibilityLabel("Меню: виклики, контакти й налаштування")
+                    NavigationLink {
+                        RecipientSearchView(messageStore: messages, runtime: runtime)
+                    } label: {
+                        Image(systemName: "square.and.pencil")
+                            .frame(maxWidth: .infinity, minHeight: 30)
                     }
-                    .font(.caption)
+                    .accessibilityLabel("Новий чат")
+                    Button {
+                        showsSearch.toggle()
+                        if !showsSearch { query = "" }
+                    } label: {
+                        Image(systemName: "magnifyingglass")
+                            .frame(maxWidth: .infinity, minHeight: 30)
+                    }
+                    .accessibilityLabel("Пошук чатів")
                 }
+                .font(.caption)
+                .buttonStyle(.bordered)
                 if showsSearch { TextField("Пошук", text: $query).textInputAutocapitalization(.never) }
                 if messages.state == .loading { ProgressView().accessibilityLabel("Завантаження чатів") }
                 else if loadError != nil {
@@ -92,7 +101,13 @@ private struct WatchChatsHomeView: View {
         }
         .navigationTitle("Чати")
         .toolbar {
-            ToolbarItem(placement: .primaryAction) { NavigationLink { WatchMoreView(session: session, accountStore: accountStore, messages: messages, callHistory: callHistory, runtime: runtime) } label: { Image(systemName: "ellipsis").accessibilityLabel("Інші дії") } }
+            ToolbarItem(placement: .primaryAction) {
+                Button {
+                    if session.state == .idle || session.state.isTerminal { showsAccounts = true }
+                    else { accountSwitchWarning = true }
+                } label: { Image(systemName: "chevron.right") }
+                    .accessibilityLabel("Змінити акаунт: \(accountStore.activeAccount?.displayLabel ?? "немає")")
+            }
         }
         .safeAreaInset(edge: .bottom) {
             if session.state != .idle && !session.state.isTerminal {

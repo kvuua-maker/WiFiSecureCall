@@ -2454,6 +2454,30 @@ final class AccountFoundationTests: XCTestCase {
         XCTAssertFalse(report.contains("must-not-persist"))
     }
 
+    func testLegacyAccountWithPhoneDoesNotGuessAuthenticationProvider() throws {
+        let id = UUID()
+        let json = """
+        {"accountID":"\(id.uuidString)","phoneNumber":"+380501111111","displayLabel":"Legacy"}
+        """
+        let summary = try JSONDecoder().decode(AccountSummary.self, from: Data(json.utf8))
+        XCTAssertEqual(summary.identityKind, .unknown)
+    }
+
+    func testSafeDiagnosticsRejectsCategorySubstringAndUntrustedValues() throws {
+        let suite = "AccountFoundationTests.SafeDiagnosticDetail.\(UUID())"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let callID = UUID()
+        let diagnostics = Diagnostics(defaults: defaults)
+        diagnostics.record(role: .A, callID: callID, category: "state_token", value: "Bearer secret")
+        diagnostics.record(role: .A, callID: callID, category: "network_audio", value: "token=secret sent=12")
+        let report = Diagnostics(defaults: defaults).lastCallReport()
+        XCTAssertTrue(report.contains("sent=12"))
+        XCTAssertFalse(report.contains("state_token"))
+        XCTAssertFalse(report.contains("token=secret"))
+        XCTAssertFalse(report.contains("Bearer"))
+    }
+
     func testWatchSwitchFailureAndActiveCallGatePreserveVisibleAccount() throws {
         let defaults = try XCTUnwrap(UserDefaults(suiteName: "WatchSwitchGate.\(UUID())"))
         let secrets = InMemorySecureTokenStore()

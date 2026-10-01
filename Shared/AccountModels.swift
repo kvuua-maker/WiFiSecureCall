@@ -223,7 +223,7 @@ struct AccountSummary: Codable, Identifiable, Equatable, Sendable {
         userID = try values.decodeIfPresent(UUID.self, forKey: .userID)
         phoneNumber = try values.decodeIfPresent(String.self, forKey: .phoneNumber)
         displayLabel = try values.decodeIfPresent(String.self, forKey: .displayLabel) ?? phoneNumber ?? "Secure account"
-        identityKind = try values.decodeIfPresent(AccountIdentityKind.self, forKey: .identityKind) ?? (phoneNumber == nil ? .unknown : .phone)
+        identityKind = try values.decodeIfPresent(AccountIdentityKind.self, forKey: .identityKind) ?? .unknown
     }
 }
 

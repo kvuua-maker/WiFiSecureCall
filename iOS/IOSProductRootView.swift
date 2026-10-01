@@ -109,20 +109,32 @@ private struct IOSContactsView: View {
                     }
                 }
                 if let loadError = contactsStore.errorMessage { Text(loadError).foregroundStyle(.red) }
-                if contactsStore.contacts.isEmpty { Text("Контактів із міжнародним номером немає. Скористайтеся ручним пошуком.") }
+                if contactsStore.contacts.isEmpty { Text("Контактів немає. Скористайтеся ручним пошуком.") }
                 ForEach(visibleContacts) { contact in
-                    ForEach(contact.numbers) { number in
-                        NavigationLink {
-                            if let canonical = number.canonicalE164 {
-                                RecipientSearchView(messageStore: messageStore, runtime: runtime, initialRecipient: canonical)
-                            } else {
-                                IOSCountryPrefixConfirmation(number: number, messageStore: messageStore, runtime: runtime)
+                    NavigationLink {
+                        List {
+                            ForEach(contact.numbers) { number in
+                                NavigationLink {
+                                    if let canonical = number.canonicalE164 {
+                                        RecipientSearchView(messageStore: messageStore, runtime: runtime, initialRecipient: canonical)
+                                    } else {
+                                        IOSCountryPrefixConfirmation(number: number, messageStore: messageStore, runtime: runtime)
+                                    }
+                                } label: {
+                                    Label(number.displayValue, systemImage: "phone")
+                                }
                             }
-                        } label: {
-                            VStack(alignment: .leading) {
-                                Text(contact.name).font(.headline)
-                                Text(number.displayValue).font(.caption).foregroundStyle(.secondary)
-                                Text("Статус у сервісі невідомий — перевірити").font(.caption2).foregroundStyle(.secondary)
+                        }
+                        .navigationTitle(contact.name)
+                    } label: {
+                        HStack(spacing: 12) {
+                            Text(String(contact.name.prefix(1)).uppercased())
+                                .font(.headline).frame(width: 38, height: 38)
+                                .background(Circle().fill(Color.accentColor.opacity(0.2)))
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(contact.name).font(.headline).lineLimit(1)
+                                Text(contact.numbers.first?.displayValue ?? "")
+                                    .font(.caption).foregroundStyle(.secondary).lineLimit(1)
                             }
                         }
                     }
