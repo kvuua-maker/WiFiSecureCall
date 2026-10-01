@@ -2403,6 +2403,81 @@ final class AccountFoundationTests: XCTestCase {
         XCTAssertFalse(callStateBlocksAccountMutation(.failed(callID, .networkLost)))
     }
 
+    @MainActor
+    func testAccountMutationOnlyGatesCallsForMatchingAccount() async throws {
+        let firstID = UUID(), secondID = UUID()
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: "ScopedMutationCalls.\(UUID())"))
+        let secrets = InMemorySecureTokenStore()
+        let store = AccountSessionStore(tokenStore: secrets, defaults: defaults)
+        try store.add(accountResponse(accountID: firstID, phone: "+380501111111"))
+        try store.add(accountResponse(accountID: secondID, phone: "+380502222222"))
+        let runtime = NotificationRuntime(config: accountConfig(), accountStore: store, accountAPI: AccountAPIClient(config: accountConfig(), tokenStore: secrets), audio: AudioEngineMock(), media: MediaTransportMock())
+        let gate = AccountMutationTestGate()
+        let mutation = Task { @MainActor in
+            try await runtime.performExclusiveAccountMutation(accountID: firstID, remote: {
+                await gate.wait()
+            }, local: {})
+        }
+        await gate.waitUntilReached()
+
+        let otherCallID = UUID()
+        let otherAccountAdmitted = await runtime.awaitAccountMutation(accountID: secondID, callID: otherCallID)
+        XCTAssertTrue(otherAccountAdmitted)
+        await runtime.startUserCall(targetUserID: UUID(), accountID: firstID)
+        guard case .failed(_, .accountMutationInProgress) = runtime.callSession.state else {
+            XCTFail("matching outgoing call was not rejected with a clear reason")
+            await gate.release(); _ = try await mutation.value; return
+        }
+        await gate.release()
+        _ = try await mutation.value
+    }
+
+    @MainActor
+    func testIncomingSameAccountResumesAfterFailedServerLogout() async throws {
+        let accountID = UUID()
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: "FailedMutationIncoming.\(UUID())"))
+        let secrets = InMemorySecureTokenStore()
+        let store = AccountSessionStore(tokenStore: secrets, defaults: defaults)
+        try store.add(accountResponse(accountID: accountID, phone: "+380501111111"))
+        let runtime = NotificationRuntime(config: accountConfig(), accountStore: store, accountAPI: AccountAPIClient(config: accountConfig(), tokenStore: secrets), audio: AudioEngineMock(), media: MediaTransportMock())
+        let gate = AccountMutationTestGate()
+        let mutation = Task { @MainActor in
+            try await runtime.performExclusiveAccountMutation(accountID: accountID, remote: {
+                await gate.wait()
+                throw URLError(.notConnectedToInternet)
+            }, local: { XCTFail("local logout ran after failed server logout") })
+        }
+        await gate.waitUntilReached()
+        let admission = Task { @MainActor in await runtime.awaitAccountMutation(accountID: accountID, callID: UUID()) }
+        await gate.release()
+        do { _ = try await mutation.value; XCTFail("server logout unexpectedly succeeded") } catch { }
+        let wasAdmitted = await admission.value
+        XCTAssertTrue(wasAdmitted)
+        XCTAssertNotNil(try secrets.tokens(for: accountID))
+    }
+
+    @MainActor
+    func testIncomingSameAccountStopsAfterSuccessfulServerLogoutAndLocalRemoval() async throws {
+        let accountID = UUID()
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: "SuccessfulMutationIncoming.\(UUID())"))
+        let secrets = InMemorySecureTokenStore()
+        let store = AccountSessionStore(tokenStore: secrets, defaults: defaults)
+        try store.add(accountResponse(accountID: accountID, phone: "+380501111111"))
+        let runtime = NotificationRuntime(config: accountConfig(), accountStore: store, accountAPI: AccountAPIClient(config: accountConfig(), tokenStore: secrets), audio: AudioEngineMock(), media: MediaTransportMock())
+        let gate = AccountMutationTestGate()
+        let mutation = Task { @MainActor in
+            try await runtime.performExclusiveAccountMutation(accountID: accountID, remote: { await gate.wait() }, local: { try store.logout(accountID: accountID) })
+        }
+        await gate.waitUntilReached()
+        let admission = Task { @MainActor in await runtime.awaitAccountMutation(accountID: accountID, callID: UUID()) }
+        await gate.release()
+        _ = try await mutation.value
+        let wasAdmitted = await admission.value
+        XCTAssertFalse(wasAdmitted)
+        XCTAssertNil(try secrets.tokens(for: accountID))
+        XCTAssertFalse(store.accounts.contains { $0.accountID == accountID })
+    }
+
     func testNotificationRoutingNeverCrossesAccountsDuringCallOrUsesOrphan() throws {
         let defaults = try XCTUnwrap(UserDefaults(suiteName: "NotificationRoutingAccounts.\(UUID())"))
         let secrets = InMemorySecureTokenStore()
@@ -7469,6 +7544,30 @@ private actor RemoteCellularTestGate {
         isOpen = true
         waitContinuation?.resume()
         waitContinuation = nil
+    }
+}
+
+private actor AccountMutationTestGate {
+    private var releaseContinuation: CheckedContinuation<Void, Never>?
+    private var reachedContinuations: [CheckedContinuation<Void, Never>] = []
+    private var reached = false
+
+    func wait() async {
+        reached = true
+        let continuations = reachedContinuations
+        reachedContinuations.removeAll()
+        continuations.forEach { $0.resume() }
+        await withCheckedContinuation { releaseContinuation = $0 }
+    }
+
+    func waitUntilReached() async {
+        if reached { return }
+        await withCheckedContinuation { reachedContinuations.append($0) }
+    }
+
+    func release() {
+        releaseContinuation?.resume()
+        releaseContinuation = nil
     }
 }
 

@@ -80,6 +80,7 @@ final class CallSession: ObservableObject {
         activeSignaling?.mediaPeerIdentity.protocolVersion == 2 && callAudioCryptor != nil
     }
     var requiresEndToEndEncryptedMedia: Bool { activeSignaling?.mediaPeerIdentity.protocolVersion == 2 }
+    var activeAccountID: UUID? { activeSignaling?.historyAccountID }
 
     private let api: APIClient
     private let config: AppConfig

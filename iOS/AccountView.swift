@@ -255,9 +255,9 @@ struct AccountView: View {
         guard canSwitchAccounts() else { message = "Завершіть виклик перед виходом з акаунта."; return }
         do {
             try await runtime.performExclusiveAccountMutation(
+                accountID: accountID,
                 remote: { try await client.logout(accountID: accountID) },
                 local: {
-                    guard canSwitchAccounts() else { throw AccountMutationError.callInProgress }
                     try store.logout(accountID: accountID)
                 }
             )
@@ -269,9 +269,9 @@ struct AccountView: View {
         guard canSwitchAccounts() else { message = "Завершіть виклик перед видаленням акаунта."; return }
         do {
             try await runtime.performExclusiveAccountMutation(
+                accountID: accountID,
                 remote: { try await client.deleteAccount(accountID: accountID) },
                 local: {
-                    guard canSwitchAccounts() else { throw AccountMutationError.callInProgress }
                     try store.delete(accountID: accountID)
                 }
             )

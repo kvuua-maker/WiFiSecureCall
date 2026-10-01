@@ -42,6 +42,7 @@ struct ActiveCallView: View {
         case .reconnecting: return "Повторне з’єднання…"
         case .ending: return "Завершення…"
         case .ended: return "Дзвінок завершено"
+        case .failed(_, .accountMutationInProgress): return "Зачекайте завершення зміни акаунта"
         case .failed: return "Помилка дзвінка"
         }
     }
