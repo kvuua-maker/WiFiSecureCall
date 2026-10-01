@@ -27,25 +27,25 @@ struct PhoneRegistrationView: View {
     var body: some View {
         Form {
             if verificationID == nil {
-                Section("Phone number") {
+                Section("Номер телефону") {
                     TextField("+380…", text: $phone).keyboardType(.phonePad).textContentType(.telephoneNumber)
-                    Button("Send code") { Task { await sendCode() } }.disabled(busy || !E164Phone.isValid(E164Phone.canonicalized(phone)))
+                    Button("Надіслати код") { Task { await sendCode() } }.disabled(busy || !E164Phone.isValid(E164Phone.canonicalized(phone)))
                 }
             } else {
-                Section("Verification code") {
+                Section("Код підтвердження") {
                     TextField("123456", text: $code).keyboardType(.numberPad).textContentType(.oneTimeCode)
-                    Button("Verify") { Task { await verify() } }.disabled(busy || code.count != 6)
+                    Button("Підтвердити") { Task { await verify() } }.disabled(busy || code.count != 6)
                 }
             }
             if !message.isEmpty { Text(message).foregroundStyle(.secondary) }
         }
-        .navigationTitle("Register phone")
+        .navigationTitle("Реєстрація номера")
     }
 
     @MainActor private func sendCode() async {
         busy = true; defer { busy = false }
-        do { verificationID = try await client.startPhone(E164Phone.canonicalized(phone)).verificationID; message = "Code sent" }
-        catch { message = "Unable to send code" }
+        do { verificationID = try await client.startPhone(E164Phone.canonicalized(phone)).verificationID; message = "Код надіслано" }
+        catch { message = "Не вдалося надіслати код" }
     }
 
     @MainActor private func verify() async {
@@ -59,6 +59,6 @@ struct PhoneRegistrationView: View {
             onAccountAdded(response.account.accountID, decision.activate)
             dismiss()
         }
-        catch { message = "Verification failed" }
+        catch { message = "Не вдалося підтвердити код" }
     }
 }

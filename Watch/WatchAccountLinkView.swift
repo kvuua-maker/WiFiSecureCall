@@ -164,6 +164,7 @@ struct WatchAccountLinkView: View {
     @ObservedObject var store: AccountSessionStore
     @EnvironmentObject private var appleAuthentication: WatchAppleAuthenticationCoordinator
     private let client: AccountAPIClient
+    private let runtime: NotificationRuntime
     private let canSwitchAccounts: () -> Bool
     private let expectedAccountID: UUID?
     @State private var code = ""
@@ -174,8 +175,9 @@ struct WatchAccountLinkView: View {
     @State private var polling: Task<Void, Never>?
     @State private var currentAttemptID: UUID?
 
-    init(store: AccountSessionStore, expectedAccountID: UUID? = nil, canSwitchAccounts: @escaping () -> Bool = { true }) {
+    init(store: AccountSessionStore, runtime: NotificationRuntime = .shared, expectedAccountID: UUID? = nil, canSwitchAccounts: @escaping () -> Bool = { true }) {
         self.store = store
+        self.runtime = runtime
         self.client = AccountAPIClient(config: .load(), tokenStore: store.tokenStore)
         self.expectedAccountID = expectedAccountID
         self.canSwitchAccounts = canSwitchAccounts
@@ -191,7 +193,7 @@ struct WatchAccountLinkView: View {
                     if code.isEmpty {
                         Button("Створити код") {
                             guard canSwitchAccounts() else { message = "Завершіть виклик перед додаванням акаунта."; return }
-                            begin()
+                            begin(expectedAccountID: expectedAccountID)
                         }
                             .disabled(polling != nil)
                     }
@@ -250,6 +252,7 @@ struct WatchAccountLinkView: View {
                                 Button("Зв’язати повторно") { relink(selected.accountID) }
                             } else {
                                 Button("Вийти", role: .destructive) {
+                                    guard canSwitchAccounts() else { message = "Завершіть виклик перед виходом з акаунта."; return }
                                     Task { await signOut(selected.accountID) }
                                 }
                             }
@@ -398,12 +401,19 @@ struct WatchAccountLinkView: View {
     }
 
     @MainActor private func signOut(_ accountID: UUID) async {
+        guard canSwitchAccounts() else { message = "Завершіть виклик перед виходом з акаунта."; return }
         do {
-            try await client.logout(accountID: accountID)
-            try store.logout(accountID: accountID)
+            try await runtime.performExclusiveAccountMutation(
+                remote: { try await client.logout(accountID: accountID) },
+                local: {
+                    guard canSwitchAccounts() else { throw AccountMutationError.callInProgress }
+                    try store.logout(accountID: accountID)
+                }
+            )
             selectedAccountID = store.activeAccountID ?? store.accounts.first?.accountID
             message = "Вихід виконано"
         }
+        catch AccountMutationError.callInProgress { message = "Вихід скасовано: триває виклик." }
         catch { message = "Не вдалося вийти" }
     }
 }

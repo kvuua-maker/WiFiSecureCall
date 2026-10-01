@@ -2391,6 +2391,47 @@ final class AccountFoundationTests: XCTestCase {
         XCTAssertTrue(isCurrentWatchLinkAttempt(current: secondAttempt, candidate: secondAttempt, isCancelled: false))
     }
 
+    func testEveryLiveCallStateBlocksLogoutAndDeletion() {
+        let callID = UUID()
+        let blocked: [CallState] = [
+            .outgoingRinging(callID), .incomingRinging(callID), .connecting(callID),
+            .active(callID), .reconnecting(callID), .ending(callID)
+        ]
+        XCTAssertTrue(blocked.allSatisfy(callStateBlocksAccountMutation))
+        XCTAssertFalse(callStateBlocksAccountMutation(.idle))
+        XCTAssertFalse(callStateBlocksAccountMutation(.ended(callID)))
+        XCTAssertFalse(callStateBlocksAccountMutation(.failed(callID, .networkLost)))
+    }
+
+    func testNotificationRoutingNeverCrossesAccountsDuringCallOrUsesOrphan() throws {
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: "NotificationRoutingAccounts.\(UUID())"))
+        let secrets = InMemorySecureTokenStore()
+        let first = accountResponse(phone: "+380501111111")
+        let second = accountResponse(phone: "+380502222222")
+        let orphan = accountResponse(phone: "+380503333333")
+        let store = AccountSessionStore(tokenStore: secrets, defaults: defaults)
+        try store.add(first); try store.add(second); try store.add(orphan)
+        XCTAssertEqual(store.switchAccount(to: first.account.accountID), .switched)
+        try secrets.delete(accountID: orphan.account.accountID)
+        let conversationID = UUID()
+        var routes: [(UUID, UUID)] = []
+
+        XCTAssertFalse(routeSecureMessageNotification(accountID: second.account.accountID, conversationID: conversationID, accountStore: store, callState: .active(UUID())) { routes.append(($0, $1)) })
+        XCTAssertEqual(store.activeAccountID, first.account.accountID)
+        XCTAssertTrue(routes.isEmpty)
+
+        XCTAssertFalse(routeSecureMessageNotification(accountID: orphan.account.accountID, conversationID: conversationID, accountStore: store, callState: .idle) { routes.append(($0, $1)) })
+        XCTAssertEqual(store.activeAccountID, first.account.accountID)
+        XCTAssertTrue(routes.isEmpty)
+
+        XCTAssertTrue(routeSecureMessageNotification(accountID: first.account.accountID, conversationID: conversationID, accountStore: store, callState: .active(UUID())) { routes.append(($0, $1)) })
+        XCTAssertEqual(routes.map(\.0), [first.account.accountID])
+
+        XCTAssertTrue(routeSecureMessageNotification(accountID: second.account.accountID, conversationID: conversationID, accountStore: store, callState: .idle) { routes.append(($0, $1)) })
+        XCTAssertEqual(store.activeAccountID, second.account.accountID)
+        XCTAssertEqual(routes.last?.0, second.account.accountID)
+    }
+
     func testAccountCompletionDuringCallPreservesActiveIdentityAndCurrentE2EEContext() throws {
         let defaults = try XCTUnwrap(UserDefaults(suiteName: "AccountCompletionDuringCall.\(UUID())"))
         let secrets = InMemorySecureTokenStore()

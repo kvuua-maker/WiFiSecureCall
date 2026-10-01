@@ -4,6 +4,7 @@ import SwiftUI
 struct AccountView: View {
     @ObservedObject var store: AccountSessionStore
     private let client: AccountAPIClient
+    private let runtime: NotificationRuntime
     private let canSwitchAccounts: () -> Bool
     @State private var showRegistration = false
     @State private var watchCode = ""
@@ -17,8 +18,9 @@ struct AccountView: View {
     @State private var showsAppleSignIn = false
     @State private var pendingSwitchAccountID: UUID?
 
-    init(store: AccountSessionStore, canSwitchAccounts: @escaping () -> Bool = { true }) {
+    init(store: AccountSessionStore, runtime: NotificationRuntime = .shared, canSwitchAccounts: @escaping () -> Bool = { true }) {
         self.store = store
+        self.runtime = runtime
         self.client = AccountAPIClient(config: .load(), tokenStore: store.tokenStore)
         self.canSwitchAccounts = canSwitchAccounts
     }
@@ -110,8 +112,14 @@ struct AccountView: View {
                             }
                         }
                         Section {
-                            Button("Вийти", role: .destructive) { confirmsSignOut = true }
-                            Button("Видалити акаунт", role: .destructive) { confirmsDeletion = true }
+                            Button("Вийти", role: .destructive) {
+                                guard canSwitchAccounts() else { message = "Завершіть виклик перед виходом з акаунта."; return }
+                                confirmsSignOut = true
+                            }
+                            Button("Видалити акаунт", role: .destructive) {
+                                guard canSwitchAccounts() else { message = "Завершіть виклик перед видаленням акаунта."; return }
+                                confirmsDeletion = true
+                            }
                         }
                     }
                 }
@@ -244,12 +252,32 @@ struct AccountView: View {
         catch { message = "Не вдалося зв’язати Apple Watch" }
     }
     @MainActor private func logout(_ accountID: UUID) async {
-        do { try await client.logout(accountID: accountID); try store.logout(accountID: accountID) }
-        catch { message = "Не вдалося вийти" }
+        guard canSwitchAccounts() else { message = "Завершіть виклик перед виходом з акаунта."; return }
+        do {
+            try await runtime.performExclusiveAccountMutation(
+                remote: { try await client.logout(accountID: accountID) },
+                local: {
+                    guard canSwitchAccounts() else { throw AccountMutationError.callInProgress }
+                    try store.logout(accountID: accountID)
+                }
+            )
+        } catch AccountMutationError.callInProgress {
+            message = "Вихід скасовано: триває виклик."
+        } catch { message = "Не вдалося вийти" }
     }
     @MainActor private func delete(_ accountID: UUID) async {
-        do { try await client.deleteAccount(accountID: accountID); try store.delete(accountID: accountID) }
-        catch { message = "Не вдалося видалити акаунт" }
+        guard canSwitchAccounts() else { message = "Завершіть виклик перед видаленням акаунта."; return }
+        do {
+            try await runtime.performExclusiveAccountMutation(
+                remote: { try await client.deleteAccount(accountID: accountID) },
+                local: {
+                    guard canSwitchAccounts() else { throw AccountMutationError.callInProgress }
+                    try store.delete(accountID: accountID)
+                }
+            )
+        } catch AccountMutationError.callInProgress {
+            message = "Видалення скасовано: триває виклик."
+        } catch { message = "Не вдалося видалити акаунт" }
     }
 
     private func removeOrphaned(_ accountID: UUID) {

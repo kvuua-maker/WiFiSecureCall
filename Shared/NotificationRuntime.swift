@@ -1,5 +1,35 @@
 import Foundation
 
+enum AccountMutationError: Error, Equatable {
+    case callInProgress
+    case mutationInProgress
+}
+
+func callStateBlocksAccountMutation(_ state: CallState) -> Bool {
+    switch state {
+    case .idle, .ended, .failed: return false
+    case .outgoingRinging, .incomingRinging, .connecting, .active, .reconnecting, .ending: return true
+    }
+}
+
+@MainActor
+func routeSecureMessageNotification(
+    accountID: UUID,
+    conversationID: UUID,
+    accountStore: AccountSessionStore,
+    callState: CallState,
+    open: (UUID, UUID) -> Void
+) -> Bool {
+    guard accountStore.accounts.contains(where: { $0.accountID == accountID }),
+          (try? accountStore.tokenStore.tokens(for: accountID)) != nil else { return false }
+    if accountStore.activeAccountID != accountID {
+        guard !callStateBlocksAccountMutation(callState),
+              accountStore.switchAccount(to: accountID) == .switched else { return false }
+    }
+    open(accountID, conversationID)
+    return true
+}
+
 @MainActor
 final class NotificationRuntime {
     static let shared = NotificationRuntime()
@@ -12,6 +42,7 @@ final class NotificationRuntime {
     private var callKitFactory: (() -> CallKitHandling)?
     private var callKit: CallKitHandling?
     private(set) var callKitCreationCount = 0
+    private var accountMutationInProgress = false
 
     init(
         config: AppConfig = AppConfig.load(),
@@ -55,6 +86,7 @@ final class NotificationRuntime {
     }
 
     func startCall() async {
+        guard !accountMutationInProgress else { return }
         _ = ensureCallKit()
         await callSession.startCall()
     }
@@ -65,6 +97,7 @@ final class NotificationRuntime {
     }
 
     func startPreferredCall(targetPlatform: String, accountID: UUID) async {
+        guard !accountMutationInProgress else { return }
         guard accountStore.accounts.contains(where: { $0.accountID == accountID }) else {
             callSession.failToStart(.accountSessionInvalid)
             return
@@ -78,6 +111,7 @@ final class NotificationRuntime {
             callSession.failToStart(.accountSessionInvalid)
             return
         }
+        guard !accountMutationInProgress else { return }
         let matches: [AccountDeviceSummary]
         do {
             matches = try await accountAPI.devices(accountID: accountID).filter {
@@ -87,6 +121,7 @@ final class NotificationRuntime {
             callSession.failToStart(Self.isInvalidAccountSession(error) ? .accountSessionInvalid : .serverUnavailable)
             return
         }
+        guard !accountMutationInProgress else { return }
         guard matches.count == 1 else {
             callSession.failToStart(matches.isEmpty ? .targetUnavailable : .targetAmbiguous)
             return
@@ -105,6 +140,7 @@ final class NotificationRuntime {
     }
 
     func startUserCall(targetUserID: UUID, accountID: UUID, peerDisplayName: String? = nil) async {
+        guard !accountMutationInProgress else { return }
         guard accountStore.accounts.contains(where: { $0.accountID == accountID }) else {
             callSession.failToStart(.accountSessionInvalid)
             return
@@ -124,6 +160,7 @@ final class NotificationRuntime {
     }
 
     func handleIncomingVoIP(callID: UUID) async {
+        guard !accountMutationInProgress else { return }
         callSession.recordLifecycleDiagnostic("push_received", status: "voip", callID: callID)
         guard ensureCallKit() != nil else {
             callSession.recordLifecycleDiagnostic("incoming_callkit_report_started", status: "provider_unavailable", callID: callID)
@@ -133,6 +170,7 @@ final class NotificationRuntime {
     }
 
     func handleIncomingVoIP(callID: UUID, accountID: UUID) async {
+        guard !accountMutationInProgress else { return }
         callSession.recordLifecycleDiagnostic("push_received", status: "account", callID: callID)
         guard let signaling = accountIncomingSignaling(accountID: accountID, callID: callID) else {
             if !accountStore.accounts.contains(where: { $0.accountID == accountID }) {
@@ -145,6 +183,7 @@ final class NotificationRuntime {
     }
 
     func handleIncomingBackgroundNotification(callID: UUID) async -> Bool {
+        guard !accountMutationInProgress else { return false }
         callSession.recordLifecycleDiagnostic("watch_background_notification_received", status: "received", callID: callID)
         if callSession.state.callID == callID {
             callSession.recordLifecycleDiagnostic("duplicate_incoming_suppressed", status: "same_server_call_id", callID: callID)
@@ -174,6 +213,7 @@ final class NotificationRuntime {
     }
 
     func handleIncomingBackgroundNotification(callID: UUID, accountID: UUID) async -> Bool {
+        guard !accountMutationInProgress else { return false }
         callSession.recordLifecycleDiagnostic("watch_background_notification_received", status: "account", callID: callID)
         if let duplicate = duplicateIncomingResult(callID: callID) { return duplicate }
         guard let signaling = accountIncomingSignaling(accountID: accountID, callID: callID) else { return false }
@@ -186,22 +226,26 @@ final class NotificationRuntime {
     }
 
     func handleIncomingAlert(callID: UUID, requestAnswer: Bool) async {
+        guard !accountMutationInProgress else { return }
         guard ensureCallKit() != nil else { return }
         await callSession.handleIncoming(callID: callID, requestAnswer: requestAnswer)
     }
 
     func handleIncomingAlert(callID: UUID, accountID: UUID, requestAnswer: Bool) async {
+        guard !accountMutationInProgress else { return }
         guard let signaling = accountIncomingSignaling(accountID: accountID, callID: callID), ensureCallKit() != nil else { return }
         await callSession.handleIncoming(callID: callID, requestAnswer: requestAnswer, signaling: signaling)
     }
 
     func handleIncomingUserVoIP(callID: UUID, accountID: UUID, caller: CrossUserCallerIdentity) async {
+        guard !accountMutationInProgress else { return }
         callSession.recordLifecycleDiagnostic("push_received", status: "user", callID: callID)
         guard let signaling = userIncomingSignaling(accountID: accountID, caller: caller), ensureCallKit() != nil else { return }
         await callSession.handleIncomingVoIP(callID: callID, signaling: signaling)
     }
 
     func handleIncomingUserBackgroundNotification(callID: UUID, accountID: UUID, caller: CrossUserCallerIdentity) async -> Bool {
+        guard !accountMutationInProgress else { return false }
         callSession.recordLifecycleDiagnostic("watch_background_notification_received", status: "user", callID: callID)
         if let duplicate = duplicateIncomingResult(callID: callID) { return duplicate }
         guard let signaling = userIncomingSignaling(accountID: accountID, caller: caller), ensureCallKit() != nil else { return false }
@@ -210,8 +254,23 @@ final class NotificationRuntime {
     }
 
     func handleIncomingUserAlert(callID: UUID, accountID: UUID, caller: CrossUserCallerIdentity, requestAnswer: Bool) async {
+        guard !accountMutationInProgress else { return }
         guard let signaling = userIncomingSignaling(accountID: accountID, caller: caller), ensureCallKit() != nil else { return }
         await callSession.handleIncoming(callID: callID, requestAnswer: requestAnswer, signaling: signaling)
+    }
+
+    func performExclusiveAccountMutation(
+        remote: @MainActor () async throws -> Void,
+        local: @MainActor () throws -> Void
+    ) async throws {
+        guard !callStateBlocksAccountMutation(callSession.state) else { throw AccountMutationError.callInProgress }
+        guard !accountMutationInProgress else { throw AccountMutationError.mutationInProgress }
+        accountMutationInProgress = true
+        defer { accountMutationInProgress = false }
+        guard !callStateBlocksAccountMutation(callSession.state) else { throw AccountMutationError.callInProgress }
+        try await remote()
+        guard !callStateBlocksAccountMutation(callSession.state) else { throw AccountMutationError.callInProgress }
+        try local()
     }
 
     private func userIncomingSignaling(accountID: UUID, caller: CrossUserCallerIdentity) -> CrossUserCallSignaling? {
@@ -276,7 +335,7 @@ final class SecureMessageNotificationExecutionPermit: @unchecked Sendable {
 @MainActor
 final class SecureMessageNotificationWorkCoordinator {
     typealias Loader = @MainActor (UUID, UUID) async -> Bool
-    typealias Router = @MainActor (UUID, UUID) -> Void
+    typealias Router = @MainActor (UUID, UUID) -> Bool
     typealias Sleeper = @Sendable (UInt64) async -> Void
 
     static let shared = SecureMessageNotificationWorkCoordinator(
@@ -287,8 +346,15 @@ final class SecureMessageNotificationWorkCoordinator {
             )
         },
         router: { accountID, conversationID in
-            NotificationRuntime.shared.accountStore.switchAccount(to: accountID)
-            ProductNavigation.shared.openConversation(accountID: accountID, conversationID: conversationID)
+            let runtime = NotificationRuntime.shared
+            return routeSecureMessageNotification(
+                accountID: accountID,
+                conversationID: conversationID,
+                accountStore: runtime.accountStore,
+                callState: runtime.callSession.state
+            ) { routedAccountID, routedConversationID in
+                ProductNavigation.shared.openConversation(accountID: routedAccountID, conversationID: routedConversationID)
+            }
         },
         sleeper: { nanoseconds in try? await Task.sleep(nanoseconds: nanoseconds) }
     )
@@ -342,12 +408,10 @@ final class SecureMessageNotificationWorkCoordinator {
                 operationTasks.removeValue(forKey: operationID)
                 return
             }
-            if loaded, action == .openConversation {
-                router(envelope.accountID, envelope.conversationID)
-            }
+            let completed = loaded && (action == .refreshOnly || router(envelope.accountID, envelope.conversationID))
             permit.close()
             operationTasks.removeValue(forKey: operationID)
-            outcome.finish(loaded)
+            outcome.finish(completed)
         }
         deadlineTasks[operationID] = Task { @MainActor [weak self] in
             guard let self else { outcome.finish(false); return }

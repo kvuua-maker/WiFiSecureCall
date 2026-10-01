@@ -657,6 +657,7 @@ final class SecureMessengerNavigationRepairTests: XCTestCase {
             },
             router: { accountID, conversationID in
                 recorder.routes.append((accountID, conversationID))
+                return true
             },
             sleeper: { nanoseconds in try? await Task.sleep(nanoseconds: nanoseconds) }
         )
@@ -712,6 +713,7 @@ final class SecureMessengerNavigationRepairTests: XCTestCase {
             },
             router: { accountID, conversationID in
                 recorder.routes.append((accountID, conversationID))
+                return true
             },
             sleeper: { _ in await deadlineGate.wait() }
         )
@@ -733,5 +735,23 @@ final class SecureMessengerNavigationRepairTests: XCTestCase {
         XCTAssertTrue(recorder.routes.isEmpty)
         XCTAssertEqual(coordinator.trackedOperationCount, 0)
         XCTAssertEqual(coordinator.trackedDeadlineCount, 0)
+    }
+
+    func testNotificationOpenReportsFailureWhenRouterRefusesAccount() async {
+        let coordinator = SecureMessageNotificationWorkCoordinator(
+            loader: { _, _ in true },
+            router: { _, _ in false },
+            sleeper: { nanoseconds in try? await Task.sleep(nanoseconds: nanoseconds) }
+        )
+        let envelope = SecureMessagePushEnvelope(
+            conversationID: UUID(),
+            messageID: UUID(),
+            accountID: UUID()
+        )
+
+        let opened = await coordinator.handle(envelope, action: .openConversation)
+        let refreshed = await coordinator.handle(envelope, action: .refreshOnly)
+        XCTAssertFalse(opened)
+        XCTAssertTrue(refreshed)
     }
 }
