@@ -365,15 +365,26 @@ private struct WatchContactsView: View {
             } else {
                 if let updatedAt = cache.updatedAt { Text("Оновлено \(updatedAt, style: .relative)").font(.caption2) }
                 ForEach(visible) { contact in
-                    ForEach(contact.numbers) { number in
-                        NavigationLink {
-                            if let canonical = number.canonicalE164 {
-                                RecipientSearchView(messageStore: messageStore, runtime: runtime, initialRecipient: canonical)
-                            } else {
-                                WatchCountryPrefixConfirmation(number: number, messageStore: messageStore, runtime: runtime)
+                    NavigationLink {
+                        List {
+                            ForEach(contact.numbers) { number in
+                                NavigationLink {
+                                    if let canonical = number.canonicalE164 {
+                                        RecipientSearchView(messageStore: messageStore, runtime: runtime, initialRecipient: canonical)
+                                    } else {
+                                        WatchCountryPrefixConfirmation(number: number, messageStore: messageStore, runtime: runtime)
+                                    }
+                                } label: {
+                                    Text(number.displayValue).lineLimit(1)
+                                }
                             }
-                        } label: {
-                            VStack(alignment: .leading) { Text(contact.name).lineLimit(1); Text(number.displayValue).font(.caption2) }
+                        }
+                        .navigationTitle(contact.name)
+                    } label: {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(contact.name).lineLimit(1)
+                            Text(contact.numbers.first?.displayValue ?? "")
+                                .font(.caption2).foregroundStyle(.secondary).lineLimit(1)
                         }
                     }
                 }

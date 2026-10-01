@@ -1,6 +1,7 @@
 import SwiftUI
 
 struct ConversationView: View {
+    @Environment(\.dismiss) private var dismiss
     @ObservedObject var store: SecureMessageStore
     let conversation: SecureConversation
     let accountID: UUID
@@ -66,6 +67,11 @@ struct ConversationView: View {
                     let text = draft
                     sending = true
                     Task {
+                        guard store.activeAccountID == accountID else {
+                            safeError = "Акаунт змінено. Поверніться до списку чатів."
+                            sending = false
+                            return
+                        }
                         do {
                             try await store.send(text: text, conversation: conversation, accountID: accountID)
                             if draft == text { draft = "" }
@@ -77,7 +83,7 @@ struct ConversationView: View {
                 } label: {
                     if sending { ProgressView() } else { Image(systemName: "arrow.up.circle.fill") }
                 }
-                .disabled(sending || draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                .disabled(sending || store.activeAccountID != accountID || draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                 .accessibilityLabel(ProductAccessibility.sendMessage)
             }
             .padding([.horizontal, .bottom])
@@ -89,6 +95,7 @@ struct ConversationView: View {
                     Task { await NotificationRuntime.shared.startUserCall(targetUserID: peer.userID, accountID: accountID, peerDisplayName: conversation.peerDisplayName) }
                 } label: { Image(systemName: "phone") }
                     .accessibilityLabel("Захищений дзвінок")
+                    .disabled(store.activeAccountID != accountID)
             }
             NavigationLink("Безпека") {
                 List {
@@ -150,9 +157,15 @@ struct ConversationView: View {
         }
         #endif
         .task {
+            guard store.activeAccountID == accountID else { dismiss(); return }
             await store.prepareSafety(conversation: conversation, accountID: accountID)
+            guard store.activeAccountID == accountID else { dismiss(); return }
             await store.loadMessages(conversationID: conversation.id, accountID: accountID)
+            guard store.activeAccountID == accountID else { dismiss(); return }
             await store.markRead(conversationID: conversation.id, accountID: accountID)
+        }
+        .onChange(of: store.activeAccountID) { value in
+            if value != accountID { dismiss() }
         }
     }
 }

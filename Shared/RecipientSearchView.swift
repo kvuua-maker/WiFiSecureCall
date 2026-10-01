@@ -145,14 +145,22 @@ struct RecipientSearchView: View {
     private func startMessage(_ value: ResolvedRecipient) async {
         guard state != .loading else { return }
         guard let accountID = currentAccountID else { state = .failed("Виберіть акаунт для повідомлення"); return }
+        if accountID != runtime.accountStore.activeAccountID && callStateBlocksAccountMutation(runtime.callSession.state) {
+            state = .failed("Завершіть виклик перед перемиканням акаунта.")
+            return
+        }
         let operation = operationGate.begin(accountID: accountID)
         state = .loading
         do {
             let conversation = try await messageStore.createConversation(targetUserID: value.userID, accountID: accountID)
             guard operationGate.accepts(operation, selectedAccountID: currentAccountID) else { return }
-            // The explicit "From account" choice remains the conversation's
-            // active identity when the destination is presented.
-            runtime.accountStore.switchAccount(to: accountID)
+            if accountID != runtime.accountStore.activeAccountID {
+                guard !callStateBlocksAccountMutation(runtime.callSession.state),
+                      runtime.accountStore.switchAccount(to: accountID) == .switched else {
+                    state = .failed("Завершіть виклик перед перемиканням акаунта.")
+                    return
+                }
+            }
             createdConversation = conversation
             createdConversationAccountID = accountID
             showCreatedConversation = true
