@@ -1901,7 +1901,10 @@ final class WiFiSecureCallTests: XCTestCase {
         let previousStops = audio.stopCount
         adapter.onAudioDeactivated?(localID)
         await eventually { audio.stopCount > previousStops }
+        audio.onFailure?(.configurationChanged)
+        try? await Task.sleep(nanoseconds: 30_000_000)
         XCTAssertGreaterThan(audio.stopCount, previousStops)
+        XCTAssertFalse(session.state.isTerminal)
     }
 
     @MainActor

@@ -932,8 +932,10 @@ final class CallSession: ObservableObject {
     }
 
     private func audioFailed(_ failure: AudioEngineRuntimeFailure) {
-        guard let current = generation, state.isAcceptedLifecycle else { return }
-        if activatedCallKitUUID == current.localCallKitUUID, audioRecoveryBudget.claim() {
+        guard let current = generation, state.isAcceptedLifecycle,
+              activatedCallKitUUID == current.localCallKitUUID,
+              audioStartedForCallKitUUID == current.localCallKitUUID else { return }
+        if audioRecoveryBudget.claim() {
             recordRuntimeDiagnostic("audio_watchdog_recovery_started", status: "runtime_failure=\(String(describing: failure))", callID: current.serverCallID)
             recoverAudioOnly(current)
         } else {
