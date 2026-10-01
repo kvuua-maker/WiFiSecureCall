@@ -3380,6 +3380,14 @@ final class AccountCallFoundationTests: XCTestCase {
 
 @MainActor
 final class SecureRingingUpgradeRegressionTests: XCTestCase {
+    func testIndependentAudioProgressDetectsEveryStoppedDirection() {
+        let baseline = AudioProgressCounters(sent: 10, received: 20, rendered: 30)
+        XCTAssertEqual(AudioProgressCounters(sent: 10, received: 21, rendered: 31).stalledStage(since: baseline), .sendFailure)
+        XCTAssertEqual(AudioProgressCounters(sent: 11, received: 20, rendered: 31).stalledStage(since: baseline), .receiveAbsent)
+        XCTAssertEqual(AudioProgressCounters(sent: 11, received: 21, rendered: 30).stalledStage(since: baseline), .renderFailure)
+        XCTAssertNil(AudioProgressCounters(sent: 11, received: 21, rendered: 31).stalledStage(since: baseline))
+    }
+
     func testOwnDeviceAndCrossUserRingingUpgradeRequireVerifiedFullResponse() async throws {
         for kind in ["own", "cross"] {
             let signaling = RingingUpgradeSignaling(hasVerifiedKeys: true, kind: kind)
@@ -3416,7 +3424,8 @@ final class SecureRingingUpgradeRegressionTests: XCTestCase {
         try await adapter.approveStart(try XCTUnwrap(adapter.startedIDs.first))
         await waitUntil { signaling.terminalRequestIDs.count >= 2 }
         XCTAssertTrue(session.state.isTerminal)
-        XCTAssertEqual(signaling.terminalMutations, [.end, .end])
+        XCTAssertGreaterThanOrEqual(signaling.terminalMutations.count, 2)
+        XCTAssertTrue(signaling.terminalMutations.allSatisfy { $0 == .end })
         XCTAssertEqual(Set(signaling.terminalRequestIDs).count, 1)
         XCTAssertFalse(session.isEndToEndEncryptedMedia)
     }
@@ -3430,6 +3439,19 @@ final class SecureRingingUpgradeRegressionTests: XCTestCase {
         await waitUntil { if case .connecting = session.state { return true }; return false }
         XCTAssertGreaterThanOrEqual(signaling.verifiedAcceptedCount, 2)
         XCTAssertTrue(session.isEndToEndEncryptedMedia)
+        XCTAssertTrue(signaling.terminalMutations.isEmpty)
+    }
+
+    func testTerminalStateDuringAcceptedVerificationRetryStopsWithoutMedia() async throws {
+        let signaling = RingingUpgradeSignaling(hasVerifiedKeys: true, kind: "terminal", transientVerificationFailures: 1, terminalAfterTransient: true)
+        let media = MediaTransportMock()
+        let session = CallSession(config: config(), audio: AudioEngineMock(), media: media)
+        let adapter = RetainedCallKitMock(); session.attach(callKit: adapter)
+        await session.startCall(signaling: signaling)
+        try await adapter.approveStart(try XCTUnwrap(adapter.startedIDs.first))
+        await waitUntil { session.state.isTerminal }
+        XCTAssertTrue(session.state.isTerminal)
+        XCTAssertTrue(media.connectedCallIDs.isEmpty)
         XCTAssertTrue(signaling.terminalMutations.isEmpty)
     }
 
@@ -3539,6 +3561,7 @@ private final class RingingUpgradeSignaling: CallSignaling, @unchecked Sendable 
     private let hasVerifiedKeys: Bool
     private let kind: String
     private let permanentVerificationFailure: Bool
+    private let terminalAfterTransient: Bool
     private var transientVerificationFailures: Int
     private let failFirstEnd: Bool
     private var mutations: [CallMutation] = []
@@ -3547,10 +3570,11 @@ private final class RingingUpgradeSignaling: CallSignaling, @unchecked Sendable 
     var terminalRequestIDs: [UUID] { lock.withLock { requestIDs } }
     private(set) var rawAcceptedCount = 0
     private(set) var verifiedAcceptedCount = 0
-    init(hasVerifiedKeys: Bool, kind: String, permanentVerificationFailure: Bool = false, transientVerificationFailures: Int = 0, failFirstEnd: Bool = false) {
+    init(hasVerifiedKeys: Bool, kind: String, permanentVerificationFailure: Bool = false, transientVerificationFailures: Int = 0, terminalAfterTransient: Bool = false, failFirstEnd: Bool = false) {
         self.hasVerifiedKeys = hasVerifiedKeys; self.kind = kind
         self.permanentVerificationFailure = permanentVerificationFailure
         self.transientVerificationFailures = transientVerificationFailures
+        self.terminalAfterTransient = terminalAfterTransient
         self.failFirstEnd = failFirstEnd
     }
     func create(callID: UUID, requestID: UUID) async throws -> CallSignalView { view(callID, state: .ringing, keys: nil) }
@@ -3564,6 +3588,7 @@ private final class RingingUpgradeSignaling: CallSignaling, @unchecked Sendable 
         }
         if permanentVerificationFailure { throw CallSignalingError.invalidResponse }
         if shouldFailTransiently { throw URLError(.networkConnectionLost) }
+        if terminalAfterTransient { return view(id, state: .ended, keys: nil) }
         let keys = hasVerifiedKeys ? CallAudioKeys(send: SymmetricKey(size: .bits256), receive: SymmetricKey(size: .bits256), epoch: 1, sendDirection: .callerToCallee, receiveDirection: .calleeToCaller) : nil
         return view(id, state: .accepted, keys: keys)
     }

@@ -29,6 +29,19 @@ enum AudioFlowFailureStage: String, Equatable, Sendable {
     case renderFailure = "render_failure"
 }
 
+struct AudioProgressCounters: Equatable, Sendable {
+    var sent: UInt64 = 0
+    var received: UInt64 = 0
+    var rendered: UInt64 = 0
+
+    func stalledStage(since baseline: Self) -> AudioFlowFailureStage? {
+        if sent == baseline.sent { return .sendFailure }
+        if received == baseline.received { return .receiveAbsent }
+        if rendered == baseline.rendered { return .renderFailure }
+        return nil
+    }
+}
+
 struct AudioFlowMilestones: Equatable, Sendable {
     var micCallback = false
     var networkPCMGenerated = false
@@ -216,6 +229,8 @@ final class AudioEngine: AudioEngineHandling, @unchecked Sendable {
     private var pcmRing = PCMByteRing()
     private var captureTimer: DispatchSourceTimer?
     private var watchdog: DispatchWorkItem?
+    private var watchdogGeneration: UInt64 = 0
+    private var renderedBufferCount: UInt64 = 0
     private var captureLifecycle = CaptureSourceLifecycle()
     private var starting = false
     private var scheduledBuffers = 0
@@ -456,19 +471,20 @@ final class AudioEngine: AudioEngineHandling, @unchecked Sendable {
 
     private func startCaptureWatchdog(_ ring: RealtimeCaptureRing) {
         watchdog?.cancel()
-        scheduleCaptureWatchdog(ring, baseline: ring.callbackCount)
+        watchdogGeneration &+= 1
+        scheduleCaptureWatchdog(ring, baseline: ring.callbackCount, generation: watchdogGeneration)
     }
 
-    private func scheduleCaptureWatchdog(_ ring: RealtimeCaptureRing, baseline: UInt64) {
+    private func scheduleCaptureWatchdog(_ ring: RealtimeCaptureRing, baseline: UInt64, generation: UInt64) {
         let item = DispatchWorkItem { [weak self, weak ring] in
-            guard let self, let ring, self.engine.isRunning else { return }
+            guard let self, let ring, self.engine.isRunning, self.watchdogGeneration == generation else { return }
             let current = ring.callbackCount
             if current == baseline {
                 self.emit("capture_watchdog_failed", "callbacks_stalled")
                 self.onFailure?(.captureStalled)
                 return
             }
-            self.scheduleCaptureWatchdog(ring, baseline: current)
+            self.scheduleCaptureWatchdog(ring, baseline: current, generation: generation)
         }
         watchdog = item; controlQueue.asyncAfter(deadline: .now() + 2, execute: item)
     }
@@ -500,13 +516,15 @@ final class AudioEngine: AudioEngineHandling, @unchecked Sendable {
             self.playbackQueue.async {
                 self.scheduledBuffers = max(0, self.scheduledBuffers - 1)
                 if !self.firstPlaybackRenderedReported { self.firstPlaybackRenderedReported = true; self.emit("first_playback_buffer_rendered", "rendered") }
+                self.renderedBufferCount &+= 1
+                if self.renderedBufferCount.isMultiple(of: 50) { self.emit("playback_render_progress", "frames=50") }
             }
         }
         if !firstPlaybackScheduledReported { firstPlaybackScheduledReported = true; emit("first_playback_buffer_scheduled", "frameLength=\(converted.frameLength) depth=\(scheduledBuffers) peak=\(peakScheduledBuffers)") }
     }
 
     private func cleanupGraph() {
-        watchdog?.cancel(); watchdog = nil; captureTimer?.cancel(); captureTimer = nil
+        watchdogGeneration &+= 1; watchdog?.cancel(); watchdog = nil; captureTimer?.cancel(); captureTimer = nil
         playbackQueue.sync {}
         player.stop(); if engine.isRunning { engine.stop() }
         captureQueue.sync {}
@@ -533,7 +551,7 @@ final class AudioEngine: AudioEngineHandling, @unchecked Sendable {
     }
     private func formatDescription(_ format: AVAudioFormat) -> String { "sampleRate=\(format.sampleRate) channelCount=\(format.channelCount) commonFormat=\(format.commonFormat.rawValue) interleaved=\(format.isInterleaved)" }
     private func metricsDescription(_ metrics: PCMSignalMetrics) -> String { "frames=\(metrics.frameCount) rms=\(metrics.rms) peak=\(metrics.peak) nonzero=\(metrics.nonzeroCount)" }
-    private func resetFirstFlags() { firstMicBufferReported = false; firstMicNonzeroReported = false; firstNetworkFrameReported = false; firstNetworkNonzeroReported = false; firstCaptureFailureReported = false; firstPlaybackScheduledReported = false; firstPlaybackNonzeroReported = false; firstPlaybackRenderedReported = false; firstPlaybackFailureReported = false; playbackOverflowReported = false; peakScheduledBuffers = 0 }
+    private func resetFirstFlags() { firstMicBufferReported = false; firstMicNonzeroReported = false; firstNetworkFrameReported = false; firstNetworkNonzeroReported = false; firstCaptureFailureReported = false; firstPlaybackScheduledReported = false; firstPlaybackNonzeroReported = false; firstPlaybackRenderedReported = false; firstPlaybackFailureReported = false; playbackOverflowReported = false; peakScheduledBuffers = 0; renderedBufferCount = 0 }
     private func reportCaptureFailure(_ error: NSError) { guard !firstCaptureFailureReported else { return }; firstCaptureFailureReported = true; emit("first_capture_conversion_failure", "failed", error: error); onFailure?(.captureConversion) }
     private func reportPlaybackFailure(_ error: NSError) { guard !firstPlaybackFailureReported else { return }; firstPlaybackFailureReported = true; emit("first_playback_failure", "failed", error: error); onFailure?(.playbackConversion) }
     private func emit(_ event: String, _ status: String, error: NSError? = nil) { onDiagnostic?(.init(event: event, status: status, errorDomain: error?.domain, errorCode: error?.code)) }
