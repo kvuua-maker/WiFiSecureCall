@@ -3222,6 +3222,37 @@ final class AccountCallFoundationTests: XCTestCase {
         XCTAssertEqual(store.activeAccountID, activeID)
     }
 
+    func testIncomingOtherAccountStillReachesCallKitDuringAccountMutation() async throws {
+        let mutatingID = UUID(), incomingID = UUID(), callID = UUID()
+        let secrets = InMemorySecureTokenStore()
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: "IncomingDuringOtherMutation.\(UUID())"))
+        let store = AccountSessionStore(tokenStore: secrets, defaults: defaults)
+        try store.add(accountSession(accountID: mutatingID))
+        try store.add(accountSession(accountID: incomingID))
+        let requests = LockedRequests()
+        let session = accountCallTestSession { request in
+            requests.append(request)
+            XCTAssertEqual(request.value(forHTTPHeaderField: "Authorization"), "Bearer access-\(incomingID)")
+            return (200, self.accountCallResponse(callID: callID, side: .callee, state: .ringing))
+        }
+        let runtime = NotificationRuntime(config: accountCallConfig(), accountStore: store, accountAPI: AccountAPIClient(config: accountCallConfig(), tokenStore: secrets, session: session), audio: AudioEngineMock(), media: MediaTransportMock())
+        let adapter = RetainedCallKitMock()
+        runtime.configureCallKitFactory { adapter }
+        let gate = AccountMutationTestGate()
+        let mutation = Task { @MainActor in
+            try await runtime.performExclusiveAccountMutation(accountID: mutatingID, remote: { await gate.wait() }, local: {})
+        }
+        await gate.waitUntilReached()
+
+        await runtime.handleIncomingVoIP(callID: callID, accountID: incomingID)
+        await eventually { !requests.values.isEmpty }
+
+        XCTAssertEqual(adapter.incomingIDs.count, 1)
+        XCTAssertEqual(runtime.callSession.activeAccountID, incomingID)
+        await gate.release()
+        _ = try await mutation.value
+    }
+
     func testIncomingV2MissingAccountIgnoredAndSignedInAccountUsesSameProvider() async throws {
         let accountID = UUID(), callID = UUID(), secrets = InMemorySecureTokenStore()
         let defaults = try XCTUnwrap(UserDefaults(suiteName: "IncomingAccountCall.\(UUID())"))
