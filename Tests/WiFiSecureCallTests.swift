@@ -2361,6 +2361,25 @@ final class AccountFoundationTests: XCTestCase {
         XCTAssertEqual(relaunched.callableAccounts.map(\.accountID), [first.account.accountID])
     }
 
+    func testWatchSwitchFailureAndActiveCallGatePreserveVisibleAccount() throws {
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: "WatchSwitchGate.\(UUID())"))
+        let secrets = InMemorySecureTokenStore()
+        let first = accountResponse(phone: "+380501111111")
+        let orphan = accountResponse(phone: "+380502222222")
+        let store = AccountSessionStore(tokenStore: secrets, defaults: defaults)
+        try store.add(first)
+        try store.add(orphan)
+        XCTAssertEqual(store.switchAccount(to: first.account.accountID), .switched)
+        try secrets.delete(accountID: orphan.account.accountID)
+
+        XCTAssertEqual(attemptWatchAccountSwitch(store: store, accountID: orphan.account.accountID, canSwitchAccounts: true), .missingSession)
+        XCTAssertEqual(store.activeAccountID, first.account.accountID)
+        XCTAssertEqual(attemptWatchAccountSwitch(store: store, accountID: UUID(), canSwitchAccounts: true), .unknownAccount)
+        XCTAssertEqual(store.activeAccountID, first.account.accountID)
+        XCTAssertEqual(attemptWatchAccountSwitch(store: store, accountID: orphan.account.accountID, canSwitchAccounts: false), .blockedByActiveCall)
+        XCTAssertEqual(store.activeAccountID, first.account.accountID)
+    }
+
     func testSharedAccountStoreAndCustomInjection() throws {
         XCTAssertTrue(AccountSessionStore.shared === AccountSessionStore.shared)
         let defaults = try XCTUnwrap(UserDefaults(suiteName: "AccountStoreInjection.\(UUID())"))
@@ -2685,16 +2704,18 @@ final class AccountFoundationTests: XCTestCase {
         XCTAssertTrue(capture.diagnosticEvents.contains("account_session_invalid"))
     }
 
-    func testOrphanedWatchAccountCanRelinkSameAccountWithoutSMS() throws {
+    func testFailedWatchRelinkPreservesOrphanAndSuccessfulClaimRestoresSameAccount() throws {
         let accountID = UUID(), secrets = InMemorySecureTokenStore()
         let defaults = try XCTUnwrap(UserDefaults(suiteName: "WatchRelinkRecovery.\(UUID())"))
         let store = AccountSessionStore(tokenStore: secrets, defaults: defaults)
         try store.add(accountResponse(accountID: accountID, phone: "+380••••4567", access: "old-access", refresh: "old-refresh"))
         try secrets.delete(accountID: accountID)
 
-        XCTAssertTrue(try store.removeOrphanedLocalAccount(accountID: accountID))
-        XCTAssertFalse(store.accounts.contains(where: { $0.accountID == accountID }))
+        XCTAssertThrowsError(try validateWatchRelinkClaim(expectedAccountID: accountID, claimedAccountID: UUID()))
+        XCTAssertTrue(store.accounts.contains(where: { $0.accountID == accountID }))
+        XCTAssertNil(try secrets.tokens(for: accountID))
         let replacement = AccountTokens(accessToken: "new-access", accessExpiresAt: .distantFuture, refreshToken: "new-refresh", refreshExpiresAt: .distantFuture)
+        XCTAssertNoThrow(try validateWatchRelinkClaim(expectedAccountID: accountID, claimedAccountID: accountID))
         try store.addLinkedAccount(accountID: accountID, phoneNumber: "+380••••4567", tokens: replacement)
 
         XCTAssertEqual(store.activeAccountID, accountID)

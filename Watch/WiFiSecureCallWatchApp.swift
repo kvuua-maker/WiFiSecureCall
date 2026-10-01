@@ -13,7 +13,10 @@ struct WiFiSecureCallWatchApp: App {
         WatchContactsCache.shared.activate()
         _session = StateObject(wrappedValue: runtime.callSession)
         _appleAuthentication = StateObject(
-            wrappedValue: WatchAppleAuthenticationCoordinator(store: accountStore)
+            wrappedValue: WatchAppleAuthenticationCoordinator(
+                store: accountStore,
+                activationAllowed: { runtime.callSession.state == .idle || runtime.callSession.state.isTerminal }
+            )
         )
     }
 

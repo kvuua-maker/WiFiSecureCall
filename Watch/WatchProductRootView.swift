@@ -104,7 +104,7 @@ private struct WatchChatsHomeView: View {
         }
         .task(id: messages.activeAccountID) { await messages.refresh() }
         .sheet(isPresented: $showsAccounts) {
-            WatchAccountSwitcher(store: accountStore, isPresented: $showsAccounts)
+            WatchAccountSwitcher(store: accountStore, isPresented: $showsAccounts, canSwitchAccounts: { session.state == .idle || session.state.isTerminal })
         }
         .alert("Завершіть поточний виклик перед перемиканням акаунта.", isPresented: $accountSwitchWarning) { Button("Гаразд", role: .cancel) {} }
     }
@@ -129,6 +129,9 @@ private struct WatchChatsHomeView: View {
 private struct WatchAccountSwitcher: View {
     @ObservedObject var store: AccountSessionStore
     @Binding var isPresented: Bool
+    let canSwitchAccounts: () -> Bool
+    @State private var errorMessage: String?
+    @State private var showsAccountLink = false
 
     private var orphaned: [AccountSummary] {
         store.accounts.filter { account in !store.callableAccounts.contains(where: { $0.accountID == account.accountID }) }
@@ -139,8 +142,12 @@ private struct WatchAccountSwitcher: View {
             List {
                 ForEach(store.callableAccounts) { account in
                     Button {
-                        store.switchAccount(to: account.accountID)
-                        isPresented = false
+                        switch attemptWatchAccountSwitch(store: store, accountID: account.accountID, canSwitchAccounts: canSwitchAccounts()) {
+                        case .switched: isPresented = false
+                        case .blockedByActiveCall: errorMessage = "Завершіть виклик перед перемиканням акаунта."
+                        case .missingSession: errorMessage = "Потрібне повторне зв’язування цього акаунта."
+                        case .unknownAccount: errorMessage = "Акаунт більше недоступний. Оновіть список."
+                        }
                     } label: {
                         HStack {
                             Text(account.displayLabel).lineLimit(1).truncationMode(.tail)
@@ -152,7 +159,10 @@ private struct WatchAccountSwitcher: View {
                 if !orphaned.isEmpty {
                     Section("Потрібне повторне зв’язування") {
                         ForEach(orphaned) { account in
-                            NavigationLink { WatchAccountLinkView(store: store) } label: {
+                            Button {
+                                guard canSwitchAccounts() else { errorMessage = "Завершіть виклик перед повторним зв’язуванням."; return }
+                                showsAccountLink = true
+                            } label: {
                                 VStack(alignment: .leading) {
                                     Text(account.displayLabel).lineLimit(1)
                                     Text("Відновити або вилучити запис").font(.caption2).foregroundStyle(.secondary)
@@ -161,9 +171,18 @@ private struct WatchAccountSwitcher: View {
                         }
                     }
                 }
-                NavigationLink("Додати акаунт") { WatchAccountLinkView(store: store) }
+                Button("Додати акаунт") {
+                    guard canSwitchAccounts() else { errorMessage = "Завершіть виклик перед додаванням акаунта."; return }
+                    showsAccountLink = true
+                }
             }
             .navigationTitle("Акаунти")
+            .navigationDestination(isPresented: $showsAccountLink) {
+                WatchAccountLinkView(store: store, canSwitchAccounts: canSwitchAccounts)
+            }
+            .alert("Не вдалося змінити акаунт", isPresented: Binding(get: { errorMessage != nil }, set: { if !$0 { errorMessage = nil } })) {
+                Button("Гаразд", role: .cancel) { errorMessage = nil }
+            } message: { Text(errorMessage ?? "") }
         }
     }
 }
@@ -178,6 +197,9 @@ private struct WatchConversationView: View {
     @State private var sending = false
     @State private var safeError: String?
     @State private var loadingOlder = false
+    @State private var paginationMutation = false
+    @State private var isNearBottom = true
+    @State private var scrollAfterSend = false
 
     private var blocked: Bool {
         !store.keyChangeWarnings(conversationID: conversation.id, accountID: accountID).isEmpty
@@ -193,11 +215,15 @@ private struct WatchConversationView: View {
                                 guard !loadingOlder, store.activeAccountID == accountID else { return }
                                 let anchor = store.messages(conversationID: conversation.id, accountID: accountID).first?.id
                                 loadingOlder = true
+                                paginationMutation = true
                                 Task {
                                     _ = await store.loadMessages(conversationID: conversation.id, accountID: accountID, append: true, reportsLoading: false)
                                     guard store.activeAccountID == accountID else { loadingOlder = false; dismiss(); return }
-                                    loadingOlder = false
                                     if let anchor { proxy.scrollTo(anchor, anchor: .top) }
+                                    await Task.yield()
+                                    guard store.activeAccountID == accountID else { loadingOlder = false; dismiss(); return }
+                                    loadingOlder = false
+                                    paginationMutation = false
                                 }
                             }
                             .disabled(loadingOlder)
@@ -216,11 +242,16 @@ private struct WatchConversationView: View {
                             }
                             .id(message.id)
                         }
+                        Color.clear.frame(height: 1).id("conversation-bottom")
+                            .onAppear { if !paginationMutation { isNearBottom = true } }
+                            .onDisappear { if !paginationMutation { isNearBottom = false } }
                     }
                 }
                 .onChange(of: store.messages(conversationID: conversation.id, accountID: accountID).count) { _ in
-                    guard !loadingOlder else { return }
-                    if let last = store.messages(conversationID: conversation.id, accountID: accountID).last { proxy.scrollTo(last.id, anchor: .bottom) }
+                    guard !paginationMutation, !loadingOlder else { return }
+                    guard isNearBottom || scrollAfterSend else { return }
+                    proxy.scrollTo("conversation-bottom", anchor: .bottom)
+                    scrollAfterSend = false
                 }
             }
             if blocked {
@@ -232,10 +263,11 @@ private struct WatchConversationView: View {
                 Button {
                     let text = draft
                     sending = true
+                    scrollAfterSend = true
                     Task {
-                        guard store.activeAccountID == accountID else { safeError = "Акаунт змінено. Поверніться до списку чатів."; sending = false; return }
-                        do { try await store.send(text: text, conversation: conversation, accountID: accountID); if draft == text { draft = "" }; safeError = nil }
-                        catch { safeError = SecureMessageStore.safeError(error) }
+                        guard store.activeAccountID == accountID else { safeError = "Акаунт змінено. Поверніться до списку чатів."; scrollAfterSend = false; sending = false; return }
+                        do { try await store.send(text: text, conversation: conversation, accountID: accountID); guard store.activeAccountID == accountID else { scrollAfterSend = false; sending = false; dismiss(); return }; if draft == text { draft = "" }; safeError = nil }
+                        catch { scrollAfterSend = false; safeError = SecureMessageStore.safeError(error) }
                         sending = false
                     }
                 } label: { Image(systemName: "arrow.up.circle.fill").accessibilityLabel("Надіслати") }

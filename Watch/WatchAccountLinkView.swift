@@ -11,6 +11,7 @@ final class WatchAppleAuthenticationCoordinator: NSObject, ObservableObject, ASA
     private let store: AccountSessionStore
     private let client: AccountAPIClient
     private let pushRegistration: AccountPushRegistrationCoordinator
+    private let activationAllowed: () -> Bool
     private var attempt: AppleSignInAttempt?
     private var authorizationController: ASAuthorizationController?
     private var submissionTask: Task<Void, Never>?
@@ -18,7 +19,8 @@ final class WatchAppleAuthenticationCoordinator: NSObject, ObservableObject, ASA
     init(
         store: AccountSessionStore,
         client: AccountAPIClient? = nil,
-        pushRegistration: AccountPushRegistrationCoordinator? = nil
+        pushRegistration: AccountPushRegistrationCoordinator? = nil,
+        activationAllowed: @escaping () -> Bool = { true }
     ) {
         self.store = store
         self.client = client ?? AccountAPIClient(
@@ -27,6 +29,7 @@ final class WatchAppleAuthenticationCoordinator: NSObject, ObservableObject, ASA
             platform: "watchOS"
         )
         self.pushRegistration = pushRegistration ?? .shared
+        self.activationAllowed = activationAllowed
         super.init()
     }
 
@@ -100,10 +103,11 @@ final class WatchAppleAuthenticationCoordinator: NSObject, ObservableObject, ASA
                 expectedState: attempt.state,
                 rawNonce: attempt.rawNonce
             )
-            try store.add(response)
+            let shouldActivate = activationAllowed()
+            try store.add(response, activate: shouldActivate)
             await pushRegistration.registerKnownTokens(for: response.account.accountID)
             lastSignedInAccountID = response.account.accountID
-            message = "Вхід через Apple виконано"
+            message = shouldActivate ? "Вхід через Apple виконано" : "Акаунт додано. Перемкніться після завершення виклику."
         } catch let error as AppleCredentialValidationError {
             message = error == .stateMismatch
                 ? "Не вдалося перевірити стан входу Apple"
@@ -181,14 +185,20 @@ struct WatchAccountLinkView: View {
                     Text(code.isEmpty ? "Зв’язати з iPhone" : code)
                         .font(code.isEmpty ? .headline : .title2.monospacedDigit())
                     if code.isEmpty {
-                        Button("Створити код") { begin() }
+                        Button("Створити код") {
+                            guard canSwitchAccounts() else { message = "Завершіть виклик перед додаванням акаунта."; return }
+                            begin()
+                        }
                             .disabled(polling != nil)
                     }
                     Button("Скасувати") { cancelLinking() }
                         .font(.caption2)
                 } else if store.accounts.isEmpty || showsAddMethods {
                     Text(store.accounts.isEmpty ? "Додайте акаунт" : "Новий акаунт").font(.headline)
-                    WatchNativeAppleIDButton { appleAuthentication.start() }
+                    WatchNativeAppleIDButton {
+                        guard canSwitchAccounts() else { message = "Завершіть виклик перед додаванням акаунта."; return }
+                        appleAuthentication.start()
+                    }
                         .frame(height: 34)
                         .allowsHitTesting(!appleAuthentication.isAuthenticating)
                         .opacity(appleAuthentication.isAuthenticating ? 0.6 : 1)
@@ -267,20 +277,20 @@ struct WatchAccountLinkView: View {
     }
 
     private func relink(_ accountID: UUID) {
-        do {
-            guard try store.removeOrphanedLocalAccount(accountID: accountID) else {
-                message = "Сесію акаунта відновлено"
-                return
-            }
-            selectedAccountID = store.activeAccountID ?? store.accounts.first?.accountID
-            isAdding = true
-            begin()
-        } catch {
-            message = "Не вдалося зв’язати повторно"
+        guard canSwitchAccounts() else { message = "Завершіть виклик перед повторним зв’язуванням."; return }
+        guard needsRelinking(accountID), store.accounts.contains(where: { $0.accountID == accountID }) else {
+            message = "Цей акаунт уже має чинну сесію"
+            return
         }
+        selectedAccountID = accountID
+        isAdding = true
+        code = ""
+        message = ""
+        begin(expectedAccountID: accountID)
     }
 
     private func startAdding() {
+        guard canSwitchAccounts() else { message = "Завершіть виклик перед додаванням акаунта."; return }
         isAdding = true
         showsAddMethods = false
         code = ""
@@ -304,7 +314,7 @@ struct WatchAccountLinkView: View {
         isAdding = false
     }
 
-    private func begin() {
+    private func begin(expectedAccountID: UUID? = nil) {
         polling?.cancel()
         polling = Task {
             do {
@@ -316,12 +326,23 @@ struct WatchAccountLinkView: View {
                     if status.status == "claimed", let accountID = status.accountID,
                        let access = status.accessToken, let accessExpiry = status.accessExpiresAt,
                        let refresh = status.refreshToken, let refreshExpiry = status.refreshExpiresAt {
-                        try await MainActor.run { try store.addLinkedAccount(accountID: accountID, userID: status.userID, phoneNumber: status.phoneNumber, displayLabel: status.displayLabel ?? status.phoneNumber ?? "Secure account", tokens: AccountTokens(accessToken: access, accessExpiresAt: accessExpiry, refreshToken: refresh, refreshExpiresAt: refreshExpiry)) }
+                        do {
+                            try validateWatchRelinkClaim(expectedAccountID: expectedAccountID, claimedAccountID: accountID)
+                        } catch {
+                            await MainActor.run {
+                                message = "Отримано інший акаунт. Осиротілий запис збережено."
+                                code = ""
+                                isAdding = false
+                            }
+                            return
+                        }
+                        let shouldActivate = await MainActor.run { canSwitchAccounts() }
+                        try await MainActor.run { try store.addLinkedAccount(accountID: accountID, userID: status.userID, phoneNumber: status.phoneNumber, displayLabel: status.displayLabel ?? status.phoneNumber ?? "Secure account", tokens: AccountTokens(accessToken: access, accessExpiresAt: accessExpiry, refreshToken: refresh, refreshExpiresAt: refreshExpiry), activate: shouldActivate) }
                         await AccountPushRegistrationCoordinator.shared.registerKnownTokens(for: accountID)
                         await MainActor.run {
                             selectedAccountID = accountID
                             code = ""
-                            message = "Акаунт зв’язано"
+                            message = shouldActivate ? "Акаунт зв’язано" : "Акаунт зв’язано. Перемкніться після завершення виклику."
                             isAdding = false
                         }
                         return

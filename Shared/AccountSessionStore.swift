@@ -6,6 +6,37 @@ enum AccountSwitchResult: Equatable {
     case missingSession
 }
 
+enum WatchAccountSwitchAttemptResult: Equatable {
+    case switched
+    case blockedByActiveCall
+    case missingSession
+    case unknownAccount
+}
+
+enum WatchRelinkValidationError: Error, Equatable {
+    case wrongAccount
+}
+
+@MainActor
+func attemptWatchAccountSwitch(
+    store: AccountSessionStore,
+    accountID: UUID,
+    canSwitchAccounts: Bool
+) -> WatchAccountSwitchAttemptResult {
+    guard canSwitchAccounts else { return .blockedByActiveCall }
+    switch store.switchAccount(to: accountID) {
+    case .switched: return .switched
+    case .missingSession: return .missingSession
+    case .unknownAccount: return .unknownAccount
+    }
+}
+
+func validateWatchRelinkClaim(expectedAccountID: UUID?, claimedAccountID: UUID) throws {
+    if let expectedAccountID, expectedAccountID != claimedAccountID {
+        throw WatchRelinkValidationError.wrongAccount
+    }
+}
+
 @MainActor
 final class AccountSessionStore: ObservableObject {
     static let shared = AccountSessionStore()
@@ -44,12 +75,12 @@ final class AccountSessionStore: ObservableObject {
         }
     }
 
-    func add(_ response: AccountSessionResponse) throws {
+    func add(_ response: AccountSessionResponse, activate: Bool = true) throws {
         try tokenStore.save(response.tokens, for: response.account.accountID)
         AccountE2EEContext.shared.invalidate(accountID: response.account.accountID)
         if let index = accounts.firstIndex(where: { $0.accountID == response.account.accountID }) { accounts[index] = response.account }
         else { accounts.append(response.account) }
-        activeAccountID = response.account.accountID
+        if activate { activeAccountID = response.account.accountID }
         if let profile = response.user { profiles[response.account.accountID] = profile }
         persistMetadata()
         accountAdded?(response.account.accountID)
@@ -69,12 +100,12 @@ final class AccountSessionStore: ObservableObject {
         try addLinkedAccount(accountID: accountID, userID: nil, phoneNumber: phoneNumber, displayLabel: phoneNumber ?? "Secure account", tokens: tokens)
     }
 
-    func addLinkedAccount(accountID: UUID, userID: UUID?, phoneNumber: String?, displayLabel: String, tokens: AccountTokens) throws {
+    func addLinkedAccount(accountID: UUID, userID: UUID?, phoneNumber: String?, displayLabel: String, tokens: AccountTokens, activate: Bool = true) throws {
         try tokenStore.save(tokens, for: accountID)
         AccountE2EEContext.shared.invalidate(accountID: accountID)
         let summary = AccountSummary(accountID: accountID, userID: userID, phoneNumber: phoneNumber, displayLabel: displayLabel)
         if let index = accounts.firstIndex(where: { $0.accountID == accountID }) { accounts[index] = summary } else { accounts.append(summary) }
-        activeAccountID = accountID
+        if activate { activeAccountID = accountID }
         persistMetadata()
         accountAdded?(accountID)
     }
