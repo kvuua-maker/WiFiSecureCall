@@ -49,7 +49,7 @@ final class Diagnostics: ObservableObject {
     }
 
     private static let permittedCategories: Set<String> = [
-        "state", "media_peer_ready", "media_connect_started", "media_connect_succeeded",
+        "state", "network_audio", "media_peer_ready", "media_connect_started", "media_connect_succeeded",
         "media_connect_failed", "media_disconnected", "first_mic_callback",
         "first_mic_nonzero_signal", "first_network_pcm_generated",
         "first_network_pcm_nonzero", "first_network_audio_frame_generated",
