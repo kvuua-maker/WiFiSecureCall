@@ -36,6 +36,7 @@ private struct WatchChatsHomeView: View {
     @State private var query = ""
     @State private var showsSearch = false
     @State private var showsAccounts = false
+    @State private var accountSwitchWarning = false
 
     private var visible: [SecureConversation] {
         let term = query.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -54,15 +55,24 @@ private struct WatchChatsHomeView: View {
     var body: some View {
         ScrollView(showsIndicators: false) {
             LazyVStack(spacing: 5) {
-                ScrollView(.horizontal, showsIndicators: false) {
-                    HStack(spacing: 6) {
+                VStack(spacing: 4) {
+                    HStack {
+                        Text(accountStore.activeAccount?.displayLabel ?? "WiFi Secure Call")
+                            .font(.caption2).foregroundStyle(.secondary).lineLimit(1).truncationMode(.tail)
+                        Spacer()
+                        Button {
+                            if session.state == .idle || session.state.isTerminal { showsAccounts = true }
+                            else { accountSwitchWarning = true }
+                        } label: { Label("Акаунт", systemImage: "chevron.right").labelStyle(.titleAndIcon) }
+                            .font(.caption2).buttonStyle(.plain)
+                    }
+                    NavigationLink { CallHistoryView(store: callHistory, accountID: accountStore.activeAccountID, runtime: runtime) } label: { Label("Дзвінки", systemImage: "phone") }
+                    NavigationLink { WatchContactsView(messageStore: messages, runtime: runtime) } label: { Label("Контакти", systemImage: "person.2") }
+                    HStack {
                         NavigationLink { RecipientSearchView(messageStore: messages, runtime: runtime) } label: { Label("Новий чат", systemImage: "square.and.pencil") }
                         Button { showsSearch.toggle(); if !showsSearch { query = "" } } label: { Image(systemName: "magnifyingglass").accessibilityLabel("Пошук чатів") }
-                        NavigationLink { CallHistoryView(store: callHistory, accountID: accountStore.activeAccountID, runtime: runtime) } label: { Image(systemName: "phone").accessibilityLabel("Дзвінки") }
-                        NavigationLink { WatchMoreView(session: session, accountStore: accountStore, messages: messages, callHistory: callHistory, runtime: runtime) } label: { Image(systemName: "ellipsis").accessibilityLabel("Інші дії") }
                     }
                     .font(.caption)
-                    .buttonStyle(.bordered)
                 }
                 if showsSearch { TextField("Пошук", text: $query).textInputAutocapitalization(.never) }
                 if messages.state == .loading { ProgressView().accessibilityLabel("Завантаження чатів") }
@@ -84,9 +94,7 @@ private struct WatchChatsHomeView: View {
         }
         .navigationTitle("Чати")
         .toolbar {
-            ToolbarItem(placement: .primaryAction) {
-                Button { showsAccounts = true } label: { Image(systemName: "chevron.right").accessibilityLabel("Акаунти") }
-            }
+            ToolbarItem(placement: .primaryAction) { NavigationLink { WatchMoreView(session: session, accountStore: accountStore, messages: messages, callHistory: callHistory, runtime: runtime) } label: { Image(systemName: "ellipsis").accessibilityLabel("Інші дії") } }
         }
         .safeAreaInset(edge: .bottom) {
             if session.state != .idle && !session.state.isTerminal {
@@ -98,6 +106,7 @@ private struct WatchChatsHomeView: View {
         .sheet(isPresented: $showsAccounts) {
             WatchAccountSwitcher(store: accountStore, isPresented: $showsAccounts)
         }
+        .alert("Завершіть поточний виклик перед перемиканням акаунта.", isPresented: $accountSwitchWarning) { Button("Гаразд", role: .cancel) {} }
     }
 
     private func row(_ conversation: SecureConversation, accountID: UUID) -> some View {
@@ -121,10 +130,14 @@ private struct WatchAccountSwitcher: View {
     @ObservedObject var store: AccountSessionStore
     @Binding var isPresented: Bool
 
+    private var orphaned: [AccountSummary] {
+        store.accounts.filter { account in !store.callableAccounts.contains(where: { $0.accountID == account.accountID }) }
+    }
+
     var body: some View {
         NavigationStack {
             List {
-                ForEach(store.accounts) { account in
+                ForEach(store.callableAccounts) { account in
                     Button {
                         store.switchAccount(to: account.accountID)
                         isPresented = false
@@ -136,6 +149,18 @@ private struct WatchAccountSwitcher: View {
                         }
                     }
                 }
+                if !orphaned.isEmpty {
+                    Section("Потрібне повторне зв’язування") {
+                        ForEach(orphaned) { account in
+                            NavigationLink { WatchAccountLinkView(store: store) } label: {
+                                VStack(alignment: .leading) {
+                                    Text(account.displayLabel).lineLimit(1)
+                                    Text("Відновити або вилучити запис").font(.caption2).foregroundStyle(.secondary)
+                                }
+                            }
+                        }
+                    }
+                }
                 NavigationLink("Додати акаунт") { WatchAccountLinkView(store: store) }
             }
             .navigationTitle("Акаунти")
@@ -144,6 +169,7 @@ private struct WatchAccountSwitcher: View {
 }
 
 private struct WatchConversationView: View {
+    @Environment(\.dismiss) private var dismiss
     @ObservedObject var store: SecureMessageStore
     let conversation: SecureConversation
     let accountID: UUID
@@ -151,6 +177,7 @@ private struct WatchConversationView: View {
     @State private var draft = ""
     @State private var sending = false
     @State private var safeError: String?
+    @State private var loadingOlder = false
 
     private var blocked: Bool {
         !store.keyChangeWarnings(conversationID: conversation.id, accountID: accountID).isEmpty
@@ -161,6 +188,21 @@ private struct WatchConversationView: View {
             ScrollViewReader { proxy in
                 ScrollView {
                     LazyVStack(spacing: 5) {
+                        if store.hasOlderMessages(conversationID: conversation.id, accountID: accountID) {
+                            Button(loadingOlder ? "Завантаження…" : "Раніші повідомлення") {
+                                guard !loadingOlder, store.activeAccountID == accountID else { return }
+                                let anchor = store.messages(conversationID: conversation.id, accountID: accountID).first?.id
+                                loadingOlder = true
+                                Task {
+                                    _ = await store.loadMessages(conversationID: conversation.id, accountID: accountID, append: true, reportsLoading: false)
+                                    guard store.activeAccountID == accountID else { loadingOlder = false; dismiss(); return }
+                                    loadingOlder = false
+                                    if let anchor { proxy.scrollTo(anchor, anchor: .top) }
+                                }
+                            }
+                            .disabled(loadingOlder)
+                            .font(.caption2)
+                        }
                         ForEach(store.messages(conversationID: conversation.id, accountID: accountID)) { message in
                             HStack {
                                 if message.isSentByCurrentUser { Spacer(minLength: 16) }
@@ -177,6 +219,7 @@ private struct WatchConversationView: View {
                     }
                 }
                 .onChange(of: store.messages(conversationID: conversation.id, accountID: accountID).count) { _ in
+                    guard !loadingOlder else { return }
                     if let last = store.messages(conversationID: conversation.id, accountID: accountID).last { proxy.scrollTo(last.id, anchor: .bottom) }
                 }
             }
@@ -190,28 +233,34 @@ private struct WatchConversationView: View {
                     let text = draft
                     sending = true
                     Task {
+                        guard store.activeAccountID == accountID else { safeError = "Акаунт змінено. Поверніться до списку чатів."; sending = false; return }
                         do { try await store.send(text: text, conversation: conversation, accountID: accountID); if draft == text { draft = "" }; safeError = nil }
                         catch { safeError = SecureMessageStore.safeError(error) }
                         sending = false
                     }
                 } label: { Image(systemName: "arrow.up.circle.fill").accessibilityLabel("Надіслати") }
-                    .disabled(blocked || sending || draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                    .disabled(blocked || sending || store.activeAccountID != accountID || draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
             }
         }
         .navigationTitle(conversation.peerDisplayName)
         .toolbar {
             if let peer = conversation.peer {
                 Button {
+                    guard store.activeAccountID == accountID else { safeError = "Акаунт змінено. Поверніться до списку чатів."; return }
                     Task { await runtime.startUserCall(targetUserID: peer.userID, accountID: accountID, peerDisplayName: conversation.peerDisplayName) }
                 } label: { Image(systemName: "phone").accessibilityLabel("Захищений дзвінок") }
                     .disabled(blocked)
             }
         }
         .task {
+            guard store.activeAccountID == accountID else { dismiss(); return }
             await store.prepareSafety(conversation: conversation, accountID: accountID)
+            guard store.activeAccountID == accountID else { dismiss(); return }
             await store.loadMessages(conversationID: conversation.id, accountID: accountID)
+            guard store.activeAccountID == accountID else { dismiss(); return }
             await store.markRead(conversationID: conversation.id, accountID: accountID)
         }
+        .onChange(of: store.activeAccountID) { value in if value != accountID { dismiss() } }
     }
 }
 
@@ -232,7 +281,7 @@ private struct WatchMoreView: View {
             NavigationLink("Набрати номер") { WatchDialEntry(messageStore: messages, runtime: runtime) }
             NavigationLink("Акаунт і безпека") {
                 List {
-                    WatchAccountLinkView(store: accountStore)
+                    WatchAccountLinkView(store: accountStore, canSwitchAccounts: { session.state == .idle || session.state.isTerminal })
                     CallKeyChangeWarningsView(accountID: accountStore.activeAccountID)
                     #if DEBUG
                     NavigationLink("Developer diagnostics") { WatchRootView(session: session) }

@@ -42,11 +42,11 @@ struct CallHistoryView: View {
                             .foregroundStyle(record.status == .missed || record.status == .failed ? .red : .accentColor)
                         VStack(alignment: .leading, spacing: 2) {
                             Text(record.peerDisplayName).lineLimit(1)
-                            Text(statusText(record.status))
+                            Text(statusText(record))
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
-                            if let terminalAt = record.terminalAt, record.status == .answered {
-                                Text(durationText(terminalAt.timeIntervalSince(record.startedAt)))
+                            if let terminalAt = record.terminalAt, let connectedAt = record.connectedAt, record.status == .answered {
+                                Text(durationText(terminalAt.timeIntervalSince(connectedAt)))
                                     .font(.caption2).foregroundStyle(.secondary)
                             }
                         }
@@ -74,11 +74,11 @@ struct CallHistoryView: View {
         Task { await runtime.startPreferredCall(targetPlatform: platform, accountID: accountID) }
     }
 
-    private func statusText(_ status: CallHistoryStatus) -> String {
-        switch status {
+    private func statusText(_ record: CallHistoryRecord) -> String {
+        switch record.status {
         case .ringing: return "Виклик"
         case .active: return "Триває"
-        case .answered: return "Відповіли"
+        case .answered: return record.connectedAt == nil ? "Завершений" : "Відповіли"
         case .missed: return "Пропущено"
         case .rejected: return "Відхилено"
         case .failed: return "Не вдалося"

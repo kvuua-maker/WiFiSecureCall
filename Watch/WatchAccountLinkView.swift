@@ -160,6 +160,7 @@ struct WatchAccountLinkView: View {
     @ObservedObject var store: AccountSessionStore
     @EnvironmentObject private var appleAuthentication: WatchAppleAuthenticationCoordinator
     private let client: AccountAPIClient
+    private let canSwitchAccounts: () -> Bool
     @State private var code = ""
     @State private var message = ""
     @State private var selectedAccountID: UUID?
@@ -167,9 +168,10 @@ struct WatchAccountLinkView: View {
     @State private var showsAddMethods = false
     @State private var polling: Task<Void, Never>?
 
-    init(store: AccountSessionStore) {
+    init(store: AccountSessionStore, canSwitchAccounts: @escaping () -> Bool = { true }) {
         self.store = store
         self.client = AccountAPIClient(config: .load(), tokenStore: store.tokenStore)
+        self.canSwitchAccounts = canSwitchAccounts
     }
 
     var body: some View {
@@ -194,10 +196,11 @@ struct WatchAccountLinkView: View {
                     if !store.accounts.isEmpty { Button("Скасувати") { showsAddMethods = false } }
                 } else {
                         Text("Акаунти").font(.headline)
-                        ForEach(store.accounts) { account in
+                        ForEach(store.callableAccounts) { account in
                             Button {
-                                selectedAccountID = account.accountID
-                                store.switchAccount(to: account.accountID)
+                                guard canSwitchAccounts() else { message = "Завершіть виклик перед перемиканням акаунта."; return }
+                                if store.switchAccount(to: account.accountID) == .switched { selectedAccountID = account.accountID }
+                                else { message = "Потрібне повторне зв’язування" }
                             } label: {
                                 HStack {
                                     Text(account.displayLabel)
@@ -207,6 +210,14 @@ struct WatchAccountLinkView: View {
                                         Image(systemName: "checkmark")
                                     }
                                 }
+                            }
+                        }
+                        ForEach(orphanedAccounts) { account in
+                            VStack(spacing: 4) {
+                                Text(account.displayLabel).lineLimit(1)
+                                Text("Потрібне повторне зв’язування").font(.caption2).foregroundStyle(.secondary)
+                                Button("Відновити") { relink(account.accountID) }
+                                Button("Вилучити запис", role: .destructive) { removeOrphan(account.accountID) }
                             }
                         }
 
@@ -247,6 +258,10 @@ struct WatchAccountLinkView: View {
         store.accounts.first { $0.accountID == selectedAccountID }
     }
 
+    private var orphanedAccounts: [AccountSummary] {
+        store.accounts.filter { account in !store.callableAccounts.contains(where: { $0.accountID == account.accountID }) }
+    }
+
     private func needsRelinking(_ accountID: UUID) -> Bool {
         (try? store.tokenStore.tokens(for: accountID)) == nil
     }
@@ -271,6 +286,14 @@ struct WatchAccountLinkView: View {
         code = ""
         message = ""
         begin()
+    }
+
+    private func removeOrphan(_ accountID: UUID) {
+        do {
+            _ = try store.removeOrphanedLocalAccount(accountID: accountID)
+            selectedAccountID = store.activeAccountID
+            message = "Локальний запис вилучено"
+        } catch { message = "Не вдалося вилучити запис" }
     }
 
     private func cancelLinking() {

@@ -4,6 +4,7 @@ import SwiftUI
 struct AccountView: View {
     @ObservedObject var store: AccountSessionStore
     private let client: AccountAPIClient
+    private let canSwitchAccounts: () -> Bool
     @State private var showRegistration = false
     @State private var watchCode = ""
     @State private var message = ""
@@ -15,9 +16,10 @@ struct AccountView: View {
     @State private var confirmsDeletion = false
     @State private var showsAppleSignIn = false
 
-    init(store: AccountSessionStore) {
+    init(store: AccountSessionStore, canSwitchAccounts: @escaping () -> Bool = { true }) {
         self.store = store
         self.client = AccountAPIClient(config: .load(), tokenStore: store.tokenStore)
+        self.canSwitchAccounts = canSwitchAccounts
     }
 
     var body: some View {
@@ -51,9 +53,10 @@ struct AccountView: View {
                         }
                     }
                     Section {
-                        ForEach(store.accounts) { account in
+                        ForEach(store.callableAccounts) { account in
                             Button {
-                                store.switchAccount(to: account.accountID)
+                                guard canSwitchAccounts() else { message = "Завершіть поточний виклик перед перемиканням акаунта."; return }
+                                if store.switchAccount(to: account.accountID) != .switched { message = "Потрібен повторний вхід до цього акаунта." }
                             } label: {
                                 HStack { Text(account.displayLabel); Spacer(); if account.accountID == store.activeAccountID { Image(systemName: "checkmark") } }
                             }
@@ -65,9 +68,24 @@ struct AccountView: View {
                     } footer: {
                         Text("Позначка показує активний акаунт. Для дзвінка або повідомлення перевірте вибрану вихідну ідентичність.")
                     }
+                    let orphaned = store.accounts.filter { account in !store.callableAccounts.contains(where: { $0.accountID == account.accountID }) }
+                    if !orphaned.isEmpty {
+                        Section("Потрібен повторний вхід") {
+                            ForEach(orphaned) { account in
+                                VStack(alignment: .leading, spacing: 6) {
+                                    Text(account.displayLabel).font(.headline)
+                                    Text("Локальна сесія недоступна. Увійдіть знову або вилучіть цей запис.").font(.caption).foregroundStyle(.secondary)
+                                    HStack {
+                                        Button("Увійти знову") { showsAppleSignIn = true }
+                                        Button("Вилучити запис", role: .destructive) { removeOrphaned(account.accountID) }
+                                    }
+                                }
+                            }
+                        }
+                    }
                     if let active = store.activeAccountID {
                         Section("Налаштування") {
-                            NavigationLink("Зв’язані пристрої та Apple Watch") {
+                            NavigationLink("Зв’язати Apple Watch") {
                                 Form {
                                     Text("Введіть код, показаний на Apple Watch.")
                                     TextField("Шестизначний код", text: $watchCode).keyboardType(.numberPad)
@@ -164,11 +182,12 @@ struct AccountView: View {
     @MainActor private func finishAppleSignIn(identityToken: String, authorizationCode: String, nonce: String, displayName: String, email: String) async {
         do {
             let response = try await client.signInWithApple(identityToken: identityToken, authorizationCode: authorizationCode, nonce: nonce, displayName: displayName, email: email)
+            let alreadyAdded = store.accounts.contains(where: { $0.accountID == response.account.accountID })
             try store.add(response)
             await AccountPushRegistrationCoordinator.shared.registerKnownTokens(for: response.account.accountID)
             appleDiagnostic = nil
             appleTransportDetail = nil
-            message = "Акаунт Apple готовий"
+            message = alreadyAdded ? "Цей акаунт уже був доданий. Сесію оновлено." : "Акаунт Apple готовий"
             showsAppleSignIn = false
         } catch {
             appleDiagnostic = AppleVerificationDiagnostic.classify(error)
@@ -188,5 +207,12 @@ struct AccountView: View {
     @MainActor private func delete(_ accountID: UUID) async {
         do { try await client.deleteAccount(accountID: accountID); try store.delete(accountID: accountID) }
         catch { message = "Не вдалося видалити акаунт" }
+    }
+
+    private func removeOrphaned(_ accountID: UUID) {
+        do {
+            _ = try store.removeOrphanedLocalAccount(accountID: accountID)
+            message = "Локальний запис вилучено"
+        } catch { message = "Не вдалося вилучити локальний запис" }
     }
 }

@@ -1,5 +1,11 @@
 import Foundation
 
+enum AccountSwitchResult: Equatable {
+    case switched
+    case unknownAccount
+    case missingSession
+}
+
 @MainActor
 final class AccountSessionStore: ObservableObject {
     static let shared = AccountSessionStore()
@@ -21,7 +27,13 @@ final class AccountSessionStore: ObservableObject {
         accounts = (defaults.data(forKey: accountsKey)).flatMap { try? JSONDecoder().decode([AccountSummary].self, from: $0) } ?? []
         profiles = (defaults.data(forKey: profilesKey)).flatMap { try? JSONDecoder().decode([UUID: UserProfile].self, from: $0) } ?? [:]
         activeAccountID = defaults.string(forKey: activeKey).flatMap(UUID.init(uuidString:))
-        if let activeAccountID, !accounts.contains(where: { $0.accountID == activeAccountID }) { self.activeAccountID = accounts.first?.accountID }
+        if let activeAccountID,
+           accounts.contains(where: { $0.accountID == activeAccountID }),
+           (try? tokenStore.tokens(for: activeAccountID)) != nil {
+            self.activeAccountID = activeAccountID
+        } else {
+            self.activeAccountID = accounts.first(where: { (try? tokenStore.tokens(for: $0.accountID)) != nil })?.accountID
+        }
     }
 
     var activeAccount: AccountSummary? { accounts.first { $0.accountID == activeAccountID } }
@@ -67,10 +79,13 @@ final class AccountSessionStore: ObservableObject {
         accountAdded?(accountID)
     }
 
-    func switchAccount(to accountID: UUID) {
-        guard accounts.contains(where: { $0.accountID == accountID }) else { return }
+    @discardableResult
+    func switchAccount(to accountID: UUID) -> AccountSwitchResult {
+        guard accounts.contains(where: { $0.accountID == accountID }) else { return .unknownAccount }
+        guard (try? tokenStore.tokens(for: accountID)) != nil else { return .missingSession }
         activeAccountID = accountID
         persistMetadata()
+        return .switched
     }
 
     func logout(accountID: UUID) throws { try removeLocal(accountID: accountID) }
@@ -89,7 +104,9 @@ final class AccountSessionStore: ObservableObject {
         AccountE2EEContext.shared.invalidate(accountID: accountID)
         accounts.removeAll { $0.accountID == accountID }
         profiles.removeValue(forKey: accountID)
-        if activeAccountID == accountID { activeAccountID = accounts.first?.accountID }
+        if activeAccountID == accountID || activeAccountID.map({ (try? tokenStore.tokens(for: $0)) == nil }) == true {
+            activeAccountID = accounts.first(where: { (try? tokenStore.tokens(for: $0.accountID)) != nil })?.accountID
+        }
         persistMetadata()
     }
 

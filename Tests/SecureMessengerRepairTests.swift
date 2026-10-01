@@ -102,7 +102,9 @@ final class SecureMessengerCallHistoryRepairTests: XCTestCase {
         let encoder = JSONEncoder()
         encoder.dateEncodingStrategy = .iso8601
         persistence.data = try encoder.encode([legacy])
-        XCTAssertNil(CallHistoryStore(persistence: persistence).records.first?.targetUserID)
+        let decodedLegacy = CallHistoryStore(persistence: persistence).records.first
+        XCTAssertNil(decodedLegacy?.targetUserID)
+        XCTAssertNil(decodedLegacy?.connectedAt)
     }
 
     func testLifecycleUpdatesOneRecordExactlyOnce() throws {
@@ -115,13 +117,17 @@ final class SecureMessengerCallHistoryRepairTests: XCTestCase {
         XCTAssertEqual(store.begin(accountID: accountID, logicalCallID: logicalCallID, direction: .outgoing, peerDisplayName: "@peer", at: start), id)
         XCTAssertEqual(store.records.count, 1)
         XCTAssertEqual(store.records.first?.status, .ringing)
-        store.markActive(id)
+        let connected = Date(timeIntervalSince1970: 1_040)
+        store.markActive(id, at: connected)
+        store.markActive(id, at: Date(timeIntervalSince1970: 1_060))
         XCTAssertEqual(store.records.first?.status, .active)
+        XCTAssertEqual(store.records.first?.connectedAt, connected)
         let terminal = Date(timeIntervalSince1970: 1_100)
         store.finish(id, status: .failed, at: terminal)
         XCTAssertEqual(store.records.count, 1)
         XCTAssertEqual(store.records.first?.status, .answered)
         XCTAssertEqual(store.records.first?.terminalAt, terminal)
+        XCTAssertEqual(store.records.first?.terminalAt?.timeIntervalSince(store.records.first?.connectedAt ?? terminal), 60)
         store.finish(id, status: .missed, at: Date(timeIntervalSince1970: 1_200))
         XCTAssertEqual(store.records.first?.status, .answered)
         XCTAssertEqual(store.records.first?.terminalAt, terminal)

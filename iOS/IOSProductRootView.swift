@@ -25,7 +25,7 @@ struct IOSProductRootView: View {
     var body: some View {
         Group {
         if accountStore.callableAccounts.isEmpty {
-            NavigationView { AccountView(store: accountStore).navigationTitle("WiFi Secure Call") }
+            NavigationView { AccountView(store: accountStore, canSwitchAccounts: { session.state == .idle || session.state.isTerminal }).navigationTitle("WiFi Secure Call") }
         } else {
         TabView(selection: Binding(
             get: { navigation.selectedSection },
@@ -43,7 +43,7 @@ struct IOSProductRootView: View {
                 .tabItem { Label("Чати", systemImage: "bubble.left.and.bubble.right") }
                 .tag(ProductSection.chats)
             NavigationView {
-                AccountView(store: accountStore)
+                AccountView(store: accountStore, canSwitchAccounts: { session.state == .idle || session.state.isTerminal })
                     .toolbar {
                         NavigationLink("Шифрування") { EncryptionDetailsView(accountID: accountStore.activeAccountID) }
                     #if DEBUG

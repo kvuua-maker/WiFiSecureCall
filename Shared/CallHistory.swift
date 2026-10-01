@@ -28,6 +28,7 @@ struct CallHistoryRecord: Codable, Equatable, Identifiable, Sendable {
     let direction: CallHistoryDirection
     let peerDisplayName: String
     let startedAt: Date
+    var connectedAt: Date? = nil
     var terminalAt: Date?
     var status: CallHistoryStatus
     let deduplicationToken: String?
@@ -135,9 +136,10 @@ final class CallHistoryStore: ObservableObject {
         return id
     }
 
-    func markActive(_ id: UUID) {
+    func markActive(_ id: UUID, at date: Date = Date()) {
         guard let index = records.firstIndex(where: { $0.id == id }), !records[index].status.isTerminal else { return }
         records[index].status = .active
+        if records[index].connectedAt == nil { records[index].connectedAt = date }
         persist()
     }
 

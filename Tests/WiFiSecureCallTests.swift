@@ -2343,6 +2343,24 @@ final class AccountFoundationTests: XCTestCase {
         XCTAssertEqual(try secrets.tokens(for: third.account.accountID)?.refreshToken, "refresh-c")
     }
 
+    func testOrphanedAccountCannotBecomeActiveAndRelaunchSelectsValidSession() throws {
+        let suite = "AccountFoundationTests.Orphan.\(UUID())"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        let secrets = InMemorySecureTokenStore()
+        let first = accountResponse(phone: "+380501111111")
+        let second = accountResponse(phone: "+380502222222")
+        let store = AccountSessionStore(tokenStore: secrets, defaults: defaults)
+        try store.add(first); try store.add(second)
+        XCTAssertEqual(store.switchAccount(to: first.account.accountID), .switched)
+        try secrets.delete(accountID: second.account.accountID)
+        XCTAssertEqual(store.switchAccount(to: second.account.accountID), .missingSession)
+        XCTAssertEqual(store.activeAccountID, first.account.accountID)
+
+        let relaunched = AccountSessionStore(tokenStore: secrets, defaults: defaults)
+        XCTAssertEqual(relaunched.activeAccountID, first.account.accountID)
+        XCTAssertEqual(relaunched.callableAccounts.map(\.accountID), [first.account.accountID])
+    }
+
     func testSharedAccountStoreAndCustomInjection() throws {
         XCTAssertTrue(AccountSessionStore.shared === AccountSessionStore.shared)
         let defaults = try XCTUnwrap(UserDefaults(suiteName: "AccountStoreInjection.\(UUID())"))
