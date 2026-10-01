@@ -51,8 +51,8 @@ struct IOSProductRootView: View {
                     #endif
                     }
             }
-            .tabItem { Label("Налаштування", systemImage: "gear") }
-            .tag(ProductSection.settings)
+            .tabItem { Label("Профіль", systemImage: "person.crop.circle") }
+            .tag(ProductSection.profile)
         }
         .safeAreaInset(edge: .top) {
             if session.state != .idle && !session.state.isTerminal {

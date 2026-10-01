@@ -31,6 +31,7 @@ struct ConversationListView: View {
                     Text("Розмов поки немає").font(.headline)
                     Text("Знайдіть користувача за @іменем або підтвердженим номером.").font(.caption).foregroundStyle(.secondary).multilineTextAlignment(.center)
                     NavigationLink("Написати повідомлення") { RecipientSearchView(messageStore: store, runtime: runtime) }
+                    if case .failed = store.state { Button("Повторити") { Task { await store.refresh() } } }
                 }.padding()
             } else {
                 #if os(watchOS)
@@ -53,15 +54,21 @@ struct ConversationListView: View {
                             EmptyView()
                         }
                     } label: {
-                        VStack(alignment: .leading, spacing: 3) {
-                            Text(conversation.peerDisplayName).font(.headline).lineLimit(1)
-                            if let accountID = store.activeAccountID,
-                               let last = store.messages(conversationID: conversation.id, accountID: accountID).last {
-                                Text(last.text).font(.caption).foregroundStyle(.secondary).lineLimit(1)
-                            } else {
-                                Text("Відкрити розмову").font(.caption).foregroundStyle(.secondary)
+                        HStack(spacing: 10) {
+                            Text(String(conversation.peerDisplayName.prefix(1)).uppercased())
+                                .font(.headline).frame(width: 40, height: 40)
+                                .background(Circle().fill(Color.accentColor.opacity(0.2)))
+                            VStack(alignment: .leading, spacing: 3) {
+                                Text(conversation.peerDisplayName).font(.headline).lineLimit(1).truncationMode(.tail)
+                                if let accountID = store.activeAccountID,
+                                   let last = store.messages(conversationID: conversation.id, accountID: accountID).last {
+                                    Text(last.text).font(.caption).foregroundStyle(.secondary).lineLimit(1).truncationMode(.tail)
+                                } else {
+                                    Text("Відкрити розмову").font(.caption).foregroundStyle(.secondary)
+                                }
                             }
-                            Text(conversation.updatedAt, style: .date).font(.caption2).foregroundStyle(.secondary)
+                            Spacer(minLength: 4)
+                            Text(conversation.updatedAt, style: .time).font(.caption2).foregroundStyle(.secondary)
                         }
                     }
                 }

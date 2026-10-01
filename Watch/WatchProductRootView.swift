@@ -35,6 +35,7 @@ private struct WatchChatsHomeView: View {
     let runtime: NotificationRuntime
     @State private var query = ""
     @State private var showsSearch = false
+    @State private var showsAccounts = false
 
     private var visible: [SecureConversation] {
         let term = query.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -74,7 +75,7 @@ private struct WatchChatsHomeView: View {
                 } else {
                     ForEach(visible) { conversation in
                         if let accountID = messages.activeAccountID {
-                            NavigationLink { ConversationView(store: messages, conversation: conversation, accountID: accountID) } label: { row(conversation, accountID: accountID) }
+                            NavigationLink { WatchConversationView(store: messages, conversation: conversation, accountID: accountID, runtime: runtime) } label: { row(conversation, accountID: accountID) }
                                 .buttonStyle(.plain)
                         }
                     }
@@ -84,7 +85,7 @@ private struct WatchChatsHomeView: View {
         .navigationTitle("Чати")
         .toolbar {
             ToolbarItem(placement: .primaryAction) {
-                NavigationLink { WatchAccountLinkView(store: accountStore) } label: { Image(systemName: "chevron.right").accessibilityLabel("Акаунти") }
+                Button { showsAccounts = true } label: { Image(systemName: "chevron.right").accessibilityLabel("Акаунти") }
             }
         }
         .safeAreaInset(edge: .bottom) {
@@ -94,6 +95,9 @@ private struct WatchChatsHomeView: View {
             }
         }
         .task(id: messages.activeAccountID) { await messages.refresh() }
+        .sheet(isPresented: $showsAccounts) {
+            WatchAccountSwitcher(store: accountStore, isPresented: $showsAccounts)
+        }
     }
 
     private func row(_ conversation: SecureConversation, accountID: UUID) -> some View {
@@ -110,6 +114,104 @@ private struct WatchChatsHomeView: View {
         }
         .frame(minHeight: 48)
         .contentShape(Rectangle())
+    }
+}
+
+private struct WatchAccountSwitcher: View {
+    @ObservedObject var store: AccountSessionStore
+    @Binding var isPresented: Bool
+
+    var body: some View {
+        NavigationStack {
+            List {
+                ForEach(store.accounts) { account in
+                    Button {
+                        store.switchAccount(to: account.accountID)
+                        isPresented = false
+                    } label: {
+                        HStack {
+                            Text(account.displayLabel).lineLimit(1).truncationMode(.tail)
+                            Spacer()
+                            if account.accountID == store.activeAccountID { Image(systemName: "checkmark") }
+                        }
+                    }
+                }
+                NavigationLink("Додати акаунт") { WatchAccountLinkView(store: store) }
+            }
+            .navigationTitle("Акаунти")
+        }
+    }
+}
+
+private struct WatchConversationView: View {
+    @ObservedObject var store: SecureMessageStore
+    let conversation: SecureConversation
+    let accountID: UUID
+    let runtime: NotificationRuntime
+    @State private var draft = ""
+    @State private var sending = false
+    @State private var safeError: String?
+
+    private var blocked: Bool {
+        !store.keyChangeWarnings(conversationID: conversation.id, accountID: accountID).isEmpty
+    }
+
+    var body: some View {
+        VStack(spacing: 4) {
+            ScrollViewReader { proxy in
+                ScrollView {
+                    LazyVStack(spacing: 5) {
+                        ForEach(store.messages(conversationID: conversation.id, accountID: accountID)) { message in
+                            HStack {
+                                if message.isSentByCurrentUser { Spacer(minLength: 16) }
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text(message.text).font(.caption).fixedSize(horizontal: false, vertical: true)
+                                    Text(message.createdAt, style: .time).font(.system(size: 9)).foregroundStyle(.secondary)
+                                }
+                                .padding(6)
+                                .background(message.isSentByCurrentUser ? Color.accentColor.opacity(0.25) : Color.secondary.opacity(0.18), in: RoundedRectangle(cornerRadius: 9))
+                                if !message.isSentByCurrentUser { Spacer(minLength: 16) }
+                            }
+                            .id(message.id)
+                        }
+                    }
+                }
+                .onChange(of: store.messages(conversationID: conversation.id, accountID: accountID).count) { _ in
+                    if let last = store.messages(conversationID: conversation.id, accountID: accountID).last { proxy.scrollTo(last.id, anchor: .bottom) }
+                }
+            }
+            if blocked {
+                Text("Ключ безпеки змінився. Підтвердьте його на iPhone.").font(.caption2).foregroundStyle(.red)
+            }
+            if let safeError { Text(safeError).font(.caption2).foregroundStyle(.red) }
+            HStack(spacing: 4) {
+                TextField("Повідомлення", text: $draft)
+                Button {
+                    let text = draft
+                    sending = true
+                    Task {
+                        do { try await store.send(text: text, conversation: conversation, accountID: accountID); if draft == text { draft = "" }; safeError = nil }
+                        catch { safeError = SecureMessageStore.safeError(error) }
+                        sending = false
+                    }
+                } label: { Image(systemName: "arrow.up.circle.fill").accessibilityLabel("Надіслати") }
+                    .disabled(blocked || sending || draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+            }
+        }
+        .navigationTitle(conversation.peerDisplayName)
+        .toolbar {
+            if let peer = conversation.peer {
+                Button {
+                    Task { await runtime.startUserCall(targetUserID: peer.userID, accountID: accountID, peerDisplayName: conversation.peerDisplayName) }
+                } label: { Image(systemName: "phone").accessibilityLabel("Захищений дзвінок") }
+                    .disabled(blocked)
+            }
+        }
+        .task {
+            await store.prepareSafety(conversation: conversation, accountID: accountID)
+            await store.loadMessages(conversationID: conversation.id, accountID: accountID)
+            await store.markRead(conversationID: conversation.id, accountID: accountID)
+        }
     }
 }
 

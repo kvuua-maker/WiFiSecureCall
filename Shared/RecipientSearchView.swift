@@ -66,7 +66,7 @@ struct RecipientSearchView: View {
             }
             Section("Знайти користувача") {
                 TextField("@ім’я або підтверджений номер", text: $recipient)
-                    .accessibilityLabel("Recipient search")
+                    .accessibilityLabel("Пошук адресата")
                 Button("Знайти") { Task { await resolve() } }
                     .disabled(recipient.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || state == .loading)
             }
@@ -137,14 +137,14 @@ struct RecipientSearchView: View {
     }
 
     private func startCall(_ value: ResolvedRecipient) async {
-        guard let accountID = selectedAccountID ?? runtime.accountStore.activeAccountID else { state = .failed("Choose a calling account"); return }
+        guard let accountID = selectedAccountID ?? runtime.accountStore.activeAccountID else { state = .failed("Виберіть акаунт для виклику"); return }
         let peer = value.displayName?.isEmpty == false ? "\(value.displayName!) (@\(value.username))" : "@\(value.username)"
         await runtime.startUserCall(targetUserID: value.userID, accountID: accountID, peerDisplayName: peer)
     }
 
     private func startMessage(_ value: ResolvedRecipient) async {
         guard state != .loading else { return }
-        guard let accountID = currentAccountID else { state = .failed("Choose a messaging account"); return }
+        guard let accountID = currentAccountID else { state = .failed("Виберіть акаунт для повідомлення"); return }
         let operation = operationGate.begin(accountID: accountID)
         state = .loading
         do {
@@ -160,7 +160,7 @@ struct RecipientSearchView: View {
         }
         catch {
             guard operationGate.accepts(operation, selectedAccountID: currentAccountID) else { return }
-            state = .failed("Secure conversation could not be created")
+            state = .failed("Не вдалося створити захищену розмову")
         }
     }
 

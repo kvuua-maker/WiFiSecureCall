@@ -4,7 +4,7 @@ enum ProductSection: String, CaseIterable, Identifiable {
     case chats = "Chats"
     case calls = "Calls"
     case contacts = "Contacts"
-    case settings = "Settings"
+    case profile = "Profile"
     var id: String { rawValue }
 }
 

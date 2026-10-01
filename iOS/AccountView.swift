@@ -35,6 +35,21 @@ struct AccountView: View {
                 if store.accounts.isEmpty {
                     Section("Акаунт за номером") { Button("Зареєструвати номер") { showRegistration = true } }
                 } else {
+                    if let active = store.activeAccountID,
+                       let account = store.accounts.first(where: { $0.accountID == active }) {
+                        Section {
+                            HStack(spacing: 14) {
+                                Text(String(account.displayLabel.prefix(1)).uppercased())
+                                    .font(.title.bold()).frame(width: 52, height: 52)
+                                    .background(Circle().fill(Color.accentColor.opacity(0.2)))
+                                VStack(alignment: .leading, spacing: 3) {
+                                    Text(store.profiles[active]?.displayName ?? account.displayLabel).font(.headline).lineLimit(1)
+                                    if let username = store.profiles[active]?.username { Text("@\(username)").foregroundStyle(.secondary) }
+                                    else { Text(account.displayLabel).foregroundStyle(.secondary).lineLimit(1) }
+                                }
+                            }
+                        }
+                    }
                     Section {
                         ForEach(store.accounts) { account in
                             Button {
@@ -51,15 +66,20 @@ struct AccountView: View {
                         Text("Позначка показує активний акаунт. Для дзвінка або повідомлення перевірте вибрану вихідну ідентичність.")
                     }
                     if let active = store.activeAccountID {
-                        if let profile = store.profiles[active] {
-                            Section("Публічна ідентичність") {
-                                Text("@\(profile.username)")
-                                Text(profile.publicIdentity).font(.caption).textSelection(.enabled)
+                        Section("Налаштування") {
+                            NavigationLink("Зв’язані пристрої та Apple Watch") {
+                                Form {
+                                    Text("Введіть код, показаний на Apple Watch.")
+                                    TextField("Шестизначний код", text: $watchCode).keyboardType(.numberPad)
+                                    Button("Зв’язати") { Task { await claimWatch(accountID: active) } }.disabled(watchCode.count != 6)
+                                }.navigationTitle("Apple Watch")
                             }
-                        }
-                        Section("Зв’язати Apple Watch") {
-                            TextField("Шестизначний код", text: $watchCode).keyboardType(.numberPad)
-                            Button("Зв’язати") { Task { await claimWatch(accountID: active) } }.disabled(watchCode.count != 6)
+                            NavigationLink("Безпека та шифрування") {
+                                List {
+                                    Text("Нові захищені виклики використовують E2EE protocol 2. Зміна ключа блокує зв’язок до підтвердження.")
+                                    CallKeyChangeWarningsView(accountID: active)
+                                }.navigationTitle("Безпека")
+                            }
                         }
                         Section {
                             Button("Вийти", role: .destructive) { confirmsSignOut = true }
@@ -83,7 +103,7 @@ struct AccountView: View {
                 }
                 #endif
             }
-            .navigationTitle("Акаунт")
+            .navigationTitle("Профіль")
             .sheet(isPresented: $showRegistration) { NavigationView { PhoneRegistrationView(store: store, client: client) } }
             .confirmationDialog("Вийти з активного акаунта?", isPresented: $confirmsSignOut) {
                 Button("Вийти", role: .destructive) {
@@ -112,14 +132,14 @@ struct AccountView: View {
             appleNonce = ""
             appleState = ""
             appleDiagnostic = .serverRequest
-            message = "Apple sign-in could not be started"
+            message = "Не вдалося почати вхід через Apple"
         }
     }
 
     private func handleAppleResult(_ result: Result<ASAuthorization, Error>) {
         switch result {
         case .failure:
-            message = "Apple sign-in was not completed"
+            message = "Вхід через Apple не завершено"
             appleDiagnostic = .serverRequest
         case .success(let authorization):
             guard let credential = authorization.credential as? ASAuthorizationAppleIDCredential,
@@ -129,7 +149,7 @@ struct AccountView: View {
                   let identityToken = String(data: tokenData, encoding: .utf8),
                   let authorizationCode = String(data: codeData, encoding: .utf8),
                   !appleNonce.isEmpty else {
-                message = "Apple credential is incomplete"
+                message = "Дані Apple неповні"
                 appleDiagnostic = .jwtFormat
                 return
             }
@@ -148,25 +168,25 @@ struct AccountView: View {
             await AccountPushRegistrationCoordinator.shared.registerKnownTokens(for: response.account.accountID)
             appleDiagnostic = nil
             appleTransportDetail = nil
-            message = "Apple account ready"
+            message = "Акаунт Apple готовий"
             showsAppleSignIn = false
         } catch {
             appleDiagnostic = AppleVerificationDiagnostic.classify(error)
             appleTransportDetail = AppleVerificationDiagnostic.safeTransportDetail(error)
-            message = "Apple sign-in could not be verified"
+            message = "Не вдалося перевірити вхід через Apple"
         }
     }
 
     @MainActor private func claimWatch(accountID: UUID) async {
-        do { try await client.claimWatch(code: watchCode, accountID: accountID); watchCode = ""; message = "Watch linked" }
-        catch { message = "Unable to link Watch" }
+        do { try await client.claimWatch(code: watchCode, accountID: accountID); watchCode = ""; message = "Apple Watch зв’язано" }
+        catch { message = "Не вдалося зв’язати Apple Watch" }
     }
     @MainActor private func logout(_ accountID: UUID) async {
         do { try await client.logout(accountID: accountID); try store.logout(accountID: accountID) }
-        catch { message = "Unable to sign out" }
+        catch { message = "Не вдалося вийти" }
     }
     @MainActor private func delete(_ accountID: UUID) async {
         do { try await client.deleteAccount(accountID: accountID); try store.delete(accountID: accountID) }
-        catch { message = "Unable to delete account" }
+        catch { message = "Не вдалося видалити акаунт" }
     }
 }

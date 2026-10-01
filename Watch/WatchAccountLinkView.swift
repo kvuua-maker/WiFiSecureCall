@@ -62,7 +62,7 @@ final class WatchAppleAuthenticationCoordinator: NSObject, ObservableObject, ASA
               let credential = authorization.credential as? ASAuthorizationAppleIDCredential else {
             clearAttempt()
             isAuthenticating = false
-            message = "Apple credential unavailable"
+            message = "Дані Apple недоступні"
             return
         }
 
@@ -103,13 +103,13 @@ final class WatchAppleAuthenticationCoordinator: NSObject, ObservableObject, ASA
             try store.add(response)
             await pushRegistration.registerKnownTokens(for: response.account.accountID)
             lastSignedInAccountID = response.account.accountID
-            message = "Signed in with Apple"
+            message = "Вхід через Apple виконано"
         } catch let error as AppleCredentialValidationError {
             message = error == .stateMismatch
-                ? "Apple sign-in state verification failed"
-                : "Apple credential unavailable"
+                ? "Не вдалося перевірити стан входу Apple"
+                : "Дані Apple недоступні"
         } catch {
-            message = "Apple sign-in could not be verified"
+            message = "Не вдалося перевірити вхід через Apple"
         }
     }
 
@@ -164,6 +164,7 @@ struct WatchAccountLinkView: View {
     @State private var message = ""
     @State private var selectedAccountID: UUID?
     @State private var isAdding = false
+    @State private var showsAddMethods = false
     @State private var polling: Task<Void, Never>?
 
     init(store: AccountSessionStore) {
@@ -175,22 +176,28 @@ struct WatchAccountLinkView: View {
         ScrollView {
             VStack(spacing: 8) {
                 if isAdding {
-                    Text(code.isEmpty ? "Link with iPhone" : code)
+                    Text(code.isEmpty ? "Зв’язати з iPhone" : code)
                         .font(code.isEmpty ? .headline : .title2.monospacedDigit())
                     if code.isEmpty {
-                        Button("Create code") { begin() }
+                        Button("Створити код") { begin() }
                             .disabled(polling != nil)
                     }
-                    Button("Cancel") { cancelLinking() }
+                    Button("Скасувати") { cancelLinking() }
                         .font(.caption2)
+                } else if store.accounts.isEmpty || showsAddMethods {
+                    Text(store.accounts.isEmpty ? "Додайте акаунт" : "Новий акаунт").font(.headline)
+                    WatchNativeAppleIDButton { appleAuthentication.start() }
+                        .frame(height: 34)
+                        .allowsHitTesting(!appleAuthentication.isAuthenticating)
+                        .opacity(appleAuthentication.isAuthenticating ? 0.6 : 1)
+                    Button("Зв’язати через iPhone") { startAdding() }
+                    if !store.accounts.isEmpty { Button("Скасувати") { showsAddMethods = false } }
                 } else {
-                    if store.accounts.isEmpty {
-                        Text("Account").font(.headline)
-                    } else {
-                        Text("Linked accounts").font(.headline)
+                        Text("Акаунти").font(.headline)
                         ForEach(store.accounts) { account in
                             Button {
                                 selectedAccountID = account.accountID
+                                store.switchAccount(to: account.accountID)
                             } label: {
                                 HStack {
                                     Text(account.displayLabel)
@@ -204,31 +211,16 @@ struct WatchAccountLinkView: View {
                         }
 
                         if let selected = selectedAccount {
-                            if selected.accountID != store.activeAccountID {
-                                Button("Set as default") {
-                                    store.switchAccount(to: selected.accountID)
-                                }
-                                .font(.caption2)
-                            }
                             if needsRelinking(selected.accountID) {
-                                Text("Account needs relinking")
-                                Button("Relink account") { relink(selected.accountID) }
+                                Text("Потрібне повторне зв’язування")
+                                Button("Зв’язати повторно") { relink(selected.accountID) }
                             } else {
-                                Button("Sign out", role: .destructive) {
+                                Button("Вийти", role: .destructive) {
                                     Task { await signOut(selected.accountID) }
                                 }
                             }
                         }
-
-                        Text("Add account").font(.caption)
-                    }
-
-                    WatchNativeAppleIDButton { appleAuthentication.start() }
-                        .frame(height: 34)
-                        .allowsHitTesting(!appleAuthentication.isAuthenticating)
-                        .opacity(appleAuthentication.isAuthenticating ? 0.6 : 1)
-
-                    Button("Link with iPhone") { startAdding() }
+                        Button("Додати акаунт") { showsAddMethods = true }
                 }
                 if !message.isEmpty { Text(message).font(.caption) }
                 if !appleAuthentication.message.isEmpty {
@@ -245,6 +237,7 @@ struct WatchAccountLinkView: View {
             guard let accountID else { return }
             selectedAccountID = accountID
             isAdding = false
+            showsAddMethods = false
             code = ""
         }
         .onDisappear { polling?.cancel(); polling = nil }
@@ -261,19 +254,20 @@ struct WatchAccountLinkView: View {
     private func relink(_ accountID: UUID) {
         do {
             guard try store.removeOrphanedLocalAccount(accountID: accountID) else {
-                message = "Account session restored"
+                message = "Сесію акаунта відновлено"
                 return
             }
             selectedAccountID = store.activeAccountID ?? store.accounts.first?.accountID
             isAdding = true
             begin()
         } catch {
-            message = "Unable to relink"
+            message = "Не вдалося зв’язати повторно"
         }
     }
 
     private func startAdding() {
         isAdding = true
+        showsAddMethods = false
         code = ""
         message = ""
         begin()
@@ -293,7 +287,7 @@ struct WatchAccountLinkView: View {
             do {
                 let link = try await client.watchLinkStart()
                 guard !Task.isCancelled else { return }
-                await MainActor.run { code = link.code; message = "Enter this code on iPhone" }
+                await MainActor.run { code = link.code; message = "Введіть цей код на iPhone" }
                 while !Task.isCancelled && Date() < link.expiresAt {
                     let status = try await client.watchLinkStatus(linkID: link.linkID, secret: link.linkSecret)
                     if status.status == "claimed", let accountID = status.accountID,
@@ -304,16 +298,16 @@ struct WatchAccountLinkView: View {
                         await MainActor.run {
                             selectedAccountID = accountID
                             code = ""
-                            message = "Account linked"
+                            message = "Акаунт зв’язано"
                             isAdding = false
                         }
                         return
                     }
-                    if status.status == "expired" { await MainActor.run { message = "Code expired" }; return }
+                    if status.status == "expired" { await MainActor.run { message = "Строк коду минув" }; return }
                     try await Task.sleep(nanoseconds: 2_000_000_000)
                 }
             } catch is CancellationError { }
-            catch { await MainActor.run { message = "Unable to link" } }
+            catch { await MainActor.run { message = "Не вдалося зв’язати" } }
         }
     }
 
@@ -322,8 +316,8 @@ struct WatchAccountLinkView: View {
             try await client.logout(accountID: accountID)
             try store.logout(accountID: accountID)
             selectedAccountID = store.activeAccountID ?? store.accounts.first?.accountID
-            message = "Account signed out"
+            message = "Вихід виконано"
         }
-        catch { message = "Unable to sign out" }
+        catch { message = "Не вдалося вийти" }
     }
 }

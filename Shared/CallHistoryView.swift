@@ -45,6 +45,10 @@ struct CallHistoryView: View {
                             Text(statusText(record.status))
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
+                            if let terminalAt = record.terminalAt, record.status == .answered {
+                                Text(durationText(terminalAt.timeIntervalSince(record.startedAt)))
+                                    .font(.caption2).foregroundStyle(.secondary)
+                            }
                         }
                         Spacer(minLength: 4)
                         if let targetUserID = record.targetUserID, let accountID = record.accountID {
@@ -79,5 +83,10 @@ struct CallHistoryView: View {
         case .rejected: return "Відхилено"
         case .failed: return "Не вдалося"
         }
+    }
+
+    private func durationText(_ seconds: TimeInterval) -> String {
+        let total = max(0, Int(seconds))
+        return String(format: "%d:%02d", total / 60, total % 60)
     }
 }
