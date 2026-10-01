@@ -2380,6 +2380,39 @@ final class AccountFoundationTests: XCTestCase {
         XCTAssertEqual(store.activeAccountID, first.account.accountID)
     }
 
+    func testCancelledAndSupersededWatchLinkAttemptsRejectLateResponses() {
+        let cancelledAttempt = UUID()
+        XCTAssertFalse(isCurrentWatchLinkAttempt(current: nil, candidate: cancelledAttempt, isCancelled: false))
+        XCTAssertFalse(isCurrentWatchLinkAttempt(current: cancelledAttempt, candidate: cancelledAttempt, isCancelled: true))
+
+        let firstAttempt = UUID()
+        let secondAttempt = UUID()
+        XCTAssertFalse(isCurrentWatchLinkAttempt(current: secondAttempt, candidate: firstAttempt, isCancelled: false))
+        XCTAssertTrue(isCurrentWatchLinkAttempt(current: secondAttempt, candidate: secondAttempt, isCancelled: false))
+    }
+
+    func testAccountCompletionDuringCallPreservesActiveIdentityAndCurrentE2EEContext() throws {
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: "AccountCompletionDuringCall.\(UUID())"))
+        let secrets = InMemorySecureTokenStore()
+        let active = accountResponse(phone: "+380501111111", access: "old-access", refresh: "old-refresh")
+        let store = AccountSessionStore(tokenStore: secrets, defaults: defaults)
+        try store.add(active)
+
+        let repeated = accountResponse(accountID: active.account.accountID, phone: "+380501111111", access: "new-access", refresh: "new-refresh")
+        let repeatedDecision = accountSessionIntegrationDecision(canChangeActiveAccount: false, activeAccountID: store.activeAccountID, incomingAccountID: repeated.account.accountID)
+        XCTAssertEqual(repeatedDecision, AccountSessionIntegrationDecision(activate: false, invalidateE2EE: false))
+        try store.add(repeated, activate: repeatedDecision.activate, invalidateE2EE: repeatedDecision.invalidateE2EE)
+        XCTAssertEqual(store.activeAccountID, active.account.accountID)
+        XCTAssertEqual(try secrets.tokens(for: active.account.accountID)?.accessToken, "new-access")
+
+        let added = accountResponse(phone: "+380502222222")
+        let addedDecision = accountSessionIntegrationDecision(canChangeActiveAccount: false, activeAccountID: store.activeAccountID, incomingAccountID: added.account.accountID)
+        XCTAssertFalse(addedDecision.activate)
+        try store.add(added, activate: addedDecision.activate, invalidateE2EE: addedDecision.invalidateE2EE)
+        XCTAssertEqual(store.activeAccountID, active.account.accountID)
+        XCTAssertTrue(store.callableAccounts.contains(where: { $0.accountID == added.account.accountID }))
+    }
+
     func testSharedAccountStoreAndCustomInjection() throws {
         XCTAssertTrue(AccountSessionStore.shared === AccountSessionStore.shared)
         let defaults = try XCTUnwrap(UserDefaults(suiteName: "AccountStoreInjection.\(UUID())"))

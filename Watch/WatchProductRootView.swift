@@ -132,6 +132,7 @@ private struct WatchAccountSwitcher: View {
     let canSwitchAccounts: () -> Bool
     @State private var errorMessage: String?
     @State private var showsAccountLink = false
+    @State private var accountLinkTarget: UUID?
 
     private var orphaned: [AccountSummary] {
         store.accounts.filter { account in !store.callableAccounts.contains(where: { $0.accountID == account.accountID }) }
@@ -161,6 +162,7 @@ private struct WatchAccountSwitcher: View {
                         ForEach(orphaned) { account in
                             Button {
                                 guard canSwitchAccounts() else { errorMessage = "Завершіть виклик перед повторним зв’язуванням."; return }
+                                accountLinkTarget = account.accountID
                                 showsAccountLink = true
                             } label: {
                                 VStack(alignment: .leading) {
@@ -173,12 +175,13 @@ private struct WatchAccountSwitcher: View {
                 }
                 Button("Додати акаунт") {
                     guard canSwitchAccounts() else { errorMessage = "Завершіть виклик перед додаванням акаунта."; return }
+                    accountLinkTarget = nil
                     showsAccountLink = true
                 }
             }
             .navigationTitle("Акаунти")
             .navigationDestination(isPresented: $showsAccountLink) {
-                WatchAccountLinkView(store: store, canSwitchAccounts: canSwitchAccounts)
+                WatchAccountLinkView(store: store, expectedAccountID: accountLinkTarget, canSwitchAccounts: canSwitchAccounts)
             }
             .alert("Не вдалося змінити акаунт", isPresented: Binding(get: { errorMessage != nil }, set: { if !$0 { errorMessage = nil } })) {
                 Button("Гаразд", role: .cancel) { errorMessage = nil }

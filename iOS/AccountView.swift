@@ -15,6 +15,7 @@ struct AccountView: View {
     @State private var confirmsSignOut = false
     @State private var confirmsDeletion = false
     @State private var showsAppleSignIn = false
+    @State private var pendingSwitchAccountID: UUID?
 
     init(store: AccountSessionStore, canSwitchAccounts: @escaping () -> Bool = { true }) {
         self.store = store
@@ -61,8 +62,14 @@ struct AccountView: View {
                                 HStack { Text(account.displayLabel); Spacer(); if account.accountID == store.activeAccountID { Image(systemName: "checkmark") } }
                             }
                         }
-                        Button("Додати акаунт через Apple") { showsAppleSignIn = true }
-                        Button("Додати акаунт за номером") { showRegistration = true }
+                        Button("Додати акаунт через Apple") {
+                            guard canSwitchAccounts() else { message = "Завершіть виклик перед додаванням акаунта."; return }
+                            showsAppleSignIn = true
+                        }
+                        Button("Додати акаунт за номером") {
+                            guard canSwitchAccounts() else { message = "Завершіть виклик перед додаванням акаунта."; return }
+                            showRegistration = true
+                        }
                     } header: {
                         Text("Акаунти")
                     } footer: {
@@ -76,7 +83,10 @@ struct AccountView: View {
                                     Text(account.displayLabel).font(.headline)
                                     Text("Локальна сесія недоступна. Увійдіть знову або вилучіть цей запис.").font(.caption).foregroundStyle(.secondary)
                                     HStack {
-                                        Button("Увійти знову") { showsAppleSignIn = true }
+                                        Button("Увійти знову") {
+                                            guard canSwitchAccounts() else { message = "Завершіть виклик перед повторним входом."; return }
+                                            showsAppleSignIn = true
+                                        }
                                         Button("Вилучити запис", role: .destructive) { removeOrphaned(account.accountID) }
                                     }
                                 }
@@ -106,6 +116,20 @@ struct AccountView: View {
                     }
                 }
                 if !message.isEmpty { Text(message).foregroundStyle(.secondary) }
+                if let pendingSwitchAccountID,
+                   let pending = store.accounts.first(where: { $0.accountID == pendingSwitchAccountID }) {
+                    Section("Новий акаунт") {
+                        Text(pending.displayLabel)
+                        Button("Перемкнутися") {
+                            guard canSwitchAccounts() else { message = "Завершіть виклик перед перемиканням акаунта."; return }
+                            if store.switchAccount(to: pendingSwitchAccountID) == .switched {
+                                self.pendingSwitchAccountID = nil
+                                message = "Акаунт вибрано"
+                            }
+                        }
+                        .disabled(!canSwitchAccounts())
+                    }
+                }
                 #if DEBUG
                 if let appleDiagnostic {
                     Text("Diagnostic: \(appleDiagnostic.rawValue)")
@@ -122,7 +146,16 @@ struct AccountView: View {
                 #endif
             }
             .navigationTitle("Профіль")
-            .sheet(isPresented: $showRegistration) { NavigationView { PhoneRegistrationView(store: store, client: client) } }
+            .sheet(isPresented: $showRegistration) {
+                NavigationView {
+                    PhoneRegistrationView(store: store, client: client, canActivateAccount: canSwitchAccounts) { accountID, activated in
+                        if !activated {
+                            pendingSwitchAccountID = accountID
+                            message = "Акаунт додано. Перемкніться після завершення виклику."
+                        }
+                    }
+                }
+            }
             .confirmationDialog("Вийти з активного акаунта?", isPresented: $confirmsSignOut) {
                 Button("Вийти", role: .destructive) {
                     if let active = store.activeAccountID { Task { await logout(active) } }
@@ -136,6 +169,10 @@ struct AccountView: View {
     }
 
     private func configureAppleRequest(_ request: ASAuthorizationAppleIDRequest) {
+        guard canSwitchAccounts() else {
+            message = "Завершіть виклик перед входом до іншого акаунта."
+            return
+        }
         appleDiagnostic = nil
         appleTransportDetail = nil
         do {
@@ -183,11 +220,17 @@ struct AccountView: View {
         do {
             let response = try await client.signInWithApple(identityToken: identityToken, authorizationCode: authorizationCode, nonce: nonce, displayName: displayName, email: email)
             let alreadyAdded = store.accounts.contains(where: { $0.accountID == response.account.accountID })
-            try store.add(response)
+            let decision = accountSessionIntegrationDecision(canChangeActiveAccount: canSwitchAccounts(), activeAccountID: store.activeAccountID, incomingAccountID: response.account.accountID)
+            try store.add(response, activate: decision.activate, invalidateE2EE: decision.invalidateE2EE)
             await AccountPushRegistrationCoordinator.shared.registerKnownTokens(for: response.account.accountID)
             appleDiagnostic = nil
             appleTransportDetail = nil
-            message = alreadyAdded ? "Цей акаунт уже був доданий. Сесію оновлено." : "Акаунт Apple готовий"
+            if decision.activate {
+                message = alreadyAdded ? "Цей акаунт уже був доданий. Сесію оновлено." : "Акаунт Apple готовий"
+            } else {
+                pendingSwitchAccountID = response.account.accountID
+                message = alreadyAdded ? "Сесію оновлено без зміни активного виклику." : "Акаунт додано. Перемкніться після завершення виклику."
+            }
             showsAppleSignIn = false
         } catch {
             appleDiagnostic = AppleVerificationDiagnostic.classify(error)

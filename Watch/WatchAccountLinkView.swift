@@ -165,17 +165,21 @@ struct WatchAccountLinkView: View {
     @EnvironmentObject private var appleAuthentication: WatchAppleAuthenticationCoordinator
     private let client: AccountAPIClient
     private let canSwitchAccounts: () -> Bool
+    private let expectedAccountID: UUID?
     @State private var code = ""
     @State private var message = ""
     @State private var selectedAccountID: UUID?
     @State private var isAdding = false
     @State private var showsAddMethods = false
     @State private var polling: Task<Void, Never>?
+    @State private var currentAttemptID: UUID?
 
-    init(store: AccountSessionStore, canSwitchAccounts: @escaping () -> Bool = { true }) {
+    init(store: AccountSessionStore, expectedAccountID: UUID? = nil, canSwitchAccounts: @escaping () -> Bool = { true }) {
         self.store = store
         self.client = AccountAPIClient(config: .load(), tokenStore: store.tokenStore)
+        self.expectedAccountID = expectedAccountID
         self.canSwitchAccounts = canSwitchAccounts
+        _selectedAccountID = State(initialValue: expectedAccountID)
     }
 
     var body: some View {
@@ -193,6 +197,15 @@ struct WatchAccountLinkView: View {
                     }
                     Button("Скасувати") { cancelLinking() }
                         .font(.caption2)
+                } else if let expectedAccountID, let account = store.accounts.first(where: { $0.accountID == expectedAccountID }) {
+                    Text(account.displayLabel).font(.headline).lineLimit(2)
+                    if needsRelinking(expectedAccountID) {
+                        Text("Потрібне повторне зв’язування").font(.caption).foregroundStyle(.secondary)
+                        Button("Відновити") { relink(expectedAccountID) }
+                        Button("Вилучити запис", role: .destructive) { removeOrphan(expectedAccountID) }
+                    } else {
+                        Text("Сесію відновлено").font(.caption).foregroundStyle(.secondary)
+                    }
                 } else if store.accounts.isEmpty || showsAddMethods {
                     Text(store.accounts.isEmpty ? "Додайте акаунт" : "Новий акаунт").font(.headline)
                     WatchNativeAppleIDButton {
@@ -261,7 +274,7 @@ struct WatchAccountLinkView: View {
             showsAddMethods = false
             code = ""
         }
-        .onDisappear { polling?.cancel(); polling = nil }
+        .onDisappear { invalidateCurrentAttempt() }
     }
 
     private var selectedAccount: AccountSummary? {
@@ -307,22 +320,29 @@ struct WatchAccountLinkView: View {
     }
 
     private func cancelLinking() {
-        polling?.cancel()
-        polling = nil
+        invalidateCurrentAttempt()
         code = ""
         message = ""
         isAdding = false
     }
 
     private func begin(expectedAccountID: UUID? = nil) {
-        polling?.cancel()
+        invalidateCurrentAttempt()
+        let attemptID = UUID()
+        currentAttemptID = attemptID
         polling = Task {
             do {
                 let link = try await client.watchLinkStart()
-                guard !Task.isCancelled else { return }
+                guard isCurrentAttempt(attemptID) else { return }
                 await MainActor.run { code = link.code; message = "Введіть цей код на iPhone" }
-                while !Task.isCancelled && Date() < link.expiresAt {
+                guard isCurrentAttempt(attemptID) else { return }
+                while isCurrentAttempt(attemptID) && Date() < link.expiresAt {
                     let status = try await client.watchLinkStatus(linkID: link.linkID, secret: link.linkSecret)
+                    guard isCurrentAttempt(attemptID) else { return }
+                    guard Date() < link.expiresAt else {
+                        await MainActor.run { if isCurrentAttempt(attemptID) { message = "Строк коду минув"; currentAttemptID = nil; polling = nil } }
+                        return
+                    }
                     if status.status == "claimed", let accountID = status.accountID,
                        let access = status.accessToken, let accessExpiry = status.accessExpiresAt,
                        let refresh = status.refreshToken, let refreshExpiry = status.refreshExpiresAt {
@@ -330,6 +350,7 @@ struct WatchAccountLinkView: View {
                             try validateWatchRelinkClaim(expectedAccountID: expectedAccountID, claimedAccountID: accountID)
                         } catch {
                             await MainActor.run {
+                                guard isCurrentAttempt(attemptID) else { return }
                                 message = "Отримано інший акаунт. Осиротілий запис збережено."
                                 code = ""
                                 isAdding = false
@@ -337,22 +358,43 @@ struct WatchAccountLinkView: View {
                             return
                         }
                         let shouldActivate = await MainActor.run { canSwitchAccounts() }
+                        guard isCurrentAttempt(attemptID) else { return }
                         try await MainActor.run { try store.addLinkedAccount(accountID: accountID, userID: status.userID, phoneNumber: status.phoneNumber, displayLabel: status.displayLabel ?? status.phoneNumber ?? "Secure account", tokens: AccountTokens(accessToken: access, accessExpiresAt: accessExpiry, refreshToken: refresh, refreshExpiresAt: refreshExpiry), activate: shouldActivate) }
+                        guard isCurrentAttempt(attemptID) else { return }
                         await AccountPushRegistrationCoordinator.shared.registerKnownTokens(for: accountID)
+                        guard isCurrentAttempt(attemptID) else { return }
                         await MainActor.run {
+                            guard isCurrentAttempt(attemptID) else { return }
                             selectedAccountID = accountID
                             code = ""
                             message = shouldActivate ? "Акаунт зв’язано" : "Акаунт зв’язано. Перемкніться після завершення виклику."
                             isAdding = false
+                            currentAttemptID = nil
+                            polling = nil
                         }
                         return
                     }
-                    if status.status == "expired" { await MainActor.run { message = "Строк коду минув" }; return }
+                    if status.status == "expired" {
+                        await MainActor.run { if isCurrentAttempt(attemptID) { message = "Строк коду минув"; currentAttemptID = nil; polling = nil } }
+                        return
+                    }
                     try await Task.sleep(nanoseconds: 2_000_000_000)
+                    guard isCurrentAttempt(attemptID) else { return }
                 }
+                await MainActor.run { if isCurrentAttempt(attemptID) { message = "Строк коду минув"; currentAttemptID = nil; polling = nil } }
             } catch is CancellationError { }
-            catch { await MainActor.run { message = "Не вдалося зв’язати" } }
+            catch { await MainActor.run { if isCurrentAttempt(attemptID) { message = "Не вдалося зв’язати"; currentAttemptID = nil; polling = nil } } }
         }
+    }
+
+    private func isCurrentAttempt(_ attemptID: UUID) -> Bool {
+        isCurrentWatchLinkAttempt(current: currentAttemptID, candidate: attemptID, isCancelled: Task.isCancelled)
+    }
+
+    private func invalidateCurrentAttempt() {
+        currentAttemptID = nil
+        polling?.cancel()
+        polling = nil
     }
 
     @MainActor private func signOut(_ accountID: UUID) async {

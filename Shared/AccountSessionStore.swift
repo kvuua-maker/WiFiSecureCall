@@ -17,6 +17,26 @@ enum WatchRelinkValidationError: Error, Equatable {
     case wrongAccount
 }
 
+struct AccountSessionIntegrationDecision: Equatable {
+    let activate: Bool
+    let invalidateE2EE: Bool
+}
+
+func accountSessionIntegrationDecision(
+    canChangeActiveAccount: Bool,
+    activeAccountID: UUID?,
+    incomingAccountID: UUID
+) -> AccountSessionIntegrationDecision {
+    AccountSessionIntegrationDecision(
+        activate: canChangeActiveAccount,
+        invalidateE2EE: canChangeActiveAccount || activeAccountID != incomingAccountID
+    )
+}
+
+func isCurrentWatchLinkAttempt(current: UUID?, candidate: UUID, isCancelled: Bool) -> Bool {
+    !isCancelled && current == candidate
+}
+
 @MainActor
 func attemptWatchAccountSwitch(
     store: AccountSessionStore,
@@ -75,9 +95,9 @@ final class AccountSessionStore: ObservableObject {
         }
     }
 
-    func add(_ response: AccountSessionResponse, activate: Bool = true) throws {
+    func add(_ response: AccountSessionResponse, activate: Bool = true, invalidateE2EE: Bool = true) throws {
         try tokenStore.save(response.tokens, for: response.account.accountID)
-        AccountE2EEContext.shared.invalidate(accountID: response.account.accountID)
+        if invalidateE2EE { AccountE2EEContext.shared.invalidate(accountID: response.account.accountID) }
         if let index = accounts.firstIndex(where: { $0.accountID == response.account.accountID }) { accounts[index] = response.account }
         else { accounts.append(response.account) }
         if activate { activeAccountID = response.account.accountID }
