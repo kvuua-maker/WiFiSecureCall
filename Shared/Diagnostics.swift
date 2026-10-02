@@ -79,7 +79,9 @@ final class Diagnostics: ObservableObject {
         "media_reconnect_succeeded", "media_reconnect_exhausted", "call_failed_reason",
         "callkit_end_received", "system_end_reconcile_started", "system_end_reconcile_server_state",
         "system_end_preserved_after_accept", "terminal_mutation", "provider_reset",
-        "callkit_did_deactivate", "callkit_did_activate"
+        "callkit_did_deactivate", "callkit_did_activate", "outgoing_connected_reported",
+        "callkit_reactivation_wait_started", "callkit_reactivated", "callkit_continuation_started",
+        "callkit_continuation_activated", "callkit_reactivation_failed"
     ]
 
     private static let metricKeys: Set<String> = [
@@ -102,7 +104,7 @@ final class Diagnostics: ObservableObject {
         let safeState = event.category == "state"
             ? states.first(where: { event.value.hasPrefix($0) }) : nil
         let callFailures = Set(["permissionDenied", "serverUnavailable", "callExpired", "callRejected",
-                                "callCancelled", "callKitRejected", "audioActivationTimeout", "audioFailed",
+                                "callCancelled", "callKitRejected", "audioActivationTimeout", "callKitReactivationFailed", "audioFailed",
                                 "mediaConnectionFailed", "networkLost", "invalidServerState", "notificationUnavailable",
                                 "accountSessionInvalid", "accountMutationInProgress", "targetUnavailable",
                                 "targetAmbiguous", "answeredElsewhere"])

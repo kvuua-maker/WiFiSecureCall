@@ -8,6 +8,7 @@ enum CallFailure: String, Codable, Error, Equatable, Sendable {
     case callCancelled
     case callKitRejected
     case audioActivationTimeout
+    case callKitReactivationFailed
     case audioFailed
     case mediaConnectionFailed
     case networkLost

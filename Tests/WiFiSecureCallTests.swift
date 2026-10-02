@@ -1983,7 +1983,7 @@ final class WiFiSecureCallTests: XCTestCase {
         XCTAssertEqual(audio.startMutedValues, [false])
         XCTAssertEqual(media.connectedCallIDs, [serverID])
         XCTAssertEqual(adapter.startedConnectingIDs, [localID])
-        XCTAssertTrue(adapter.connectedIDs.isEmpty)
+        XCTAssertEqual(adapter.connectedIDs, [localID])
         let epoch = try XCTUnwrap(media.connectionIDs.last)
         media.onPeerReady?(serverID, epoch)
         let capturedFrame = Data(repeating: 3, count: AudioEngine.bytesPerFrame)
@@ -2120,6 +2120,75 @@ final class WiFiSecureCallTests: XCTestCase {
 
         XCTAssertEqual(media.connectionIDs, [epoch])
         XCTAssertFalse(session.state.isTerminal)
+    }
+
+    @MainActor
+    func testVerifiedAcceptedReportsOutgoingConnectedBeforeAudioOperational() async throws {
+        let capture = RequestCapture(); capture.getState = .accepted
+        let session = makeSession(capture: capture)
+        let adapter = RetainedCallKitMock(); session.attach(callKit: adapter)
+        await session.startCall()
+        let localID = try XCTUnwrap(adapter.startedIDs.first)
+        adapter.onAudioActivated?(localID)
+        try await adapter.approveStart(localID)
+        await eventually { if case .connecting = session.state { return true }; return false }
+
+        XCTAssertEqual(adapter.connectedIDs, [localID])
+        XCTAssertEqual(adapter.connectedIDs.count, 1)
+        XCTAssertFalse(session.state.isTerminal)
+    }
+
+    @MainActor
+    func testAcceptedDeactivateDoesNotReuseInitialActivationTimeoutAndStartsOneContinuation() async throws {
+        let capture = RequestCapture(); capture.getState = .accepted
+        let session = makeSession(capture: capture)
+        let adapter = RetainedCallKitMock(); session.attach(callKit: adapter)
+        await session.startCall()
+        let oldLocalID = try XCTUnwrap(adapter.startedIDs.first)
+        adapter.onAudioActivated?(oldLocalID)
+        try await adapter.approveStart(oldLocalID)
+        await eventually { if case .connecting = session.state { return true }; return false }
+
+        adapter.onAudioDeactivated?(oldLocalID)
+        try? await Task.sleep(nanoseconds: 2_100_000_000)
+        let continuationID = try XCTUnwrap(adapter.startedIDs.last)
+        XCTAssertNotEqual(continuationID, oldLocalID)
+        XCTAssertEqual(adapter.startedIDs.count, 2)
+        XCTAssertEqual(session.activeCallKitUUID, continuationID)
+        XCTAssertFalse(session.state.isTerminal)
+
+        try await adapter.approveStart(continuationID)
+        adapter.onAudioActivated?(oldLocalID)
+        try? await Task.sleep(nanoseconds: 30_000_000)
+        XCTAssertEqual(session.activeCallKitUUID, continuationID)
+        adapter.onAudioActivated?(continuationID)
+        await eventually { adapter.connectedIDs == [oldLocalID, continuationID] }
+        XCTAssertEqual(adapter.connectedIDs, [oldLocalID, continuationID])
+        XCTAssertEqual(session.state.callID, capture.createdCallID)
+        XCTAssertFalse(session.state.isTerminal)
+    }
+
+    @MainActor
+    func testContinuationFailureEndsAcceptedCallWithoutCancel() async throws {
+        let capture = RequestCapture(); capture.getState = .accepted; capture.mutationState = .ended
+        let session = makeSession(capture: capture)
+        let adapter = RetainedCallKitMock(); session.attach(callKit: adapter)
+        await session.startCall()
+        let oldLocalID = try XCTUnwrap(adapter.startedIDs.first)
+        adapter.onAudioActivated?(oldLocalID)
+        try await adapter.approveStart(oldLocalID)
+        await eventually { if case .connecting = session.state { return true }; return false }
+        adapter.onAudioDeactivated?(oldLocalID)
+        try? await Task.sleep(nanoseconds: 2_100_000_000)
+        let continuationID = try XCTUnwrap(adapter.startedIDs.last)
+        try await adapter.approveStart(continuationID)
+        for _ in 0..<600 where !session.state.isTerminal {
+            try? await Task.sleep(nanoseconds: 10_000_000)
+        }
+
+        XCTAssertTrue(capture.paths.contains { $0.hasSuffix("/end") })
+        XCTAssertFalse(capture.paths.contains { $0.hasSuffix("/cancel") })
+        XCTAssertEqual(adapter.startedIDs.count, 2)
     }
 
     @MainActor
