@@ -98,6 +98,11 @@ final class CallSession: ObservableObject {
     private var terminalRequestID: UUID?
     private var terminalMutation: CallMutation?
     private var terminalCompensations: [UUID: TerminalCompensation] = [:]
+    private var terminalDeliveriesInProgress: Set<UUID> = []
+    private var explicitUserEndRequested = false
+    private var explicitUserEndRequestID: UUID?
+    private var explicitUserEndRequestedAt: Date?
+    private var explicitUserEndServerCallID: UUID?
     private var activeSignaling: (any CallSignaling)?
     private var isOutgoingCall = false
     private var callKitReported = false
@@ -369,8 +374,19 @@ final class CallSession: ObservableObject {
 
     func endCall() async {
         guard let current = generation else { return }
+        guard let callSignaling = try? signaling(for: current) else { return }
+        if config.role == .A {
+            recordRuntimeDiagnostic("watch_user_end_pressed", status: "current_generation", callID: current.serverCallID)
+        }
+        latchExplicitUserEnd(current, signaling: callSignaling)
+        suppressRecoveryAfterExplicitUserEnd(current)
+        enqueueTerminalMutation(current, mutation: terminalMutationForCurrentState())
         do { try await callKit?.requestEnd(id: current.localCallKitUUID) }
-        catch { guard isCurrent(current) else { return }; recordCallKitError(stage: "requestEnd", callID: current.serverCallID, error: error); _ = try? await performEnd(localID: current.localCallKitUUID, deadline: Date().addingTimeInterval(1), origin: .appRequested) }
+        catch {
+            recordCallKitError(stage: "requestEnd", callID: current.serverCallID, error: error)
+        }
+        guard isCurrent(current) else { return }
+        await teardownLocal(current, finalState: .ended(current.serverCallID), reportReason: nil)
     }
 
     func toggleMute() {
@@ -509,12 +525,27 @@ final class CallSession: ObservableObject {
     }
 
     private func performEnd(localID: UUID, deadline: Date, origin: CallEndRequestOrigin) async throws -> CallEndDisposition {
-        guard let current = generation, current.localCallKitUUID == localID else { throw CallKitCoordinatorError.invalidAction }
+        guard let current = generation else { throw CallKitCoordinatorError.invalidAction }
+        let remappedExplicitEnd = current.localCallKitUUID != localID && explicitUserEndRequested && explicitUserEndServerCallID == current.serverCallID
+        guard current.localCallKitUUID == localID || remappedExplicitEnd else { throw CallKitCoordinatorError.invalidAction }
+        if remappedExplicitEnd {
+            recordRuntimeDiagnostic("stale_end_uuid_remapped", status: "current_generation", callID: current.serverCallID)
+        }
+        let effectiveOrigin: CallEndRequestOrigin = explicitUserEndRequested ? .appRequested : origin
         let callSignaling = try signaling(for: current)
-        let originStatus = origin == .appRequested ? "appRequested" : "system"
+        let originStatus = effectiveOrigin == .appRequested ? "appRequested" : "system"
         recordRuntimeDiagnostic("callkit_end_received", status: "origin=\(originStatus)", callID: current.serverCallID)
 
-        if origin == .system, suppressedSystemEndDuringAcceptance, serverCallAccepted,
+        if explicitUserEndRequested, explicitUserEndServerCallID == current.serverCallID {
+            suppressRecoveryAfterExplicitUserEnd(current)
+            if let mutation = terminalCompensations[current.id]?.mutation {
+                enqueueTerminalMutation(current, mutation: mutation)
+            }
+            await teardownLocal(current, finalState: .ended(current.serverCallID), reportReason: nil)
+            return .ended
+        }
+
+        if effectiveOrigin == .system, suppressedSystemEndDuringAcceptance, serverCallAccepted,
            case let .connecting(callID) = state, callID == current.serverCallID,
            !audioOperational, activeCallKitUUID == localID,
            let protectionDeadline = acceptanceSystemEndProtectionDeadline,
@@ -523,7 +554,9 @@ final class CallSession: ObservableObject {
             return .preserveCall
         }
 
-        if origin == .system, serverCallAccepted, state.isAcceptedLifecycle,
+        if effectiveOrigin == .system, suppressedSystemEndDuringAcceptance,
+           acceptanceSystemEndProtectionDeadline.map({ Date() < $0 }) == true,
+           serverCallAccepted, state.isAcceptedLifecycle,
            activeCallKitUUID == localID, transportActive {
             let expectedEpoch = mediaEpoch
             let baseline = audioProgress
@@ -564,7 +597,7 @@ final class CallSession: ObservableObject {
             acceptanceSystemEndProtectionDeadline = nil
         }
 
-        if origin == .system, isOutgoingCall, case .outgoingRinging = state {
+        if effectiveOrigin == .system, isOutgoingCall, case .outgoingRinging = state {
             if systemEndReconciliationInProgress { return .preserveCall }
             systemEndReconciliationInProgress = true
             defer { systemEndReconciliationInProgress = false }
@@ -658,7 +691,7 @@ final class CallSession: ObservableObject {
         suppressedSystemEndDuringAcceptance = false
         acceptanceSystemEndProtectionDeadline = nil
         let mutation = terminalMutationForCurrentState()
-        let reason = origin == .appRequested ? "explicit_user_end" : "system_end"
+        let reason = effectiveOrigin == .appRequested ? "explicit_user_end" : "system_end"
         recordRuntimeDiagnostic("terminal_mutation", status: "mutation=\(mutation.rawValue) reason=\(reason)", callID: current.serverCallID)
         terminalMutation = mutation
         terminalRequestID = terminalRequestID ?? UUID()
@@ -712,7 +745,10 @@ final class CallSession: ObservableObject {
     }
 
     private func didActivate(localID: UUID) {
-        guard let current = generation, current.localCallKitUUID == localID else { return }
+        guard let current = generation, current.localCallKitUUID == localID, !explicitUserEndRequested else {
+            if explicitUserEndRequested { recordRuntimeDiagnostic("recovery_suppressed_after_user_end", status: "did_activate", callID: generation?.serverCallID) }
+            return
+        }
         let wasAwaitingReactivation = awaitingCallKitReactivation
         if activatedCallKitUUID != localID { callKitActivationEpoch &+= 1 }
         activatedCallKitUUID = localID
@@ -748,6 +784,10 @@ final class CallSession: ObservableObject {
         audioFlowWatchdog?.cancel(); audioFlowWatchdog = nil
         audioFlow = AudioFlowMilestones(); audioProgress = AudioProgressCounters(); audioOperational = false
         audio.stop()
+        if explicitUserEndRequested {
+            recordRuntimeDiagnostic("recovery_suppressed_after_user_end", status: "did_deactivate", callID: current.serverCallID)
+            return
+        }
         if state.isAcceptedLifecycle {
             awaitingCallKitReactivation = true
             recordRuntimeDiagnostic("callkit_reactivation_wait_started", status: "started", callID: current.serverCallID)
@@ -875,6 +915,7 @@ final class CallSession: ObservableObject {
 
     private func startMediaIfReady(_ current: CallGeneration) {
         guard isCurrent(current), activatedCallKitUUID == current.localCallKitUUID,
+              !explicitUserEndRequested,
               audioStartedForCallKitUUID != current.localCallKitUUID,
               state.callID == current.serverCallID, let token = mediaToken,
               state.isMediaEstablishing else { return }
@@ -910,7 +951,10 @@ final class CallSession: ObservableObject {
     }
 
     private func peerReady(callID: UUID, mediaEpoch: UUID) {
-        guard let current = generation, current.serverCallID == callID else { return }
+        guard let current = generation, current.serverCallID == callID, !explicitUserEndRequested else {
+            if explicitUserEndRequested { recordRuntimeDiagnostic("recovery_suppressed_after_user_end", status: "peer_ready", callID: callID) }
+            return
+        }
         guard self.mediaEpoch == mediaEpoch else {
             if self.mediaEpoch == nil { pendingPeerReadyEpochs.insert(mediaEpoch) }
             return
@@ -933,6 +977,10 @@ final class CallSession: ObservableObject {
 
     private func mediaDisconnected(_ event: MediaDisconnect) {
         guard let current = generation, current.serverCallID == event.callID, mediaEpoch == event.connectionID, state.isAcceptedLifecycle, let token = mediaToken else { return }
+        guard !explicitUserEndRequested else {
+            recordRuntimeDiagnostic("recovery_suppressed_after_user_end", status: "media_disconnect", callID: current.serverCallID)
+            return
+        }
         recordRuntimeDiagnostic("media_disconnect_reason", status: "reason=\(String(describing: event.reason))", callID: current.serverCallID)
         mediaEpoch = nil; transportActive = false; audioOperational = false; audioFlowWatchdog?.cancel(); playout.stop()
         if event.reason == .authFailed || event.reason == .protocolViolation {
@@ -956,7 +1004,10 @@ final class CallSession: ObservableObject {
     }
 
     private func startMediaReconnect(_ current: CallGeneration, token: String, reconcileServerState: Bool = false) {
-        guard isCurrent(current), state.isAcceptedLifecycle else { return }
+        guard isCurrent(current), state.isAcceptedLifecycle, !explicitUserEndRequested else {
+            if explicitUserEndRequested { recordRuntimeDiagnostic("recovery_suppressed_after_user_end", status: "media_reconnect", callID: current.serverCallID) }
+            return
+        }
         recordRuntimeDiagnostic("media_reconnect_started", status: "started", callID: current.serverCallID)
         transition(.reconnecting(current.serverCallID))
         let activation = callKitActivationEpoch
@@ -1054,7 +1105,7 @@ final class CallSession: ObservableObject {
     }
 
     private func receive(_ receivedPacket: AudioPacket, mediaEpoch: UUID) {
-        guard let current = generation, receivedPacket.callID == current.serverCallID, self.mediaEpoch == mediaEpoch, receivedPacket.type == .audio else { return }
+        guard let current = generation, !explicitUserEndRequested, receivedPacket.callID == current.serverCallID, self.mediaEpoch == mediaEpoch, receivedPacket.type == .audio else { return }
         let packet: AudioPacket
         do {
             if let cryptor = callAudioCryptor { packet = try cryptor.decrypt(receivedPacket) }
@@ -1283,7 +1334,10 @@ final class CallSession: ObservableObject {
     }
 
     private func requestAudioRecovery(_ current: CallGeneration, reason: String, eventSequence: UInt64? = nil) {
-        guard isCurrent(current), activatedCallKitUUID == current.localCallKitUUID, state.isAcceptedLifecycle else { return }
+        guard isCurrent(current), activatedCallKitUUID == current.localCallKitUUID, state.isAcceptedLifecycle, !explicitUserEndRequested else {
+            if explicitUserEndRequested { recordRuntimeDiagnostic("recovery_suppressed_after_user_end", status: reason, callID: current.serverCallID) }
+            return
+        }
         let requestSequence: UInt64
         if let eventSequence { requestSequence = eventSequence }
         else { audioRecoveryEventSequence &+= 1; requestSequence = audioRecoveryEventSequence }
@@ -1438,9 +1492,48 @@ final class CallSession: ObservableObject {
         switch state { case .outgoingRinging: return .cancel; case .incomingRinging: return .reject; default: return .end }
     }
 
+    private func latchExplicitUserEnd(_ current: CallGeneration, signaling: any CallSignaling) {
+        guard isCurrent(current) else { return }
+        if !explicitUserEndRequested {
+            explicitUserEndRequested = true
+            explicitUserEndRequestID = UUID()
+            explicitUserEndRequestedAt = Date()
+            explicitUserEndServerCallID = current.serverCallID
+            recordRuntimeDiagnostic("explicit_user_end_latched", status: "current_generation", callID: current.serverCallID)
+            recordRuntimeDiagnostic("explicit_user_end_request_id_created", status: "created", callID: current.serverCallID)
+        }
+        let mutation = terminalMutationForCurrentState()
+        terminalMutation = mutation
+        terminalRequestID = explicitUserEndRequestID
+        registerTerminalCompensation(current, mutation: mutation, signaling: signaling, requestID: explicitUserEndRequestID)
+        recordRuntimeDiagnostic("terminal_mutation", status: "mutation=\(mutation.rawValue) reason=explicit_user_end", callID: current.serverCallID)
+    }
+
+    private func suppressRecoveryAfterExplicitUserEnd(_ current: CallGeneration) {
+        guard isCurrent(current), explicitUserEndRequested else { return }
+        awaitingCallKitReactivation = false
+        mediaConnectTask?.cancel(); mediaConnectTask = nil
+        reconnectTask?.cancel(); reconnectTask = nil
+        activationWatchdog?.cancel(); activationWatchdog = nil
+        peerWatchdog?.cancel(); peerWatchdog = nil
+        audioFlowWatchdog?.cancel(); audioFlowWatchdog = nil
+        audioRecoveryTask?.cancel(); audioRecoveryTask = nil
+        audioRecoverySettleTask?.cancel(); audioRecoverySettleTask = nil
+        callKitReactivationTask?.cancel(); callKitReactivationTask = nil
+        audioRecoveryPending = false
+        playout.stop(); audio.stop()
+        recordRuntimeDiagnostic("recovery_suppressed_after_user_end", status: "latched", callID: current.serverCallID)
+    }
+
     private func enqueueTerminalMutation(_ current: CallGeneration, mutation: CallMutation) {
         guard terminalCompensations[current.id]?.mutation == mutation else { return }
-        Task { @MainActor [weak self] in await self?.deliverTerminalCompensation(current) }
+        guard !terminalDeliveriesInProgress.contains(current.id) else { return }
+        terminalDeliveriesInProgress.insert(current.id)
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            await self.deliverTerminalCompensation(current)
+            self.terminalDeliveriesInProgress.remove(current.id)
+        }
     }
 
     private func registerTerminalCompensation(_ current: CallGeneration, mutation: CallMutation, signaling: any CallSignaling, requestID: UUID? = nil) {
@@ -1457,15 +1550,23 @@ final class CallSession: ObservableObject {
 
     private func deliverTerminalCompensation(_ current: CallGeneration) async {
         guard let retained = terminalCompensations[current.id] else { return }
-        for delay: UInt64 in [0, 250_000_000, 500_000_000, 1_000_000_000, 2_000_000_000] {
+        recordRuntimeDiagnostic("terminal_end_delivery_started", status: retained.mutation.rawValue, callID: current.serverCallID)
+        for (attempt, delay): (Int, UInt64) in [0, 250_000_000, 500_000_000, 1_000_000_000, 2_000_000_000].enumerated() {
             if delay > 0 { do { try await Task.sleep(nanoseconds: delay) } catch { return } }
             guard terminalCompensations[current.id]?.mutation == retained.mutation, terminalCompensations[current.id]?.requestID == retained.requestID else { return }
             do {
                 _ = try await retained.signaling.mutate(retained.mutation, callID: current.serverCallID, requestID: retained.requestID)
                 terminalCompensations.removeValue(forKey: current.id)
+                recordRuntimeDiagnostic("terminal_end_delivery_succeeded", status: retained.mutation.rawValue, callID: current.serverCallID)
                 return
-            } catch { continue }
+            } catch {
+                if attempt < 4 {
+                    recordRuntimeDiagnostic("terminal_end_delivery_retry", status: "attempt=\(attempt + 1)", callID: current.serverCallID)
+                }
+                continue
+            }
         }
+        recordRuntimeDiagnostic("terminal_end_delivery_failed", status: retained.mutation.rawValue, callID: current.serverCallID)
         recordRuntimeDiagnostic("terminal_mutation_failed", status: retained.mutation.rawValue, callID: current.serverCallID)
     }
 
@@ -1521,6 +1622,7 @@ final class CallSession: ObservableObject {
         audio.onMuteChanged = { value in events?.yield(.muteChanged(next.id, value)) }
         callAudioCryptor?.erase(); callAudioCryptor = nil
         mediaToken = nil; mediaEpoch = nil; pendingPeerReadyEpochs.removeAll(keepingCapacity: false); createRequestID = nil; acceptRequestID = nil; terminalRequestID = nil; terminalMutation = nil
+        explicitUserEndRequested = false; explicitUserEndRequestID = nil; explicitUserEndRequestedAt = nil; explicitUserEndServerCallID = nil
         callKitActivationEpoch &+= 1; activatedCallKitUUID = nil; audioStartedForCallKitUUID = nil
         hasEverActivatedCallKitAudio = false; awaitingCallKitReactivation = false; callKitContinuationAttempted = false; continuationCallKitUUID = nil; outgoingConnectedReported = false
         serverCallCreated = false; serverCallAccepted = false; suppressedSystemEndDuringAcceptance = false; acceptanceSystemEndProtectionDeadline = nil; systemEndReconciliationInProgress = false; sequence = 0; isMuted = false; elapsedSeconds = 0
@@ -1542,6 +1644,7 @@ final class CallSession: ObservableObject {
         cancelCallTasks(); sendContinuation?.finish(); sendContinuation = nil; sendStream = nil; sendTask?.cancel(); sendTask = nil
         activeSignaling?.eraseSecrets(); callAudioCryptor?.erase(); callAudioCryptor = nil
         generation = nil; activeSignaling = nil; activeCallKitUUID = nil; mediaEpoch = nil; mediaToken = nil; isOutgoingCall = false; callKitReported = false; incomingCallerName = nil; suppressedSystemEndDuringAcceptance = false; acceptanceSystemEndProtectionDeadline = nil; systemEndReconciliationInProgress = false
+        explicitUserEndRequested = false; explicitUserEndRequestID = nil; explicitUserEndRequestedAt = nil; explicitUserEndServerCallID = nil
         hasEverActivatedCallKitAudio = false; awaitingCallKitReactivation = false; callKitContinuationAttempted = false; continuationCallKitUUID = nil; outgoingConnectedReported = false
         callHistoryRecordID = nil
     }

@@ -1751,7 +1751,7 @@ final class WiFiSecureCallTests: XCTestCase {
     }
 
     @MainActor
-    func testSystemEndAfterCallBecomesActiveWithMediaProgressIsPreserved() async throws {
+    func testSystemEndAfterCallBecomesStablyActiveEndsNormally() async throws {
         let capture = RequestCapture(); capture.mutationState = .ended
         let audio = AudioEngineMock(), media = MediaTransportMock()
         let (session, adapter, serverID, localID) = try await prepareOutgoingRinging(capture: capture, audio: audio, media: media)
@@ -1766,11 +1766,12 @@ final class WiFiSecureCallTests: XCTestCase {
         await eventually { session.state == .active(serverID) }
 
         let disposition = try await adapter.approveEnd(localID, origin: .system)
+        let endpoint = "/calls/\(serverID.uuidString.lowercased())/end"
+        await eventually { capture.paths.filter { $0.hasSuffix(endpoint) }.count == 1 }
 
-        XCTAssertEqual(disposition, .preserveCall)
-        XCTAssertEqual(session.state, .active(serverID))
-        let endpoint = "/calls/\(serverID.uuidString.lowercased())/"
-        XCTAssertFalse(capture.paths.contains { $0.contains(endpoint) && ($0.hasSuffix("/end") || $0.hasSuffix("/cancel")) })
+        XCTAssertEqual(disposition, .ended)
+        XCTAssertTrue(session.state.isTerminal)
+        XCTAssertEqual(capture.paths.filter { $0.hasSuffix(endpoint) }.count, 1)
     }
 
     @MainActor
@@ -2239,7 +2240,7 @@ final class WiFiSecureCallTests: XCTestCase {
     }
 
     @MainActor
-    func testSystemEndWithAcceptedServerAndMediaProgressPreservesWatchCall() async throws {
+    func testSystemEndWithStableAcceptedWatchCallEndsNormally() async throws {
         let capture = RequestCapture(); capture.getState = .accepted
         let audio = AudioEngineMock(), media = MediaTransportMock()
         let session = makeSession(capture: capture, role: .A, audio: audio, media: media)
@@ -2256,10 +2257,12 @@ final class WiFiSecureCallTests: XCTestCase {
         await eventually { session.state == .active(callID) }
 
         let disposition = try await adapter.approveEnd(localID, origin: .system)
+        let endpoint = "/calls/\(callID.uuidString.lowercased())/end"
+        await eventually { capture.paths.filter { $0.hasSuffix(endpoint) }.count == 1 }
 
-        XCTAssertEqual(disposition, .preserveCall)
-        XCTAssertEqual(session.state, .active(callID))
-        XCTAssertFalse(capture.paths.contains { $0.hasSuffix("/end") || $0.hasSuffix("/cancel") })
+        XCTAssertEqual(disposition, .ended)
+        XCTAssertTrue(session.state.isTerminal)
+        XCTAssertEqual(capture.paths.filter { $0.hasSuffix(endpoint) }.count, 1)
     }
 
     @MainActor
@@ -2399,6 +2402,76 @@ final class WiFiSecureCallTests: XCTestCase {
 
         await eventually { capture.createdCallID == session.state.callID }
         XCTAssertEqual(capture.createdCallID, session.state.callID)
+    }
+
+    @MainActor
+    func testWatchActiveUserEndDeliversExactlyOneEndWithoutCallKitCallback() async throws {
+        let capture = RequestCapture(); capture.mutationState = .ended
+        let (session, adapter, serverID, _, audio, media) = try await prepareIncomingAcceptedWatch(capture: capture, activateAudio: true)
+        let epoch = try XCTUnwrap(media.connectionIDs.last)
+        media.onPeerReady?(serverID, epoch)
+        establishAudioFlow(audio: audio, media: media, callID: serverID, epoch: epoch)
+        await eventually { session.state == .active(serverID) }
+
+        await session.endCall()
+        let endpoint = "/calls/\(serverID.uuidString.lowercased())/end"
+        await eventually { capture.paths.filter { $0.hasSuffix(endpoint) }.count == 1 }
+        await eventually {
+            let events = capture.diagnosticEvents(for: serverID)
+            return events.contains("explicit_user_end_latched") && events.contains("terminal_end_delivery_succeeded")
+        }
+
+        XCTAssertEqual(adapter.endRequestIDs.count, 1)
+        XCTAssertEqual(capture.paths.filter { $0.hasSuffix(endpoint) }.count, 1)
+        XCTAssertTrue(session.state.isTerminal)
+        XCTAssertTrue(capture.diagnosticEvents(for: serverID).contains("explicit_user_end_latched"))
+        XCTAssertTrue(capture.diagnosticEvents(for: serverID).contains("terminal_end_delivery_succeeded"))
+    }
+
+    @MainActor
+    func testWatchUserEndSystemCallbackIsClassifiedAsExplicitAndCannotReactivate() async throws {
+        let capture = RequestCapture(); capture.mutationState = .ended
+        let (session, adapter, serverID, _, audio, media) = try await prepareIncomingAcceptedWatch(capture: capture, activateAudio: true)
+        let epoch = try XCTUnwrap(media.connectionIDs.last)
+        media.onPeerReady?(serverID, epoch)
+        establishAudioFlow(audio: audio, media: media, callID: serverID, epoch: epoch)
+        await eventually { session.state == .active(serverID) }
+        adapter.endRequestCallbackOrigin = .system
+        let startsBefore = audio.startCount
+
+        await session.endCall()
+        adapter.onAudioActivated?(adapter.endRequestIDs.first ?? UUID())
+        audio.onFailure?(.configurationChanged)
+        media.onDisconnect?(.init(callID: serverID, connectionID: epoch, closeCode: nil, reason: .remoteClosed))
+        try? await Task.sleep(nanoseconds: 350_000_000)
+
+        let endpoint = "/calls/\(serverID.uuidString.lowercased())/end"
+        XCTAssertEqual(capture.paths.filter { $0.hasSuffix(endpoint) }.count, 1)
+        XCTAssertEqual(audio.startCount, startsBefore)
+        XCTAssertTrue(session.state.isTerminal)
+    }
+
+    @MainActor
+    func testTwentyModeledWatchUserEndsEachProduceOneEndAndNoRecovery() async throws {
+        for _ in 0..<20 {
+            let capture = RequestCapture(); capture.mutationState = .ended
+            let (session, _, serverID, _, audio, media) = try await prepareIncomingAcceptedWatch(capture: capture, activateAudio: true)
+            let epoch = try XCTUnwrap(media.connectionIDs.last)
+            media.onPeerReady?(serverID, epoch)
+            establishAudioFlow(audio: audio, media: media, callID: serverID, epoch: epoch)
+            await eventually { session.state == .active(serverID) }
+            let startsBefore = audio.startCount
+
+            await session.endCall()
+            audio.onFailure?(.configurationChanged)
+            media.onDisconnect?(.init(callID: serverID, connectionID: epoch, closeCode: nil, reason: .remoteClosed))
+            let endpoint = "/calls/\(serverID.uuidString.lowercased())/end"
+            await eventually { capture.paths.filter { $0.hasSuffix(endpoint) }.count == 1 }
+
+            XCTAssertEqual(capture.paths.filter { $0.hasSuffix(endpoint) }.count, 1)
+            XCTAssertEqual(audio.startCount, startsBefore)
+            XCTAssertTrue(session.state.isTerminal)
+        }
     }
 
     @MainActor
@@ -2697,11 +2770,17 @@ private final class RetainedCallKitMock: CallKitHandling {
     var connectedIDs: [UUID] = []
     var mutedRequests: [(UUID, Bool)] = []
     var onReportIncoming: (() -> Void)?
+    var endRequestCallbackOrigin: CallEndRequestOrigin?
     func startOutgoing(id: UUID) async throws { startedIDs.append(id); if let startError { throw startError } }
     func reportIncoming(id: UUID) async throws { try await reportIncoming(id: id, callerName: nil) }
     func reportIncoming(id: UUID, callerName: String?) async throws { incomingIDs.append(id); incomingNames.append(callerName); onReportIncoming?() }
     func requestAnswer(id: UUID) async throws { answerIDs.append(id) }
-    func requestEnd(id: UUID) async throws { endRequestIDs.append(id) }
+    func requestEnd(id: UUID) async throws {
+        endRequestIDs.append(id)
+        if let endRequestCallbackOrigin {
+            _ = try await onEndRequested?(id, Date().addingTimeInterval(10), endRequestCallbackOrigin)
+        }
+    }
     func requestSetMuted(id: UUID, muted: Bool) async throws { mutedRequests.append((id, muted)); try onMutedRequested?(id, muted) }
     func reportOutgoingStartedConnecting(id: UUID) { startedConnectingIDs.append(id) }
     func reportOutgoingConnected(id: UUID) { connectedIDs.append(id) }
