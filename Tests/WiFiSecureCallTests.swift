@@ -1971,7 +1971,7 @@ final class WiFiSecureCallTests: XCTestCase {
     }
 
     @MainActor
-    func testRepeatedAudioHealthFailureUsesOneRecoveryThenEndsBrokenCall() async throws {
+    func testAudioRecoveryRequiresNewSentAndRenderedFramesBeforeConfirmation() async throws {
         let capture = RequestCapture(); capture.getState = .accepted
         let audio = AudioEngineMock(), media = MediaTransportMock()
         let session = makeSession(capture: capture, audio: audio, media: media)
@@ -1990,11 +1990,106 @@ final class WiFiSecureCallTests: XCTestCase {
 
         audio.onFailure?(.configurationChanged)
         await eventually { audio.startCount == 2 }
-        audio.onFailure?(.configurationChanged)
-        try? await Task.sleep(nanoseconds: 50_000_000)
+        try? await Task.sleep(nanoseconds: 100_000_000)
+        XCTAssertFalse(capture.diagnosticEvents.contains("audio_recovery_confirmed"))
+
+        let sentBefore = media.sentPackets.count
+        audio.onFrame?(Data(repeating: 4, count: AudioEngine.bytesPerFrame))
+        media.onPacket?(AudioPacket(type: .audio, callID: serverID, sequence: 50, timestampMicroseconds: 1_000_000, payload: Data(repeating: 5, count: AudioEngine.bytesPerFrame)), epoch)
+        audio.onDiagnostic?(.init(event: "first_playback_buffer_scheduled", status: "test", errorDomain: nil, errorCode: nil))
+        audio.onDiagnostic?(.init(event: "first_playback_buffer_rendered", status: "test", errorDomain: nil, errorCode: nil))
+        await eventually { media.sentPackets.count > sentBefore && capture.diagnosticEvents.contains("audio_recovery_confirmed") }
 
         XCTAssertEqual(audio.startCount, 2)
+        XCTAssertTrue(capture.diagnosticEvents.contains("audio_recovery_confirmed"))
+        XCTAssertFalse(session.state.isTerminal)
+    }
+
+    @MainActor
+    func testRepeatedRouteChangesDuringRecoveryProduceOnePendingRebuild() async throws {
+        let capture = RequestCapture(); capture.getState = .accepted
+        let audio = AudioEngineMock(), media = MediaTransportMock()
+        let session = makeSession(capture: capture, audio: audio, media: media)
+        let adapter = RetainedCallKitMock(); session.attach(callKit: adapter)
+        await session.startCall()
+        let localID = try XCTUnwrap(adapter.startedIDs.first), serverID = try XCTUnwrap(session.state.callID)
+        try await adapter.approveStart(localID)
+        await eventually { if case .connecting = session.state { return true }; return false }
+        adapter.onAudioActivated?(localID)
+        await eventually { audio.startCount == 1 && !media.connectionIDs.isEmpty }
+        let epoch = try XCTUnwrap(media.connectionIDs.last)
+        media.onPeerReady?(serverID, epoch)
+        establishAudioFlow(audio: audio, media: media, callID: serverID, epoch: epoch)
+        await eventually { session.state == .active(serverID) }
+
+        audio.onFailure?(.configurationChanged)
+        audio.onFailure?(.configurationChanged)
+        audio.onFailure?(.configurationChanged)
+        await eventually { audio.startCount == 2 }
+        let sentBefore = media.sentPackets.count
+        audio.onFrame?(Data(repeating: 6, count: AudioEngine.bytesPerFrame))
+        media.onPacket?(AudioPacket(type: .audio, callID: serverID, sequence: 51, timestampMicroseconds: 1_020_000, payload: Data(repeating: 7, count: AudioEngine.bytesPerFrame)), epoch)
+        audio.onDiagnostic?(.init(event: "first_playback_buffer_scheduled", status: "test", errorDomain: nil, errorCode: nil))
+        audio.onDiagnostic?(.init(event: "first_playback_buffer_rendered", status: "test", errorDomain: nil, errorCode: nil))
+        await eventually { media.sentPackets.count > sentBefore && audio.startCount == 3 }
+        try? await Task.sleep(nanoseconds: 350_000_000)
+
+        XCTAssertEqual(audio.startCount, 3)
+        XCTAssertFalse(session.state.isTerminal)
+    }
+
+    @MainActor
+    func testDeactivateReactivatePreservesEstablishedMediaEpoch() async throws {
+        let capture = RequestCapture(); capture.getState = .accepted
+        let audio = AudioEngineMock(), media = MediaTransportMock()
+        let session = makeSession(capture: capture, audio: audio, media: media)
+        let adapter = RetainedCallKitMock(); session.attach(callKit: adapter)
+        await session.startCall()
+        let localID = try XCTUnwrap(adapter.startedIDs.first), serverID = try XCTUnwrap(session.state.callID)
+        try await adapter.approveStart(localID)
+        await eventually { if case .connecting = session.state { return true }; return false }
+        adapter.onAudioActivated?(localID)
+        await eventually { audio.startCount == 1 && media.connectionIDs.count == 1 }
+        let epoch = try XCTUnwrap(media.connectionIDs.last)
+        media.onPeerReady?(serverID, epoch)
+        establishAudioFlow(audio: audio, media: media, callID: serverID, epoch: epoch)
+        await eventually { session.state == .active(serverID) }
+
+        adapter.onAudioDeactivated?(localID)
+        adapter.onAudioActivated?(localID)
+        await eventually { audio.startCount == 2 }
+
+        XCTAssertEqual(media.connectionIDs, [epoch])
+        XCTAssertFalse(session.state.isTerminal)
+    }
+
+    @MainActor
+    func testThreeUnvalidatedAudioRecoveriesEndAcceptedCallWithoutCancel() async throws {
+        let capture = RequestCapture(); capture.getState = .accepted; capture.mutationState = .ended
+        let audio = AudioEngineMock(), media = MediaTransportMock()
+        let session = makeSession(capture: capture, audio: audio, media: media)
+        let adapter = RetainedCallKitMock(); session.attach(callKit: adapter)
+        await session.startCall()
+        let localID = try XCTUnwrap(adapter.startedIDs.first), serverID = try XCTUnwrap(session.state.callID)
+        try await adapter.approveStart(localID)
+        await eventually { if case .connecting = session.state { return true }; return false }
+        adapter.onAudioActivated?(localID)
+        await eventually { audio.startCount == 1 && !media.connectionIDs.isEmpty }
+        let epoch = try XCTUnwrap(media.connectionIDs.last)
+        media.onPeerReady?(serverID, epoch)
+        establishAudioFlow(audio: audio, media: media, callID: serverID, epoch: epoch)
+        await eventually { session.state == .active(serverID) }
+
+        audio.onFailure?(.configurationChanged)
+        for _ in 0..<850 where !session.state.isTerminal {
+            try? await Task.sleep(nanoseconds: 10_000_000)
+        }
+
         XCTAssertTrue(session.state.isTerminal)
+        XCTAssertEqual(audio.startCount, 4)
+        XCTAssertGreaterThanOrEqual(capture.paths.filter { $0.hasSuffix("/end") }.count, 1)
+        XCTAssertFalse(capture.paths.contains { $0.hasSuffix("/cancel") })
+        XCTAssertTrue(capture.diagnosticEvents.contains("audio_recovery_exhausted"))
     }
 
     @MainActor
@@ -2384,10 +2479,11 @@ private final class AudioEngineMock: AudioEngineHandling, @unchecked Sendable {
     var startMutedValues: [Bool] = []
     var mutedValues: [Bool] = []
     var played: [Data] = []
+    var graphGeneration: UInt64 = 0
     func ensureRecordPermission() async -> Bool { permission }
     func configureSession() throws {}
-    func start(muted: Bool) throws { startCount += 1; startMutedValues.append(muted) }
-    func stop() { stopCount += 1 }
+    func start(muted: Bool) throws { graphGeneration &+= 1; startCount += 1; startMutedValues.append(muted) }
+    func stop() { graphGeneration &+= 1; stopCount += 1 }
     func setMuted(_ value: Bool) throws { mutedValues.append(value); onMuteChanged?(value) }
     func play(_ payload: Data) { played.append(payload) }
 }

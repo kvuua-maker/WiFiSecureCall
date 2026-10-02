@@ -62,13 +62,20 @@ final class Diagnostics: ObservableObject {
         "audio_watchdog_recovery_succeeded", "audio_watchdog_terminal_failure",
         "audio_recovery", "capture_watchdog_failed", "first_capture_conversion_failure",
         "first_playback_failure", "audio_engine_start_failure", "audio_route_changed",
-        "audio_interruption", "audio_send_backpressure_drop"
+        "audio_interruption", "audio_send_backpressure_drop", "audio_configuration_change",
+        "audio_route_change", "audio_graph_generation", "audio_recovery_started",
+        "audio_graph_restarted", "audio_recovery_validating", "audio_recovery_confirmed",
+        "audio_recovery_validation_timeout", "audio_recovery_exhausted",
+        "playback_frame_scheduled", "playback_frame_rendered", "playback_failure",
+        "playback_graph_unavailable", "media_disconnect_reason", "media_reconnect_started",
+        "media_reconnect_succeeded", "call_failed_reason"
     ]
 
     private static let metricKeys: Set<String> = [
         "bytes", "rms", "peak", "nonzero", "sequence", "count", "frames",
         "frameLength", "sampleRate", "channelCount", "depth",
-        "sent", "received", "rendered", "relayed", "dropped"
+        "sent", "received", "rendered", "relayed", "dropped", "generation", "attempt",
+        "reason", "code"
     ]
 
     private static func safeEvent(_ event: DiagnosticEvent) -> DiagnosticEvent? {
@@ -83,7 +90,19 @@ final class Diagnostics: ObservableObject {
                       "active", "reconnecting", "ending", "ended", "failed"]
         let safeState = event.category == "state"
             ? states.first(where: { event.value.hasPrefix($0) }) : nil
-        let detail = safeState ?? (numeric.isEmpty ? "подія" : numeric.prefix(8).joined(separator: " "))
+        let callFailures = Set(["permissionDenied", "serverUnavailable", "callExpired", "callRejected",
+                                "callCancelled", "callKitRejected", "audioActivationTimeout", "audioFailed",
+                                "mediaConnectionFailed", "networkLost", "invalidServerState", "notificationUnavailable",
+                                "accountSessionInvalid", "accountMutationInProgress", "targetUnavailable",
+                                "targetAmbiguous", "answeredElsewhere"])
+        let mediaReasons = Set(["remoteClosed", "authFailed", "protocolViolation", "serverRestart",
+                                "transientNetwork", "sendFailed", "peerUnavailable", "localClose"])
+        let safeReason: String?
+        if event.category == "call_failed_reason", callFailures.contains(event.value) { safeReason = event.value }
+        else if event.category == "media_disconnect_reason",
+                let value = event.value.split(separator: "=").last.map(String.init), mediaReasons.contains(value) { safeReason = value }
+        else { safeReason = nil }
+        let detail = safeState ?? safeReason ?? (numeric.isEmpty ? "подія" : numeric.prefix(8).joined(separator: " "))
         return DiagnosticEvent(id: event.id, timestamp: event.timestamp, platform: event.platform,
                                role: event.role, callID: event.callID, category: event.category, value: detail)
     }
