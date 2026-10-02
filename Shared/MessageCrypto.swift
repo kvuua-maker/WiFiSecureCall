@@ -5,6 +5,7 @@ enum SecureMessageCryptoError: Error, Equatable {
     case emptyMessage
     case messageTooLarge
     case noRecipientDevices
+    case conflictingDeviceBundle
     case noEnvelope
     case invalidEnvelope
     case authentication
@@ -26,8 +27,7 @@ enum SecureMessageCrypto {
         let plaintext = Data(text.utf8)
         guard !plaintext.isEmpty else { throw SecureMessageCryptoError.emptyMessage }
         guard plaintext.count <= maximumUTF8Bytes else { throw SecureMessageCryptoError.messageTooLarge }
-        let devices = Dictionary(uniqueKeysWithValues: (recipientDevices + senderOtherDevices).map { ($0.deviceID, $0) }).values.sorted { $0.deviceID.uuidString < $1.deviceID.uuidString }
-        guard !recipientDevices.isEmpty, !devices.isEmpty else { throw SecureMessageCryptoError.noRecipientDevices }
+        let devices = try mergedEncryptionDevices(recipientDevices: recipientDevices, senderOtherDevices: senderOtherDevices)
         let messageKey = SymmetricKey(size: .bits256)
         let messageBox = try ChaChaPoly.seal(plaintext, using: messageKey)
         let rawMessageKey = messageKey.withUnsafeBytes { Data($0) }
@@ -118,5 +118,28 @@ enum SecureMessageCrypto {
 
     private static func envelopeContext(conversationID: UUID, messageID: UUID, deviceID: UUID) -> Data {
         Data("wsc-message-envelope-v1\n\(conversationID.uuidString.lowercased())\n\(messageID.uuidString.lowercased())\n\(deviceID.uuidString.lowercased())".utf8)
+    }
+
+    static func mergedEncryptionDevices(
+        recipientDevices: [E2EEPublicDeviceBundle],
+        senderOtherDevices: [E2EEPublicDeviceBundle]
+    ) throws -> [E2EEPublicDeviceBundle] {
+        guard !recipientDevices.isEmpty else { throw SecureMessageCryptoError.noRecipientDevices }
+        var devicesByID: [UUID: E2EEPublicDeviceBundle] = [:]
+        for bundle in recipientDevices + senderOtherDevices {
+            if let existing = devicesByID[bundle.deviceID] {
+                let sameCryptographicBundle =
+                    existing.signingPublicKey == bundle.signingPublicKey &&
+                    existing.agreementPublicKey == bundle.agreementPublicKey &&
+                    existing.keyVersion == bundle.keyVersion &&
+                    existing.protocolVersion == bundle.protocolVersion
+                guard sameCryptographicBundle else {
+                    throw SecureMessageCryptoError.conflictingDeviceBundle
+                }
+                continue
+            }
+            devicesByID[bundle.deviceID] = bundle
+        }
+        return devicesByID.values.sorted { $0.deviceID.uuidString < $1.deviceID.uuidString }
     }
 }

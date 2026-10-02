@@ -9,7 +9,7 @@ struct AudioEngineDiagnostic: Sendable {
     let errorCode: Int?
 }
 
-enum AudioEngineRuntimeFailure: Equatable, Sendable { case captureStalled, captureConversion, playbackConversion, configurationChanged }
+enum AudioEngineRuntimeFailure: Equatable, Sendable { case captureStalled, captureConversion, playbackConversion, playbackGraphUnavailable, configurationChanged }
 
 struct PCMSignalMetrics: Equatable, Sendable {
     let frameCount: Int
@@ -32,6 +32,7 @@ enum AudioFlowFailureStage: String, Equatable, Sendable {
 struct AudioProgressCounters: Equatable, Sendable {
     var sent: UInt64 = 0
     var received: UInt64 = 0
+    var scheduled: UInt64 = 0
     var rendered: UInt64 = 0
 
     func stalledStage(since baseline: Self) -> AudioFlowFailureStage? {
@@ -90,6 +91,7 @@ protocol AudioEngineHandling: AnyObject {
     var onDiagnostic: (@Sendable (AudioEngineDiagnostic) -> Void)? { get set }
     var onFailure: (@Sendable (AudioEngineRuntimeFailure) -> Void)? { get set }
     var onMuteChanged: (@Sendable (Bool) -> Void)? { get set }
+    var graphGeneration: UInt64 { get }
     func ensureRecordPermission() async -> Bool
     func configureSession() throws
     func start(muted: Bool) throws
@@ -97,6 +99,8 @@ protocol AudioEngineHandling: AnyObject {
     func setMuted(_ value: Bool) throws
     func play(_ payload: Data)
 }
+
+extension AudioEngineHandling { var graphGeneration: UInt64 { 0 } }
 
 struct CaptureSourceLifecycle {
     private(set) var isInstalled = false
@@ -231,6 +235,8 @@ final class AudioEngine: AudioEngineHandling, @unchecked Sendable {
     private var watchdog: DispatchWorkItem?
     private var watchdogGeneration: UInt64 = 0
     private var renderedBufferCount: UInt64 = 0
+    // Access only on playbackQueue; callbacks from an earlier graph must not mark a new graph rendered.
+    private var audioGraphGeneration: UInt64 = 0
     private var captureLifecycle = CaptureSourceLifecycle()
     private var starting = false
     private var scheduledBuffers = 0
@@ -247,6 +253,13 @@ final class AudioEngine: AudioEngineHandling, @unchecked Sendable {
     private var playbackOverflowReported = false
     private var peakScheduledBuffers = 0
     private var observers: [NSObjectProtocol] = []
+    private var graphChangeWorkItem: DispatchWorkItem?
+    private var graphChangePending = false
+    private var audioLifecycleMutationInProgress = false
+    private var graphEventSequence: UInt64 = 0
+    private var graphEventsIgnoredThrough: UInt64 = 0
+    private var graphEventSuppressionUntil = DispatchTime(uptimeNanoseconds: 0)
+    private var graphUnavailableReportedGeneration: UInt64?
     private let transmitMute = TransmitMuteGate()
 
     init() { engine.attach(player); installObservers() }
@@ -290,7 +303,15 @@ final class AudioEngine: AudioEngineHandling, @unchecked Sendable {
         }
     }
 
-    func start(muted: Bool) throws { try controlQueue.sync { try startOnControlQueue(muted: muted) } }
+    func start(muted: Bool) throws {
+        try controlQueue.sync {
+            beginControlledGraphMutation()
+            defer { finishControlledGraphMutation() }
+            try startOnControlQueue(muted: muted)
+        }
+    }
+
+    var graphGeneration: UInt64 { playbackQueue.sync { audioGraphGeneration } }
 
     private func startOnControlQueue(muted: Bool) throws {
         guard !engine.isRunning, !starting else { throw CallFailure.audioFailed }
@@ -338,11 +359,18 @@ final class AudioEngine: AudioEngineHandling, @unchecked Sendable {
         }
     }
 
-    func stop() { controlQueue.sync { cleanupGraph() } }
+    func stop() {
+        controlQueue.sync {
+            beginControlledGraphMutation()
+            defer { finishControlledGraphMutation() }
+            cleanupGraph()
+        }
+    }
 
     func play(_ payload: Data) {
         guard payload.count == Self.bytesPerFrame else { reportPlaybackFailure(NSError(domain: "WiFiSecureCall.AudioEngine", code: 30)); return }
-        playbackQueue.async { [weak self] in self?.convertAndSchedule(payload) }
+        let generation = graphGeneration
+        playbackQueue.async { [weak self] in self?.convertAndSchedule(payload, generation: generation) }
     }
 
     static func convertToNetworkPCM(_ buffer: AVAudioPCMBuffer, converter: AVAudioConverter) -> Data? {
@@ -489,11 +517,17 @@ final class AudioEngine: AudioEngineHandling, @unchecked Sendable {
         watchdog = item; controlQueue.asyncAfter(deadline: .now() + 2, execute: item)
     }
 
-    private func convertAndSchedule(_ payload: Data) {
+    private func convertAndSchedule(_ payload: Data, generation: UInt64) {
+        guard generation == audioGraphGeneration else { return }
         guard engine.isRunning, let networkFormat, let converter = outputConverter,
               let source = Self.canonicalBuffer(from: payload, format: networkFormat) else {
-            let error = NSError(domain: "WiFiSecureCall.AudioEngine", code: 32)
-            reportPlaybackFailure(error); return
+            guard generation == audioGraphGeneration else { return }
+            if graphUnavailableReportedGeneration != generation {
+                graphUnavailableReportedGeneration = generation
+                emit("playback_graph_unavailable", "transient generation=\(generation)")
+                onFailure?(.playbackGraphUnavailable)
+            }
+            return
         }
         guard scheduledBuffers < maximumScheduledBuffers else {
             if !playbackOverflowReported { playbackOverflowReported = true; emit("playback_overflow", "dropped depth=\(scheduledBuffers)") }
@@ -507,40 +541,97 @@ final class AudioEngine: AudioEngineHandling, @unchecked Sendable {
         guard let converted = AVAudioPCMBuffer(pcmFormat: converter.outputFormat, frameCapacity: capacity) else { reportPlaybackFailure(NSError(domain: "WiFiSecureCall.AudioEngine", code: 34)); return }
         var supplied = false, error: NSError?
         let status = converter.convert(to: converted, error: &error) { _, status in if supplied { status.pointee = .noDataNow; return nil }; supplied = true; status.pointee = .haveData; return source }
+        guard generation == audioGraphGeneration else { return }
         guard status != .error, error == nil, converted.frameLength > 0 else { reportPlaybackFailure(error ?? NSError(domain: "WiFiSecureCall.AudioEngine", code: 35)); return }
         if !player.isPlaying { player.play() }
+        guard generation == audioGraphGeneration else { return }
         scheduledBuffers += 1
         peakScheduledBuffers = max(peakScheduledBuffers, scheduledBuffers)
         player.scheduleBuffer(converted, completionCallbackType: .dataRendered) { [weak self] _ in
             guard let self else { return }
             self.playbackQueue.async {
+                guard self.audioGraphGeneration == generation else { return }
                 self.scheduledBuffers = max(0, self.scheduledBuffers - 1)
-                if !self.firstPlaybackRenderedReported { self.firstPlaybackRenderedReported = true; self.emit("first_playback_buffer_rendered", "rendered") }
+                if !self.firstPlaybackRenderedReported {
+                    self.firstPlaybackRenderedReported = true
+                    self.emit("first_playback_buffer_rendered", "generation=\(generation)")
+                    self.emit("playback_frame_rendered", "generation=\(generation)")
+                }
                 self.renderedBufferCount &+= 1
-                if self.renderedBufferCount.isMultiple(of: 50) { self.emit("playback_render_progress", "frames=50") }
+                if self.renderedBufferCount.isMultiple(of: 250) { self.emit("playback_render_progress", "frames=250") }
             }
         }
-        if !firstPlaybackScheduledReported { firstPlaybackScheduledReported = true; emit("first_playback_buffer_scheduled", "frameLength=\(converted.frameLength) depth=\(scheduledBuffers) peak=\(peakScheduledBuffers)") }
+        if !firstPlaybackScheduledReported {
+            firstPlaybackScheduledReported = true
+            emit("playback_frame_scheduled", "generation=\(generation)")
+            emit("first_playback_buffer_scheduled", "generation=\(generation) frameLength=\(converted.frameLength) depth=\(scheduledBuffers) peak=\(peakScheduledBuffers)")
+        }
     }
 
     private func cleanupGraph() {
         watchdogGeneration &+= 1; watchdog?.cancel(); watchdog = nil; captureTimer?.cancel(); captureTimer = nil
-        playbackQueue.sync {}
+        playbackQueue.sync { audioGraphGeneration &+= 1; scheduledBuffers = 0; graphUnavailableReportedGeneration = nil }
+        emit("audio_graph_generation", "generation=\(graphGeneration)")
         player.stop(); if engine.isRunning { engine.stop() }
         captureQueue.sync {}
         let sink = captureSink
         captureLifecycle.remove { [engine] in guard let sink else { return }; engine.disconnectNodeInput(sink); engine.detach(sink) }
         captureSink = nil; captureRing = nil; engine.disconnectNodeOutput(player); engine.reset()
-        inputConverter = nil; outputConverter = nil; networkFormat = nil; pcmRing.reset(); scheduledBuffers = 0
+        inputConverter = nil; outputConverter = nil; networkFormat = nil; pcmRing.reset()
         transmitMute.reset()
     }
 
     private func installObservers() {
         let center = NotificationCenter.default
-        observers.append(center.addObserver(forName: .AVAudioEngineConfigurationChange, object: nil, queue: nil) { [weak self] _ in self?.onFailure?(.configurationChanged) })
+        observers.append(center.addObserver(forName: .AVAudioEngineConfigurationChange, object: nil, queue: nil) { [weak self] _ in self?.requestGraphRecovery(event: "audio_configuration_change", status: "changed") })
         observers.append(center.addObserver(forName: AVAudioSession.interruptionNotification, object: nil, queue: nil) { [weak self] note in self?.emit("audio_interruption", "\(note.userInfo?[AVAudioSessionInterruptionTypeKey] ?? "unknown")") })
-        observers.append(center.addObserver(forName: AVAudioSession.routeChangeNotification, object: nil, queue: nil) { [weak self] _ in self?.emit("audio_route_changed", "changed") })
-        observers.append(center.addObserver(forName: AVAudioSession.mediaServicesWereResetNotification, object: nil, queue: nil) { [weak self] _ in self?.onFailure?(.configurationChanged) })
+        observers.append(center.addObserver(forName: AVAudioSession.routeChangeNotification, object: nil, queue: nil) { [weak self] note in
+            let reason = (note.userInfo?[AVAudioSessionRouteChangeReasonKey] as? UInt).map(String.init) ?? "unknown"
+            self?.requestGraphRecovery(event: "audio_route_change", status: "reason=\(reason)")
+        })
+        observers.append(center.addObserver(forName: AVAudioSession.mediaServicesWereResetNotification, object: nil, queue: nil) { [weak self] _ in self?.requestGraphRecovery(event: "audio_configuration_change", status: "media_services_reset") })
+    }
+
+    private func requestGraphRecovery(event: String, status: String) {
+        controlQueue.async { [weak self] in
+            guard let self else { return }
+            self.graphEventSequence &+= 1
+            let sequence = self.graphEventSequence
+            self.emit(event, "\(status) sequence=\(sequence)")
+            self.emit("recovery_request_source", "source=\(event)")
+            self.emit("recovery_event_sequence", "sequence=\(sequence)")
+            if self.audioLifecycleMutationInProgress || DispatchTime.now() < self.graphEventSuppressionUntil {
+                self.graphEventsIgnoredThrough = max(self.graphEventsIgnoredThrough, sequence)
+                self.emit("recovery_event_ignored_during_rebuild", "sequence=\(sequence) source=\(event)")
+                return
+            }
+            self.graphChangePending = true
+            self.graphChangeWorkItem?.cancel()
+            let item = DispatchWorkItem { [weak self] in
+                guard let self, self.graphChangePending, !self.audioLifecycleMutationInProgress,
+                      sequence > self.graphEventsIgnoredThrough,
+                      DispatchTime.now() >= self.graphEventSuppressionUntil else {
+                    self?.emit("recovery_pending_event_discarded", "sequence=\(sequence)")
+                    return
+                }
+                self.graphChangePending = false
+                self.onFailure?(.configurationChanged)
+            }
+            self.graphChangeWorkItem = item
+            self.controlQueue.asyncAfter(deadline: .now() + .milliseconds(250), execute: item)
+        }
+    }
+
+    private func beginControlledGraphMutation() {
+        audioLifecycleMutationInProgress = true
+        graphChangeWorkItem?.cancel(); graphChangeWorkItem = nil; graphChangePending = false
+        graphEventsIgnoredThrough = graphEventSequence
+    }
+
+    private func finishControlledGraphMutation() {
+        audioLifecycleMutationInProgress = false
+        graphEventsIgnoredThrough = graphEventSequence
+        graphEventSuppressionUntil = .now() + .milliseconds(500)
     }
 
     private func validate(_ format: AVAudioFormat) throws { guard format.sampleRate > 0, format.channelCount > 0 else { throw CallFailure.audioFailed } }
@@ -553,6 +644,6 @@ final class AudioEngine: AudioEngineHandling, @unchecked Sendable {
     private func metricsDescription(_ metrics: PCMSignalMetrics) -> String { "frames=\(metrics.frameCount) rms=\(metrics.rms) peak=\(metrics.peak) nonzero=\(metrics.nonzeroCount)" }
     private func resetFirstFlags() { firstMicBufferReported = false; firstMicNonzeroReported = false; firstNetworkFrameReported = false; firstNetworkNonzeroReported = false; firstCaptureFailureReported = false; firstPlaybackScheduledReported = false; firstPlaybackNonzeroReported = false; firstPlaybackRenderedReported = false; firstPlaybackFailureReported = false; playbackOverflowReported = false; peakScheduledBuffers = 0; renderedBufferCount = 0 }
     private func reportCaptureFailure(_ error: NSError) { guard !firstCaptureFailureReported else { return }; firstCaptureFailureReported = true; emit("first_capture_conversion_failure", "failed", error: error); onFailure?(.captureConversion) }
-    private func reportPlaybackFailure(_ error: NSError) { guard !firstPlaybackFailureReported else { return }; firstPlaybackFailureReported = true; emit("first_playback_failure", "failed", error: error); onFailure?(.playbackConversion) }
+    private func reportPlaybackFailure(_ error: NSError) { guard !firstPlaybackFailureReported else { return }; firstPlaybackFailureReported = true; emit("playback_failure", "failed", error: error); emit("first_playback_failure", "failed", error: error); onFailure?(.playbackConversion) }
     private func emit(_ event: String, _ status: String, error: NSError? = nil) { onDiagnostic?(.init(event: event, status: status, errorDomain: error?.domain, errorCode: error?.code)) }
 }

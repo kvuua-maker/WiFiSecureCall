@@ -225,6 +225,7 @@ final class AudioPlayoutController: @unchecked Sendable {
     private var onDiagnostic: (@Sendable (AudioPlayoutDiagnostic) -> Void)?
     private var emitted = Set<String>()
     private var previousStats = JitterBufferStats()
+    private var activeEpoch: UUID?
 
     deinit {
         timer?.setEventHandler {}
@@ -232,6 +233,7 @@ final class AudioPlayoutController: @unchecked Sendable {
     }
 
     func start(
+        epoch: UUID,
         onFrame: @escaping @Sendable (Data) -> Void,
         onDiagnostic: @escaping @Sendable (AudioPlayoutDiagnostic) -> Void
     ) {
@@ -240,6 +242,7 @@ final class AudioPlayoutController: @unchecked Sendable {
             jitter = JitterBuffer()
             previousStats = jitter.stats
             emitted.removeAll(keepingCapacity: true)
+            activeEpoch = epoch
             self.onFrame = onFrame
             self.onDiagnostic = onDiagnostic
             let timer = DispatchSource.makeTimerSource(queue: queue)
@@ -251,9 +254,9 @@ final class AudioPlayoutController: @unchecked Sendable {
         }
     }
 
-    func insert(_ packet: AudioPacket) {
+    func insert(_ packet: AudioPacket, epoch: UUID) {
         queue.async { [weak self] in
-            guard let self else { return }
+            guard let self, self.activeEpoch == epoch else { return }
             self.jitter.insert(packet)
             self.reportCounterChanges()
         }
@@ -297,6 +300,7 @@ final class AudioPlayoutController: @unchecked Sendable {
         timer = nil
         onFrame = nil
         onDiagnostic = nil
+        activeEpoch = nil
         jitter.resetForReconnect()
     }
 }

@@ -35,16 +35,21 @@ import WatchKit
 
 struct WatchSystemDialerView: View {
     @Environment(\.dismiss) private var dismiss
-    @State private var number = ""
+    @State private var number: String
     @State private var showsInvalidNumber = false
 
     private let columns = Array(repeating: GridItem(.flexible(), spacing: 3), count: 3)
     private let digits: [Character] = ["1", "2", "3", "4", "5", "6", "7", "8", "9"]
 
+    init(initialNumber: String = "") {
+        let normalized = initialNumber.filter { $0.isNumber || $0 == "+" }
+        _number = State(initialValue: String(normalized.prefix(WatchSystemDialerNumber.maximumCharacterCount)))
+    }
+
     var body: some View {
         VStack(spacing: 2) {
             HStack(spacing: 4) {
-                Button("Close") { dismiss() }
+                Button("Закрити") { dismiss() }
                     .font(.caption2)
                     .buttonStyle(.plain)
                 Spacer(minLength: 2)
@@ -53,7 +58,7 @@ struct WatchSystemDialerView: View {
                     .buttonStyle(.plain)
             }
 
-            Text(number.isEmpty ? "Enter number" : number)
+            Text(number.isEmpty ? "Введіть номер" : number)
                 .font(.headline.monospacedDigit())
                 .lineLimit(1)
                 .minimumScaleFactor(0.5)
@@ -85,15 +90,18 @@ struct WatchSystemDialerView: View {
                 Button { callSystemPhone() } label: {
                     Image(systemName: "phone.fill")
                 }
-                .accessibilityLabel("Call")
+                .accessibilityLabel("Мобільний дзвінок")
+                .disabled(!WatchSystemDialerNumber.isValid(number))
                 .buttonStyle(.plain)
                 .frame(maxWidth: .infinity, minHeight: 24)
                 .background(RoundedRectangle(cornerRadius: 8).fill(.green))
             }
         }
         .padding(.horizontal, 3)
-        .alert("Invalid number", isPresented: $showsInvalidNumber) {
-            Button("OK", role: .cancel) { }
+        .alert("Не вдалося почати системний дзвінок", isPresented: $showsInvalidNumber) {
+            Button("Гаразд", role: .cancel) { }
+        } message: {
+            Text("Перевірте номер і доступність мобільних викликів на Apple Watch або зв’язаному iPhone.")
         }
     }
 
@@ -102,7 +110,10 @@ struct WatchSystemDialerView: View {
     }
 
     private func callSystemPhone() {
-        guard let url = WatchSystemDialerNumber.url(for: number), url.scheme == "tel" else {
+        guard
+            let url = WatchSystemDialerNumber.url(for: number),
+            url.scheme == "tel"
+        else {
             showsInvalidNumber = true
             return
         }
