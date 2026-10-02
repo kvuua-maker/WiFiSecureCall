@@ -255,6 +255,10 @@ final class AudioEngine: AudioEngineHandling, @unchecked Sendable {
     private var observers: [NSObjectProtocol] = []
     private var graphChangeWorkItem: DispatchWorkItem?
     private var graphChangePending = false
+    private var audioLifecycleMutationInProgress = false
+    private var graphEventSequence: UInt64 = 0
+    private var graphEventsIgnoredThrough: UInt64 = 0
+    private var graphEventSuppressionUntil = DispatchTime(uptimeNanoseconds: 0)
     private var graphUnavailableReportedGeneration: UInt64?
     private let transmitMute = TransmitMuteGate()
 
@@ -299,7 +303,13 @@ final class AudioEngine: AudioEngineHandling, @unchecked Sendable {
         }
     }
 
-    func start(muted: Bool) throws { try controlQueue.sync { try startOnControlQueue(muted: muted) } }
+    func start(muted: Bool) throws {
+        try controlQueue.sync {
+            beginControlledGraphMutation()
+            defer { finishControlledGraphMutation() }
+            try startOnControlQueue(muted: muted)
+        }
+    }
 
     var graphGeneration: UInt64 { playbackQueue.sync { audioGraphGeneration } }
 
@@ -349,7 +359,13 @@ final class AudioEngine: AudioEngineHandling, @unchecked Sendable {
         }
     }
 
-    func stop() { controlQueue.sync { cleanupGraph() } }
+    func stop() {
+        controlQueue.sync {
+            beginControlledGraphMutation()
+            defer { finishControlledGraphMutation() }
+            cleanupGraph()
+        }
+    }
 
     func play(_ payload: Data) {
         guard payload.count == Self.bytesPerFrame else { reportPlaybackFailure(NSError(domain: "WiFiSecureCall.AudioEngine", code: 30)); return }
@@ -579,17 +595,43 @@ final class AudioEngine: AudioEngineHandling, @unchecked Sendable {
     private func requestGraphRecovery(event: String, status: String) {
         controlQueue.async { [weak self] in
             guard let self else { return }
-            self.emit(event, status)
+            self.graphEventSequence &+= 1
+            let sequence = self.graphEventSequence
+            self.emit(event, "\(status) sequence=\(sequence)")
+            self.emit("recovery_request_source", "source=\(event)")
+            self.emit("recovery_event_sequence", "sequence=\(sequence)")
+            if self.audioLifecycleMutationInProgress || DispatchTime.now() < self.graphEventSuppressionUntil {
+                self.graphEventsIgnoredThrough = max(self.graphEventsIgnoredThrough, sequence)
+                self.emit("recovery_event_ignored_during_rebuild", "sequence=\(sequence) source=\(event)")
+                return
+            }
             self.graphChangePending = true
             self.graphChangeWorkItem?.cancel()
             let item = DispatchWorkItem { [weak self] in
-                guard let self, self.graphChangePending else { return }
+                guard let self, self.graphChangePending, !self.audioLifecycleMutationInProgress,
+                      sequence > self.graphEventsIgnoredThrough,
+                      DispatchTime.now() >= self.graphEventSuppressionUntil else {
+                    self?.emit("recovery_pending_event_discarded", "sequence=\(sequence)")
+                    return
+                }
                 self.graphChangePending = false
                 self.onFailure?(.configurationChanged)
             }
             self.graphChangeWorkItem = item
             self.controlQueue.asyncAfter(deadline: .now() + .milliseconds(250), execute: item)
         }
+    }
+
+    private func beginControlledGraphMutation() {
+        audioLifecycleMutationInProgress = true
+        graphChangeWorkItem?.cancel(); graphChangeWorkItem = nil; graphChangePending = false
+        graphEventsIgnoredThrough = graphEventSequence
+    }
+
+    private func finishControlledGraphMutation() {
+        audioLifecycleMutationInProgress = false
+        graphEventsIgnoredThrough = graphEventSequence
+        graphEventSuppressionUntil = .now() + .milliseconds(500)
     }
 
     private func validate(_ format: AVAudioFormat) throws { guard format.sampleRate > 0, format.channelCount > 0 else { throw CallFailure.audioFailed } }

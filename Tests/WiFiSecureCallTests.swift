@@ -1912,7 +1912,10 @@ final class WiFiSecureCallTests: XCTestCase {
 
         XCTAssertEqual(disposition, .preserveCall)
         XCTAssertEqual(session.state, .connecting(serverID))
-        XCTAssertFalse(capture.paths.contains { $0.hasSuffix("/end") || $0.hasSuffix("/cancel") || $0.hasSuffix("/reject") })
+        let callPath = "/calls/\(serverID.uuidString.lowercased())/"
+        XCTAssertFalse(capture.paths.contains {
+            $0.contains(callPath) && ($0.hasSuffix("/end") || $0.hasSuffix("/cancel") || $0.hasSuffix("/reject"))
+        })
     }
 
     @MainActor
@@ -2056,8 +2059,10 @@ final class WiFiSecureCallTests: XCTestCase {
         XCTAssertFalse(capture.diagnosticEvents.contains("audio_recovery_confirmed"))
 
         let sentBefore = media.sentPackets.count
-        audio.onFrame?(Data(repeating: 4, count: AudioEngine.bytesPerFrame))
-        media.onPacket?(AudioPacket(type: .audio, callID: serverID, sequence: 50, timestampMicroseconds: 1_000_000, payload: Data(repeating: 5, count: AudioEngine.bytesPerFrame)), epoch)
+        audio.onDiagnostic?(.init(event: "first_mic_callback", status: "silent", errorDomain: nil, errorCode: nil))
+        audio.onDiagnostic?(.init(event: "first_network_pcm_generated", status: "silent", errorDomain: nil, errorCode: nil))
+        audio.onFrame?(Data(repeating: 0, count: AudioEngine.bytesPerFrame))
+        media.onPacket?(AudioPacket(type: .audio, callID: serverID, sequence: 50, timestampMicroseconds: 1_000_000, payload: Data(repeating: 0, count: AudioEngine.bytesPerFrame)), epoch)
         audio.onDiagnostic?(.init(event: "first_playback_buffer_scheduled", status: "test", errorDomain: nil, errorCode: nil))
         audio.onDiagnostic?(.init(event: "first_playback_buffer_rendered", status: "test", errorDomain: nil, errorCode: nil))
         await eventually { media.sentPackets.count > sentBefore && capture.diagnosticEvents.contains("audio_recovery_confirmed") }
@@ -2068,7 +2073,7 @@ final class WiFiSecureCallTests: XCTestCase {
     }
 
     @MainActor
-    func testRepeatedRouteChangesDuringRecoveryProduceOnePendingRebuild() async throws {
+    func testConfirmedRecoveryDiscardsEventsCreatedDuringRebuild() async throws {
         let capture = RequestCapture(); capture.getState = .accepted
         let audio = AudioEngineMock(), media = MediaTransportMock()
         let session = makeSession(capture: capture, audio: audio, media: media)
@@ -2093,11 +2098,50 @@ final class WiFiSecureCallTests: XCTestCase {
         media.onPacket?(AudioPacket(type: .audio, callID: serverID, sequence: 51, timestampMicroseconds: 1_020_000, payload: Data(repeating: 7, count: AudioEngine.bytesPerFrame)), epoch)
         audio.onDiagnostic?(.init(event: "first_playback_buffer_scheduled", status: "test", errorDomain: nil, errorCode: nil))
         audio.onDiagnostic?(.init(event: "first_playback_buffer_rendered", status: "test", errorDomain: nil, errorCode: nil))
-        await eventually { media.sentPackets.count > sentBefore && audio.startCount == 3 }
-        try? await Task.sleep(nanoseconds: 350_000_000)
+        await eventually { media.sentPackets.count > sentBefore && capture.diagnosticEvents.contains("audio_recovery_confirmed") }
+        try? await Task.sleep(nanoseconds: 2_200_000_000)
 
-        XCTAssertEqual(audio.startCount, 3)
+        XCTAssertEqual(audio.startCount, 2)
         XCTAssertFalse(session.state.isTerminal)
+        XCTAssertTrue(capture.diagnosticEvents.contains("recovery_event_ignored_during_rebuild"))
+        XCTAssertFalse(capture.diagnosticEvents.contains("audio_recovery_exhausted"))
+    }
+
+    @MainActor
+    func testRecoveryValidationTimeoutWithLiveMediaProgressPreservesActiveCall() async throws {
+        let capture = RequestCapture(); capture.getState = .accepted
+        let audio = AudioEngineMock(), media = MediaTransportMock()
+        let session = makeSession(capture: capture, audio: audio, media: media)
+        let adapter = RetainedCallKitMock(); session.attach(callKit: adapter)
+        await session.startCall()
+        let localID = try XCTUnwrap(adapter.startedIDs.first), serverID = try XCTUnwrap(session.state.callID)
+        try await adapter.approveStart(localID)
+        await eventually { if case .connecting = session.state { return true }; return false }
+        adapter.onAudioActivated?(localID)
+        await eventually { audio.startCount == 1 && !media.connectionIDs.isEmpty }
+        let epoch = try XCTUnwrap(media.connectionIDs.last)
+        media.onPeerReady?(serverID, epoch)
+        establishAudioFlow(audio: audio, media: media, callID: serverID, epoch: epoch)
+        await eventually { session.state == .active(serverID) }
+
+        audio.onFailure?(.configurationChanged)
+        await eventually { audio.startCount == 2 }
+        let sentBefore = media.sentPackets.count
+        audio.onDiagnostic?(.init(event: "first_mic_callback", status: "silent", errorDomain: nil, errorCode: nil))
+        audio.onDiagnostic?(.init(event: "first_network_pcm_generated", status: "silent", errorDomain: nil, errorCode: nil))
+        audio.onFrame?(Data(repeating: 0, count: AudioEngine.bytesPerFrame))
+        media.onPacket?(AudioPacket(type: .audio, callID: serverID, sequence: 70, timestampMicroseconds: 1_400_000, payload: Data(repeating: 0, count: AudioEngine.bytesPerFrame)), epoch)
+        audio.onDiagnostic?(.init(event: "first_playback_buffer_scheduled", status: "test", errorDomain: nil, errorCode: nil))
+        await eventually { media.sentPackets.count > sentBefore }
+        try? await Task.sleep(nanoseconds: 2_200_000_000)
+
+        XCTAssertEqual(session.state, .active(serverID))
+        let callPath = "/calls/\(serverID.uuidString.lowercased())/"
+        XCTAssertFalse(capture.paths.contains {
+            $0.contains(callPath) && ($0.hasSuffix("/end") || $0.hasSuffix("/cancel"))
+        })
+        XCTAssertTrue(capture.diagnosticEvents(for: serverID).contains("audio_recovery_degraded_call_preserved"))
+        XCTAssertFalse(capture.diagnosticEvents(for: serverID).contains("audio_recovery_exhausted"))
     }
 
     @MainActor
@@ -2290,6 +2334,7 @@ final class WiFiSecureCallTests: XCTestCase {
         XCTAssertEqual(audio.startCount, 4)
         XCTAssertGreaterThanOrEqual(capture.paths.filter { $0.hasSuffix("/end") }.count, 1)
         XCTAssertFalse(capture.paths.contains { $0.hasSuffix("/cancel") })
+        await eventually { capture.diagnosticEvents.contains("audio_recovery_exhausted") }
         XCTAssertTrue(capture.diagnosticEvents.contains("audio_recovery_exhausted"))
     }
 
@@ -2722,6 +2767,7 @@ private final class RequestCapture: @unchecked Sendable {
     private var _createdCallID: UUID?
     private var _callKitDiagnostic: [String: Any]?
     private var _diagnosticEvents: [String] = []
+    private var _diagnosticEventsByCallID: [UUID: [String]] = [:]
     var mutationState: ServerCallState = .ended
     var getState: ServerCallState = .ringing
     var getError: Error?
@@ -2738,6 +2784,9 @@ private final class RequestCapture: @unchecked Sendable {
     var createdCallID: UUID? { lock.withLock { _createdCallID } }
     var callKitDiagnostic: [String: Any]? { lock.withLock { _callKitDiagnostic } }
     var diagnosticEvents: [String] { lock.withLock { _diagnosticEvents } }
+    func diagnosticEvents(for callID: UUID) -> [String] {
+        lock.withLock { _diagnosticEventsByCallID[callID] ?? [] }
+    }
 
     func handle(_ request: URLRequest) throws -> (HTTPURLResponse, Data) {
         onRequest?(request)
@@ -2746,7 +2795,14 @@ private final class RequestCapture: @unchecked Sendable {
         let requestBody = bodyData(from: request)
         if path.hasSuffix("/devices/diagnostics"), let body = requestBody,
            let value = try JSONSerialization.jsonObject(with: body) as? [String: Any] {
-            if let event = value["event"] as? String { lock.withLock { _diagnosticEvents.append(event) } }
+            if let event = value["event"] as? String {
+                lock.withLock {
+                    _diagnosticEvents.append(event)
+                    if let rawCallID = value["callID"] as? String, let callID = UUID(uuidString: rawCallID) {
+                        _diagnosticEventsByCallID[callID, default: []].append(event)
+                    }
+                }
+            }
             if value["event"] as? String == "callkit_error" {
                 lock.withLock { _callKitDiagnostic = value }
             }
