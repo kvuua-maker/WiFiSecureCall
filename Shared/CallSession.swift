@@ -512,6 +512,42 @@ final class CallSession: ObservableObject {
             recordRuntimeDiagnostic("system_end_duplicate_preserved_during_connecting", status: "preserved", callID: current.serverCallID)
             return .preserveCall
         }
+
+        if origin == .system, serverCallAccepted, state.isAcceptedLifecycle,
+           activeCallKitUUID == localID, transportActive {
+            let expectedEpoch = mediaEpoch
+            let baseline = audioProgress
+            let graceDeadline = min(Date().addingTimeInterval(1), deadline.addingTimeInterval(-0.25))
+            recordRuntimeDiagnostic("system_end_reconcile_started", status: "origin=system", callID: current.serverCallID)
+            repeat {
+                do {
+                    let response = try await callSignaling.rawCall(current.serverCallID)
+                    guard isCurrent(current), activeCallKitUUID == localID,
+                          mediaEpoch == expectedEpoch, response.callID == current.serverCallID else { throw CancellationError() }
+                    recordRuntimeDiagnostic("system_end_reconcile_server_state", status: "state=\(response.state.rawValue)", callID: current.serverCallID)
+                    if response.state != .accepted {
+                        await remoteTerminal(response, generation: current)
+                        return .ended
+                    }
+                    if audioProgress.sent > baseline.sent || audioProgress.received > baseline.received ||
+                        audioProgress.scheduled > baseline.scheduled || audioProgress.rendered > baseline.rendered {
+                        recordRuntimeDiagnostic("system_end_preserved_after_accept", status: "state=accepted", callID: current.serverCallID)
+                        return .preserveCall
+                    }
+                } catch is CancellationError { throw CancellationError() }
+                catch {
+                    guard isCurrent(current), activeCallKitUUID == localID, mediaEpoch == expectedEpoch else { throw CancellationError() }
+                    recordRuntimeDiagnostic("system_end_reconcile_server_state", status: "state=transient", callID: current.serverCallID)
+                }
+                guard Date() < graceDeadline else { break }
+                try? await Task.sleep(nanoseconds: 150_000_000)
+            } while Date() < graceDeadline
+            guard isCurrent(current), activeCallKitUUID == localID, mediaEpoch == expectedEpoch else { throw CancellationError() }
+            if audioOperational {
+                recordRuntimeDiagnostic("system_end_preserved_after_accept", status: "state=accepted", callID: current.serverCallID)
+                return .preserveCall
+            }
+        }
         if suppressedSystemEndDuringAcceptance,
            acceptanceSystemEndProtectionDeadline.map({ Date() >= $0 }) == true {
             suppressedSystemEndDuringAcceptance = false
@@ -718,17 +754,12 @@ final class CallSession: ObservableObject {
             guard let self, self.isCurrent(current), self.awaitingCallKitReactivation,
                   self.activatedCallKitUUID == nil, self.callKitActivationEpoch == expectedActivation,
                   self.state.isAcceptedLifecycle else { return }
-            if self.isOutgoingCall {
-                await self.startCallKitContinuation(current)
-            } else {
-                self.recordRuntimeDiagnostic("callkit_reactivation_failed", status: "reason=timeout", callID: current.serverCallID)
-                await self.fail(current, .callKitReactivationFailed)
-            }
+            await self.startCallKitContinuation(current)
         }
     }
 
     private func startCallKitContinuation(_ current: CallGeneration) async {
-        guard isCurrent(current), isOutgoingCall, state.isAcceptedLifecycle, serverCallAccepted,
+        guard isCurrent(current), state.isAcceptedLifecycle, serverCallAccepted,
               !callKitContinuationAttempted, let callKit else { return }
         callKitContinuationAttempted = true
         let newLocalID = distinctLocalCallKitUUID(from: current.serverCallID)
@@ -765,6 +796,10 @@ final class CallSession: ObservableObject {
     private func providerReset(localID: UUID?) {
         guard let current = generation, let localID, current.localCallKitUUID == localID else { return }
         recordRuntimeDiagnostic("provider_reset", status: "current_generation", callID: current.serverCallID)
+        if state.isAcceptedLifecycle {
+            didDeactivate(localID: localID)
+            return
+        }
         guard let callSignaling = try? signaling(for: current) else { return }
         let mutation = terminalMutationForCurrentState()
         recordRuntimeDiagnostic("terminal_mutation", status: "mutation=\(mutation.rawValue) reason=provider_reset", callID: current.serverCallID)
@@ -1148,7 +1183,8 @@ final class CallSession: ObservableObject {
     }
 
     private func reportOutgoingConnectedIfNeeded(_ current: CallGeneration) {
-        guard isCurrent(current), isOutgoingCall, !outgoingConnectedReported else { return }
+        guard isCurrent(current), (isOutgoingCall || continuationCallKitUUID == current.localCallKitUUID),
+              !outgoingConnectedReported else { return }
         outgoingConnectedReported = true
         callKit?.reportOutgoingConnected(id: current.localCallKitUUID)
         recordRuntimeDiagnostic("outgoing_connected_reported", status: "success", callID: current.serverCallID)
@@ -1157,9 +1193,12 @@ final class CallSession: ObservableObject {
     private func beginAudioFlowWatchdog(_ current: CallGeneration) {
         audioFlowWatchdog?.cancel()
         let baseline = audioProgress
+        let expectedEpoch = mediaEpoch
+        let expectedActivation = callKitActivationEpoch
         audioFlowWatchdog = Task { [weak self] in
             do { try await Task.sleep(nanoseconds: 5_000_000_000) } catch { return }
-            guard let self, self.isCurrent(current), self.transportActive else { return }
+            guard let self, self.isCurrent(current), self.transportActive,
+                  self.mediaEpoch == expectedEpoch, self.callKitActivationEpoch == expectedActivation else { return }
             self.recordRuntimeDiagnostic(
                 "audio_flow_progress",
                 status: "sent=\(self.audioProgress.sent) received=\(self.audioProgress.received) scheduled=\(self.audioProgress.scheduled) rendered=\(self.audioProgress.rendered)",
