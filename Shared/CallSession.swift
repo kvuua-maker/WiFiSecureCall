@@ -107,6 +107,7 @@ final class CallSession: ObservableObject {
     private var serverCallCreated = false
     private var serverCallAccepted = false
     private var suppressedSystemEndDuringAcceptance = false
+    private var acceptanceSystemEndProtectionDeadline: Date?
     private var sequence: UInt64 = 0
     private var callAudioCryptor: CallAudioCryptor?
     private var callHistoryRecordID: UUID?
@@ -470,13 +471,7 @@ final class CallSession: ObservableObject {
             if response.state == .accepted { await compensateAfterAccept(current, signaling: callSignaling) }
             throw response.state == .expired ? CallFailure.callExpired : CallFailure.invalidServerState
         }
-        try configureAcceptedEncryption(response, signaling: callSignaling)
-        mediaToken = token
-        serverCallAccepted = true
-        suppressedSystemEndDuringAcceptance = true
-        transition(.connecting(current.serverCallID))
-        beginActivationWatchdog(current)
-        startTerminalObserver(current)
+        try enterVerifiedAcceptedConnecting(response, signaling: callSignaling, current: current)
     }
 
     private func performEnd(localID: UUID, deadline: Date, origin: CallEndRequestOrigin) async throws -> CallEndDisposition {
@@ -487,31 +482,31 @@ final class CallSession: ObservableObject {
 
         if origin == .system, suppressedSystemEndDuringAcceptance, serverCallAccepted,
            case let .connecting(callID) = state, callID == current.serverCallID,
-           !transportActive, activeCallKitUUID == localID {
+           !audioOperational, activeCallKitUUID == localID,
+           let protectionDeadline = acceptanceSystemEndProtectionDeadline,
+           Date() < protectionDeadline {
             recordRuntimeDiagnostic("system_end_duplicate_preserved_during_connecting", status: "preserved", callID: current.serverCallID)
             return .preserveCall
+        }
+        if suppressedSystemEndDuringAcceptance,
+           acceptanceSystemEndProtectionDeadline.map({ Date() >= $0 }) == true {
+            suppressedSystemEndDuringAcceptance = false
+            acceptanceSystemEndProtectionDeadline = nil
         }
 
         if origin == .system, config.role == .B, isOutgoingCall {
             if case .outgoingRinging = state {
                 recordRuntimeDiagnostic("system_end_reconcile_started", status: "started", callID: current.serverCallID)
                 do {
-                    let response = try await callSignaling.call(current.serverCallID)
+                    let response = serverCallAccepted
+                        ? try await verifiedAcceptedResponse(callSignaling, current: current, deadline: deadline)
+                        : try await callSignaling.call(current.serverCallID)
                     guard isCurrent(current), response.callID == current.serverCallID else { throw CancellationError() }
                     switch response.state {
                     case .accepted:
-                        guard let token = response.mediaToken, !token.isEmpty else {
-                            recordRuntimeDiagnostic("system_end_reconcile_result", status: "failed", callID: current.serverCallID)
-                            break
-                        }
-                        try configureAcceptedEncryption(response, signaling: callSignaling)
-                        recordRuntimeDiagnostic("system_end_reconcile_result", status: "accepted", callID: current.serverCallID)
-                        mediaToken = token
                         serverCallAccepted = true
-                        suppressedSystemEndDuringAcceptance = true
-                        transition(.connecting(current.serverCallID))
-                        beginActivationWatchdog(current)
-                        startTerminalObserver(current)
+                        try enterVerifiedAcceptedConnecting(response, signaling: callSignaling, current: current)
+                        recordRuntimeDiagnostic("system_end_reconcile_result", status: "accepted", callID: current.serverCallID)
                         startMediaIfReady(current)
                         recordRuntimeDiagnostic("system_end_preserved_after_remote_accept", status: "accepted", callID: current.serverCallID)
                         return .preserveCall
@@ -525,11 +520,18 @@ final class CallSession: ObservableObject {
                 } catch {
                     guard isCurrent(current) else { throw error }
                     recordRuntimeDiagnostic("system_end_reconcile_result", status: "failed", callID: current.serverCallID, domain: (error as NSError).domain, code: (error as NSError).code)
+                    if serverCallAccepted {
+                        terminalRequestID = terminalRequestID ?? UUID()
+                        registerTerminalCompensation(current, mutation: .end, signaling: callSignaling)
+                        await fail(current, .invalidServerState)
+                        return .ended
+                    }
                 }
             }
         }
 
         suppressedSystemEndDuringAcceptance = false
+        acceptanceSystemEndProtectionDeadline = nil
         let mutation = terminalMutationForCurrentState()
         terminalMutation = mutation
         terminalRequestID = terminalRequestID ?? UUID()
@@ -640,9 +642,9 @@ final class CallSession: ObservableObject {
                               verified.state == .accepted, let token = verified.mediaToken, !token.isEmpty else {
                             await self.fail(current, .invalidServerState); return
                         }
-                        do { try self.configureAcceptedEncryption(verified, signaling: signaling) }
+                        do { try self.enterVerifiedAcceptedConnecting(verified, signaling: signaling, current: current) }
                         catch { await self.fail(current, .invalidServerState); return }
-                        self.mediaToken = token; self.serverCallAccepted = true; self.transition(.connecting(current.serverCallID)); self.beginActivationWatchdog(current); self.startTerminalObserver(current); return
+                        return
                     case .ringing: break
                     default: await self.remoteTerminal(response, generation: current); return
                     }
@@ -709,7 +711,6 @@ final class CallSession: ObservableObject {
         }
         peerWatchdog?.cancel()
         transportActive = true
-        suppressedSystemEndDuringAcceptance = false
         recordRuntimeDiagnostic("media_peer_ready", status: "ready", callID: callID)
         beginAudioFlowWatchdog(current)
     }
@@ -964,6 +965,8 @@ final class CallSession: ObservableObject {
         let wasOperational = audioOperational
         audioOperational = audioFlow.isOperational(transportActive: transportActive)
         if audioOperational, !wasOperational, let callID = generation?.serverCallID {
+            suppressedSystemEndDuringAcceptance = false
+            acceptanceSystemEndProtectionDeadline = nil
             recordRuntimeDiagnostic("audio_operational", status: "transport=ready audio=ready", callID: callID)
             if let current = generation {
                 if state != .active(callID) {
@@ -1165,7 +1168,7 @@ final class CallSession: ObservableObject {
         audio.onMuteChanged = { value in events?.yield(.muteChanged(next.id, value)) }
         callAudioCryptor?.erase(); callAudioCryptor = nil
         mediaToken = nil; mediaEpoch = nil; pendingPeerReadyEpochs.removeAll(keepingCapacity: false); createRequestID = nil; acceptRequestID = nil; terminalRequestID = nil; terminalMutation = nil
-        activatedCallKitUUID = nil; audioStartedForCallKitUUID = nil; serverCallCreated = false; serverCallAccepted = false; suppressedSystemEndDuringAcceptance = false; sequence = 0; isMuted = false; elapsedSeconds = 0
+        activatedCallKitUUID = nil; audioStartedForCallKitUUID = nil; serverCallCreated = false; serverCallAccepted = false; suppressedSystemEndDuringAcceptance = false; acceptanceSystemEndProtectionDeadline = nil; sequence = 0; isMuted = false; elapsedSeconds = 0
         firstSentFrameReported = false; firstRemoteFrameReported = false; firstSendFailureReported = false
         transportActive = false; audioOperational = false; audioFlow = AudioFlowMilestones(); audioRecoveryBudget = AudioRecoveryBudget()
         audioProgress = AudioProgressCounters(); decryptFailureCount = 0
@@ -1177,7 +1180,7 @@ final class CallSession: ObservableObject {
         if let expected, generation != expected { return }
         cancelCallTasks(); sendContinuation?.finish(); sendContinuation = nil; sendStream = nil; sendTask?.cancel(); sendTask = nil
         activeSignaling?.eraseSecrets(); callAudioCryptor?.erase(); callAudioCryptor = nil
-        generation = nil; activeSignaling = nil; activeCallKitUUID = nil; mediaEpoch = nil; mediaToken = nil; isOutgoingCall = false; callKitReported = false; incomingCallerName = nil; suppressedSystemEndDuringAcceptance = false
+        generation = nil; activeSignaling = nil; activeCallKitUUID = nil; mediaEpoch = nil; mediaToken = nil; isOutgoingCall = false; callKitReported = false; incomingCallerName = nil; suppressedSystemEndDuringAcceptance = false; acceptanceSystemEndProtectionDeadline = nil
         callHistoryRecordID = nil
     }
 
@@ -1190,6 +1193,26 @@ final class CallSession: ObservableObject {
             callAudioCryptor?.erase()
             callAudioCryptor = nil
         }
+    }
+
+    private func enterVerifiedAcceptedConnecting(
+        _ response: CallSignalView,
+        signaling: any CallSignaling,
+        current: CallGeneration
+    ) throws {
+        guard isCurrent(current), response.callID == current.serverCallID,
+              response.state == .accepted, let token = response.mediaToken, !token.isEmpty else {
+            throw CallFailure.invalidServerState
+        }
+        try configureAcceptedEncryption(response, signaling: signaling)
+        guard isCurrent(current) else { throw CancellationError() }
+        mediaToken = token
+        serverCallAccepted = true
+        suppressedSystemEndDuringAcceptance = true
+        acceptanceSystemEndProtectionDeadline = Date().addingTimeInterval(CallTimeouts.audioActivation + CallTimeouts.initialMedia)
+        transition(.connecting(current.serverCallID))
+        beginActivationWatchdog(current)
+        startTerminalObserver(current)
     }
 
     private func cancelCallTasks() {

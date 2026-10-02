@@ -1529,14 +1529,13 @@ final class WiFiSecureCallTests: XCTestCase {
         adapter.startError = NSError(domain: "CallKitUnitTest", code: 42)
         let session = CallSession(config: config, audio: AudioEngineMock())
         session.attach(callKit: adapter)
-        let eventCount = Diagnostics.shared.events.count
-
         await session.startCall()
 
-        guard case .failed(_, .callKitRejected) = session.state else {
+        guard case let .failed(callID, .callKitRejected) = session.state else {
             return XCTFail("Expected callKitRejected terminal state")
         }
-        XCTAssertTrue(Diagnostics.shared.events.dropFirst(eventCount).contains {
+        XCTAssertTrue(Diagnostics.shared.events.contains {
+            $0.callID == callID &&
             $0.category == "callKitError" &&
             $0.value == "stage=startOutgoing domain=CallKitUnitTest code=42"
         })
@@ -1841,20 +1840,17 @@ final class WiFiSecureCallTests: XCTestCase {
     }
 
     @MainActor
-    func testIncomingWatchSystemEndAfterPeerReadyEndsNormally() async throws {
+    func testIncomingWatchSystemEndAfterPeerReadyBeforeAudioOperationalIsPreserved() async throws {
         let capture = RequestCapture(); capture.mutationState = .accepted
         let (session, adapter, serverID, localID, _, media) = try await prepareIncomingAcceptedWatch(capture: capture, activateAudio: true)
         let epoch = try XCTUnwrap(media.connectionIDs.last)
         media.onPeerReady?(serverID, epoch)
         await eventually { capture.diagnosticEvents.contains("media_peer_ready") }
-        capture.mutationState = .ended
-
         let disposition = try await adapter.approveEnd(localID, origin: .system)
-        await eventually { capture.paths.contains { $0.hasSuffix("/end") } }
 
-        XCTAssertEqual(disposition, .ended)
-        XCTAssertTrue(session.state.isTerminal)
-        XCTAssertEqual(capture.paths.filter { $0.hasSuffix("/end") }.count, 1)
+        XCTAssertEqual(disposition, .preserveCall)
+        XCTAssertEqual(session.state, .connecting(serverID))
+        XCTAssertFalse(capture.paths.contains { $0.hasSuffix("/end") || $0.hasSuffix("/cancel") || $0.hasSuffix("/reject") })
     }
 
     @MainActor
@@ -4083,6 +4079,61 @@ final class SecureRingingUpgradeRegressionTests: XCTestCase {
         XCTAssertGreaterThanOrEqual(signaling.verifiedAcceptedCount, 2)
         XCTAssertTrue(session.isEndToEndEncryptedMedia)
         XCTAssertTrue(signaling.terminalMutations.isEmpty)
+    }
+
+    func testOutgoingIPhoneVerifiedAcceptedSystemEndBeforeAudioOperationalIsPreserved() async throws {
+        let signaling = RingingUpgradeSignaling(hasVerifiedKeys: true, kind: "caller-preserve")
+        let session = CallSession(config: config(), audio: AudioEngineMock(), media: MediaTransportMock())
+        let adapter = RetainedCallKitMock(); session.attach(callKit: adapter)
+        await session.startCall(signaling: signaling)
+        let localID = try XCTUnwrap(adapter.startedIDs.first)
+        try await adapter.approveStart(localID)
+        await waitUntil { if case .connecting = session.state { return true }; return false }
+
+        let disposition = try await adapter.approveEnd(localID, origin: .system)
+
+        XCTAssertEqual(disposition, .preserveCall)
+        XCTAssertFalse(session.state.isTerminal)
+        XCTAssertTrue(signaling.terminalMutations.isEmpty)
+        XCTAssertTrue(session.isEndToEndEncryptedMedia)
+    }
+
+    func testOutgoingIPhonePeerReadyWithoutAudioStillPreservesSystemEnd() async throws {
+        let signaling = RingingUpgradeSignaling(hasVerifiedKeys: true, kind: "caller-peer-ready")
+        let audio = AudioEngineMock(), media = MediaTransportMock()
+        let session = CallSession(config: config(), audio: audio, media: media)
+        let adapter = RetainedCallKitMock(); session.attach(callKit: adapter)
+        await session.startCall(signaling: signaling)
+        let localID = try XCTUnwrap(adapter.startedIDs.first)
+        try await adapter.approveStart(localID)
+        await waitUntil { if case .connecting = session.state { return true }; return false }
+        adapter.onAudioActivated?(localID)
+        await waitUntil { !media.connectionIDs.isEmpty }
+        let callID = try XCTUnwrap(session.state.callID)
+        media.onPeerReady?(callID, try XCTUnwrap(media.connectionIDs.last))
+        await waitUntil { media.connectedCallIDs.contains(callID) }
+
+        let disposition = try await adapter.approveEnd(localID, origin: .system)
+
+        XCTAssertEqual(disposition, .preserveCall)
+        XCTAssertFalse(session.state.isTerminal)
+        XCTAssertTrue(signaling.terminalMutations.isEmpty)
+    }
+
+    func testOutgoingIPhoneAppRequestedEndDuringVerifiedConnectingSendsEnd() async throws {
+        let signaling = RingingUpgradeSignaling(hasVerifiedKeys: true, kind: "caller-app-end")
+        let session = CallSession(config: config(), audio: AudioEngineMock(), media: MediaTransportMock())
+        let adapter = RetainedCallKitMock(); session.attach(callKit: adapter)
+        await session.startCall(signaling: signaling)
+        let localID = try XCTUnwrap(adapter.startedIDs.first)
+        try await adapter.approveStart(localID)
+        await waitUntil { if case .connecting = session.state { return true }; return false }
+
+        let disposition = try await adapter.approveEnd(localID, origin: .appRequested)
+        await waitUntil { signaling.terminalMutations.contains(.end) }
+
+        XCTAssertEqual(disposition, .ended)
+        XCTAssertEqual(signaling.terminalMutations, [.end])
     }
 
     func testTerminalStateDuringAcceptedVerificationRetryStopsWithoutMedia() async throws {
