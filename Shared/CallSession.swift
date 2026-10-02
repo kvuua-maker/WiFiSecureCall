@@ -473,6 +473,7 @@ final class CallSession: ObservableObject {
         try configureAcceptedEncryption(response, signaling: callSignaling)
         mediaToken = token
         serverCallAccepted = true
+        suppressedSystemEndDuringAcceptance = true
         transition(.connecting(current.serverCallID))
         beginActivationWatchdog(current)
         startTerminalObserver(current)
@@ -484,12 +485,14 @@ final class CallSession: ObservableObject {
         let originStatus = origin == .appRequested ? "appRequested" : "system"
         recordRuntimeDiagnostic("callkit_end_action_received", status: "origin=\(originStatus) state=\(String(describing: state))", callID: current.serverCallID)
 
+        if origin == .system, suppressedSystemEndDuringAcceptance, serverCallAccepted,
+           case let .connecting(callID) = state, callID == current.serverCallID,
+           !transportActive, activeCallKitUUID == localID {
+            recordRuntimeDiagnostic("system_end_duplicate_preserved_during_connecting", status: "preserved", callID: current.serverCallID)
+            return .preserveCall
+        }
+
         if origin == .system, config.role == .B, isOutgoingCall {
-            if suppressedSystemEndDuringAcceptance, serverCallAccepted,
-               case .connecting = state, !transportActive {
-                recordRuntimeDiagnostic("system_end_duplicate_preserved_during_connecting", status: "preserved", callID: current.serverCallID)
-                return .preserveCall
-            }
             if case .outgoingRinging = state {
                 recordRuntimeDiagnostic("system_end_reconcile_started", status: "started", callID: current.serverCallID)
                 do {
