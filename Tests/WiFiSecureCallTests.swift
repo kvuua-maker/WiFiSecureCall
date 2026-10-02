@@ -7,6 +7,14 @@ import UserNotifications
 import XCTest
 
 final class WatchSystemDialerNumberTests: XCTestCase {
+    func testProductionDialerUsesDirectSystemURLWithoutCoordinatorPreflight() throws {
+        let root = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent()
+        let source = try String(contentsOf: root.appendingPathComponent("Watch/WatchSystemDialerView.swift"), encoding: .utf8)
+        XCTAssertTrue(source.contains("WKApplication.shared().openSystemURL(url)"))
+        XCTAssertFalse(source.contains("coordinator.prepareAndDial"))
+        XCTAssertFalse(source.contains("@StateObject private var coordinator"))
+    }
+
     func testValidSystemDialerNumbers() {
         XCTAssertTrue(WatchSystemDialerNumber.isValid("+380501234567"))
         XCTAssertTrue(WatchSystemDialerNumber.isValid("380501234567"))

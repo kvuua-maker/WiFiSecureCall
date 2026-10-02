@@ -37,7 +37,6 @@ struct WatchSystemDialerView: View {
     @Environment(\.dismiss) private var dismiss
     @State private var number: String
     @State private var showsInvalidNumber = false
-    @StateObject private var coordinator = WatchSystemDialCoordinator.shared
 
     private let columns = Array(repeating: GridItem(.flexible(), spacing: 3), count: 3)
     private let digits: [Character] = ["1", "2", "3", "4", "5", "6", "7", "8", "9"]
@@ -89,10 +88,10 @@ struct WatchSystemDialerView: View {
                     .background(RoundedRectangle(cornerRadius: 8).fill(.gray.opacity(0.28)))
 
                 Button { callSystemPhone() } label: {
-                    if coordinator.isPreparing { ProgressView() } else { Image(systemName: "phone.fill") }
+                    Image(systemName: "phone.fill")
                 }
                 .accessibilityLabel("Мобільний дзвінок")
-                .disabled(!WatchSystemDialerNumber.isValid(number) || coordinator.isPreparing)
+                .disabled(!WatchSystemDialerNumber.isValid(number))
                 .buttonStyle(.plain)
                 .frame(maxWidth: .infinity, minHeight: 24)
                 .background(RoundedRectangle(cornerRadius: 8).fill(.green))
@@ -104,7 +103,6 @@ struct WatchSystemDialerView: View {
         } message: {
             Text("Перевірте номер і доступність мобільних викликів на Apple Watch або зв’язаному iPhone.")
         }
-        .onAppear { coordinator.activate() }
     }
 
     private func append(_ value: Character) {
@@ -112,11 +110,14 @@ struct WatchSystemDialerView: View {
     }
 
     private func callSystemPhone() {
-        guard let url = WatchSystemDialerNumber.url(for: number), url.scheme == "tel" else {
+        guard
+            let url = WatchSystemDialerNumber.url(for: number),
+            url.scheme == "tel"
+        else {
             showsInvalidNumber = true
             return
         }
-        Task { await coordinator.prepareAndDial(number: number, url: url) }
+        WKApplication.shared().openSystemURL(url)
     }
 }
 #endif
