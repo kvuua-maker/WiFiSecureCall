@@ -24,8 +24,8 @@ struct DiagnosticEvent: Codable, Sendable, Identifiable {
 final class Diagnostics: ObservableObject {
     static let shared = Diagnostics()
     @Published private(set) var events: [DiagnosticEvent] = []
-    private let capacity = 500
-    private let persistedCapacity = 300
+    private let capacity = 600
+    private let persistedCapacity = 400
     private let retention: TimeInterval = 7 * 24 * 60 * 60
     private let defaults: UserDefaults
     private let storageKey = "WiFiSecureCall.safeCallDiagnostics.v1"
@@ -43,8 +43,16 @@ final class Diagnostics: ObservableObject {
         #else
         let platform = "iOS"
         #endif
+        if category == "playback_frame_scheduled" || category == "playback_frame_rendered",
+           events.contains(where: { $0.callID == callID && $0.category == category && $0.value == value }) { return }
         events.append(.init(timestamp: Date(), platform: platform, role: role, callID: callID, category: category, value: value))
-        if events.count > capacity { events.removeFirst(events.count - capacity) }
+        while events.count > capacity {
+            if let progress = events.firstIndex(where: { $0.category == "audio_flow_progress" || $0.category == "playback_render_progress" }) {
+                events.remove(at: progress)
+            } else {
+                events.removeFirst()
+            }
+        }
         persistSafeEvents()
     }
 
@@ -68,13 +76,16 @@ final class Diagnostics: ObservableObject {
         "audio_recovery_validation_timeout", "audio_recovery_exhausted",
         "playback_frame_scheduled", "playback_frame_rendered", "playback_failure",
         "playback_graph_unavailable", "media_disconnect_reason", "media_reconnect_started",
-        "media_reconnect_succeeded", "call_failed_reason"
+        "media_reconnect_succeeded", "media_reconnect_exhausted", "call_failed_reason",
+        "callkit_end_received", "system_end_reconcile_started", "system_end_reconcile_server_state",
+        "system_end_preserved_after_accept", "terminal_mutation", "provider_reset",
+        "callkit_did_deactivate", "callkit_did_activate"
     ]
 
     private static let metricKeys: Set<String> = [
         "bytes", "rms", "peak", "nonzero", "sequence", "count", "frames",
         "frameLength", "sampleRate", "channelCount", "depth",
-        "sent", "received", "rendered", "relayed", "dropped", "generation", "attempt",
+        "sent", "received", "scheduled", "rendered", "relayed", "dropped", "generation", "attempt",
         "reason", "code"
     ]
 
@@ -97,12 +108,25 @@ final class Diagnostics: ObservableObject {
                                 "targetAmbiguous", "answeredElsewhere"])
         let mediaReasons = Set(["remoteClosed", "authFailed", "protocolViolation", "serverRestart",
                                 "transientNetwork", "sendFailed", "peerUnavailable", "localClose"])
+        let safeWords = event.value.split(separator: " ").compactMap { field -> String? in
+            let parts = field.split(separator: "=", maxSplits: 1).map(String.init)
+            guard parts.count == 2 else { return nil }
+            let allowed: [String: Set<String>] = [
+                "origin": ["system", "appRequested"],
+                "state": ["ringing", "accepted", "terminal", "transient"],
+                "mutation": ["end", "cancel", "reject"],
+                "reason": ["explicit_user_end", "system_end", "provider_reset", "audio_recovery_exhausted", "media_reconnect_exhausted", "accepted_verification_failed", "local_failure", "networkLost"]
+            ]
+            guard allowed[parts[0]]?.contains(parts[1]) == true else { return nil }
+            return field.description
+        }
         let safeReason: String?
         if event.category == "call_failed_reason", callFailures.contains(event.value) { safeReason = event.value }
         else if event.category == "media_disconnect_reason",
                 let value = event.value.split(separator: "=").last.map(String.init), mediaReasons.contains(value) { safeReason = value }
         else { safeReason = nil }
-        let detail = safeState ?? safeReason ?? (numeric.isEmpty ? "подія" : numeric.prefix(8).joined(separator: " "))
+        let safeFields = Array((safeWords + numeric).prefix(8))
+        let detail = safeState ?? safeReason ?? (safeFields.isEmpty ? "подія" : safeFields.joined(separator: " "))
         return DiagnosticEvent(id: event.id, timestamp: event.timestamp, platform: event.platform,
                                role: event.role, callID: event.callID, category: event.category, value: detail)
     }

@@ -32,6 +32,7 @@ enum AudioFlowFailureStage: String, Equatable, Sendable {
 struct AudioProgressCounters: Equatable, Sendable {
     var sent: UInt64 = 0
     var received: UInt64 = 0
+    var scheduled: UInt64 = 0
     var rendered: UInt64 = 0
 
     func stalledStage(since baseline: Self) -> AudioFlowFailureStage? {
@@ -535,14 +536,20 @@ final class AudioEngine: AudioEngineHandling, @unchecked Sendable {
             self.playbackQueue.async {
                 guard self.audioGraphGeneration == generation else { return }
                 self.scheduledBuffers = max(0, self.scheduledBuffers - 1)
-                if !self.firstPlaybackRenderedReported { self.firstPlaybackRenderedReported = true; self.emit("first_playback_buffer_rendered", "rendered") }
-                self.emit("playback_frame_rendered", "generation=\(generation)")
+                if !self.firstPlaybackRenderedReported {
+                    self.firstPlaybackRenderedReported = true
+                    self.emit("first_playback_buffer_rendered", "generation=\(generation)")
+                    self.emit("playback_frame_rendered", "generation=\(generation)")
+                }
                 self.renderedBufferCount &+= 1
-                if self.renderedBufferCount.isMultiple(of: 50) { self.emit("playback_render_progress", "frames=50") }
+                if self.renderedBufferCount.isMultiple(of: 250) { self.emit("playback_render_progress", "frames=250") }
             }
         }
-        emit("playback_frame_scheduled", "generation=\(generation)")
-        if !firstPlaybackScheduledReported { firstPlaybackScheduledReported = true; emit("first_playback_buffer_scheduled", "frameLength=\(converted.frameLength) depth=\(scheduledBuffers) peak=\(peakScheduledBuffers)") }
+        if !firstPlaybackScheduledReported {
+            firstPlaybackScheduledReported = true
+            emit("playback_frame_scheduled", "generation=\(generation)")
+            emit("first_playback_buffer_scheduled", "generation=\(generation) frameLength=\(converted.frameLength) depth=\(scheduledBuffers) peak=\(peakScheduledBuffers)")
+        }
     }
 
     private func cleanupGraph() {

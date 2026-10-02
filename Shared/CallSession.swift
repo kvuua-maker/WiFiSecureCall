@@ -108,6 +108,7 @@ final class CallSession: ObservableObject {
     private var serverCallAccepted = false
     private var suppressedSystemEndDuringAcceptance = false
     private var acceptanceSystemEndProtectionDeadline: Date?
+    private var systemEndReconciliationInProgress = false
     private var sequence: UInt64 = 0
     private var callAudioCryptor: CallAudioCryptor?
     private var callHistoryRecordID: UUID?
@@ -121,6 +122,7 @@ final class CallSession: ObservableObject {
     private var audioFlowWatchdog: Task<Void, Never>?
     private var audioRecoveryTask: Task<Void, Never>?
     private var terminalObserver: Task<Void, Never>?
+    private var ringingPollTask: Task<Void, Never>?
     private var diagnosticContinuation: AsyncStream<DiagnosticUpload>.Continuation?
     private var diagnosticTask: Task<Void, Never>?
     private var runtimeEventContinuation: AsyncStream<RuntimeEvent>.Continuation?
@@ -485,7 +487,7 @@ final class CallSession: ObservableObject {
         guard let current = generation, current.localCallKitUUID == localID else { throw CallKitCoordinatorError.invalidAction }
         let callSignaling = try signaling(for: current)
         let originStatus = origin == .appRequested ? "appRequested" : "system"
-        recordRuntimeDiagnostic("callkit_end_action_received", status: "origin=\(originStatus) state=\(String(describing: state))", callID: current.serverCallID)
+        recordRuntimeDiagnostic("callkit_end_received", status: "origin=\(originStatus)", callID: current.serverCallID)
 
         if origin == .system, suppressedSystemEndDuringAcceptance, serverCallAccepted,
            case let .connecting(callID) = state, callID == current.serverCallID,
@@ -501,45 +503,102 @@ final class CallSession: ObservableObject {
             acceptanceSystemEndProtectionDeadline = nil
         }
 
-        if origin == .system, config.role == .B, isOutgoingCall {
-            if case .outgoingRinging = state {
-                recordRuntimeDiagnostic("system_end_reconcile_started", status: "started", callID: current.serverCallID)
+        if origin == .system, isOutgoingCall, case .outgoingRinging = state {
+            if systemEndReconciliationInProgress { return .preserveCall }
+            systemEndReconciliationInProgress = true
+            defer { systemEndReconciliationInProgress = false }
+            ringingPollTask?.cancel(); ringingPollTask = nil
+            let graceDeadline = min(Date().addingTimeInterval(2), deadline.addingTimeInterval(-0.25))
+            let pollingDeadline = graceDeadline.addingTimeInterval(-0.15)
+            recordRuntimeDiagnostic("system_end_reconcile_started", status: "origin=system", callID: current.serverCallID)
+            repeat {
+                guard isCurrent(current), activeCallKitUUID == localID else { throw CancellationError() }
+                if state.isAcceptedLifecycle {
+                    recordRuntimeDiagnostic("system_end_preserved_after_accept", status: "state=accepted", callID: current.serverCallID)
+                    return .preserveCall
+                }
                 do {
-                    let response = serverCallAccepted
-                        ? try await verifiedAcceptedResponse(callSignaling, current: current, deadline: deadline)
-                        : try await callSignaling.call(current.serverCallID)
-                    guard isCurrent(current), response.callID == current.serverCallID else { throw CancellationError() }
+                    let response = try await callSignaling.rawCall(current.serverCallID)
+                    guard isCurrent(current), activeCallKitUUID == localID,
+                          response.callID == current.serverCallID else { throw CancellationError() }
+                    recordRuntimeDiagnostic("system_end_reconcile_server_state", status: "state=\(response.state.rawValue)", callID: current.serverCallID)
                     switch response.state {
                     case .accepted:
                         serverCallAccepted = true
-                        try enterVerifiedAcceptedConnecting(response, signaling: callSignaling, current: current)
-                        recordRuntimeDiagnostic("system_end_reconcile_result", status: "accepted", callID: current.serverCallID)
-                        startMediaIfReady(current)
-                        recordRuntimeDiagnostic("system_end_preserved_after_remote_accept", status: "accepted", callID: current.serverCallID)
-                        return .preserveCall
-                    case .ringing:
-                        recordRuntimeDiagnostic("system_end_reconcile_result", status: "ringing", callID: current.serverCallID)
+                        do {
+                            let verified = try await verifiedAcceptedResponse(callSignaling, current: current, deadline: graceDeadline)
+                            guard isCurrent(current), activeCallKitUUID == localID else { throw CancellationError() }
+                            try enterVerifiedAcceptedConnecting(verified, signaling: callSignaling, current: current)
+                            startMediaIfReady(current)
+                            recordRuntimeDiagnostic("system_end_preserved_after_accept", status: "state=accepted", callID: current.serverCallID)
+                            return .preserveCall
+                        } catch let terminal as AuthoritativeTerminalCall {
+                            await remoteTerminal(terminal.response, generation: current)
+                            return .ended
+                        } catch {
+                            guard isCurrent(current) else { throw error }
+                            terminalRequestID = terminalRequestID ?? UUID()
+                            registerTerminalCompensation(current, mutation: .end, signaling: callSignaling)
+                            recordRuntimeDiagnostic("terminal_mutation", status: "mutation=end reason=accepted_verification_failed", callID: current.serverCallID)
+                            await fail(current, .invalidServerState)
+                            return .ended
+                        }
                     case .rejected, .cancelled, .expired, .ended:
-                        recordRuntimeDiagnostic("system_end_reconcile_result", status: "terminal", callID: current.serverCallID)
                         await remoteTerminal(response, generation: current)
                         return .ended
+                    case .ringing:
+                        break
                     }
                 } catch {
                     guard isCurrent(current) else { throw error }
-                    recordRuntimeDiagnostic("system_end_reconcile_result", status: "failed", callID: current.serverCallID, domain: (error as NSError).domain, code: (error as NSError).code)
-                    if serverCallAccepted {
+                    recordRuntimeDiagnostic("system_end_reconcile_server_state", status: "state=transient", callID: current.serverCallID, domain: (error as NSError).domain, code: (error as NSError).code)
+                }
+                guard Date() < pollingDeadline else { break }
+                try? await Task.sleep(nanoseconds: 125_000_000)
+            } while Date() < pollingDeadline
+            guard isCurrent(current), activeCallKitUUID == localID else { throw CancellationError() }
+            if state.isAcceptedLifecycle {
+                recordRuntimeDiagnostic("system_end_preserved_after_accept", status: "state=accepted", callID: current.serverCallID)
+                return .preserveCall
+            }
+            do {
+                let final = try await callSignaling.rawCall(current.serverCallID)
+                guard isCurrent(current), activeCallKitUUID == localID else { throw CancellationError() }
+                if final.state == .accepted {
+                    serverCallAccepted = true
+                    do {
+                        let verified = try await verifiedAcceptedResponse(callSignaling, current: current, deadline: graceDeadline)
+                        try enterVerifiedAcceptedConnecting(verified, signaling: callSignaling, current: current)
+                        startMediaIfReady(current)
+                        recordRuntimeDiagnostic("system_end_preserved_after_accept", status: "state=accepted", callID: current.serverCallID)
+                        return .preserveCall
+                    } catch let terminal as AuthoritativeTerminalCall {
+                        await remoteTerminal(terminal.response, generation: current)
+                        return .ended
+                    } catch {
                         terminalRequestID = terminalRequestID ?? UUID()
                         registerTerminalCompensation(current, mutation: .end, signaling: callSignaling)
+                        recordRuntimeDiagnostic("terminal_mutation", status: "mutation=end reason=accepted_verification_failed", callID: current.serverCallID)
                         await fail(current, .invalidServerState)
                         return .ended
                     }
                 }
+                if final.state != .ringing { await remoteTerminal(final, generation: current); return .ended }
+            } catch { guard isCurrent(current) else { throw error } }
+            if serverCallAccepted {
+                terminalRequestID = terminalRequestID ?? UUID()
+                registerTerminalCompensation(current, mutation: .end, signaling: callSignaling)
+                recordRuntimeDiagnostic("terminal_mutation", status: "mutation=end reason=accepted_verification_failed", callID: current.serverCallID)
+                await fail(current, .invalidServerState)
+                return .ended
             }
         }
 
         suppressedSystemEndDuringAcceptance = false
         acceptanceSystemEndProtectionDeadline = nil
         let mutation = terminalMutationForCurrentState()
+        let reason = origin == .appRequested ? "explicit_user_end" : "system_end"
+        recordRuntimeDiagnostic("terminal_mutation", status: "mutation=\(mutation.rawValue) reason=\(reason)", callID: current.serverCallID)
         terminalMutation = mutation
         terminalRequestID = terminalRequestID ?? UUID()
         registerTerminalCompensation(current, mutation: mutation, signaling: callSignaling)
@@ -612,9 +671,11 @@ final class CallSession: ObservableObject {
     }
 
     private func providerReset(localID: UUID?) {
-        guard let current = generation, localID == nil || current.localCallKitUUID == localID else { return }
+        guard let current = generation, let localID, current.localCallKitUUID == localID else { return }
+        recordRuntimeDiagnostic("provider_reset", status: "current_generation", callID: current.serverCallID)
         guard let callSignaling = try? signaling(for: current) else { return }
         let mutation = terminalMutationForCurrentState()
+        recordRuntimeDiagnostic("terminal_mutation", status: "mutation=\(mutation.rawValue) reason=provider_reset", callID: current.serverCallID)
         let requestID = terminalRequestID ?? UUID(); terminalRequestID = requestID
         registerTerminalCompensation(current, mutation: mutation, signaling: callSignaling, requestID: requestID)
         enqueueTerminalMutation(current, mutation: mutation)
@@ -622,7 +683,8 @@ final class CallSession: ObservableObject {
     }
 
     private func startRingingPoll(_ current: CallGeneration, ringExpiresAt: Date) {
-        spawn { [weak self] in
+        ringingPollTask?.cancel()
+        ringingPollTask = Task { @MainActor [weak self] in
             guard let self else { return }
             while !Task.isCancelled, self.isCurrent(current), Date() < ringExpiresAt {
                 do {
@@ -744,7 +806,8 @@ final class CallSession: ObservableObject {
                 guard let self, self.isCurrent(current) else { return }
                 do {
                     let response = try await self.signaling(for: current).rawCall(current.serverCallID)
-                    if response.state == .accepted { self.startMediaReconnect(current, token: token) }
+                    guard self.isCurrent(current) else { return }
+                    if response.state == .accepted { self.startMediaReconnect(current, token: token, reconcileServerState: true) }
                     else { await self.remoteTerminal(response, generation: current) }
                 }
                 catch { self.startMediaReconnect(current, token: token, reconcileServerState: true) }
@@ -794,6 +857,8 @@ final class CallSession: ObservableObject {
             }
             guard self.isCurrent(current), self.activatedCallKitUUID == current.localCallKitUUID,
                   self.audioActivationEpoch == activation else { return }
+            self.recordRuntimeDiagnostic("media_reconnect_exhausted", status: "reason=networkLost", callID: current.serverCallID)
+            self.recordRuntimeDiagnostic("terminal_mutation", status: "mutation=end reason=media_reconnect_exhausted", callID: current.serverCallID)
             await self.fail(current, .networkLost)
         }
     }
@@ -963,9 +1028,9 @@ final class CallSession: ObservableObject {
         switch value.event {
         case "first_mic_callback", "first_mic_buffer": audioFlow.micCallback = true
         case "first_network_pcm_generated", "first_network_audio_frame_generated": audioFlow.networkPCMGenerated = true
-        case "first_playback_buffer_scheduled": audioFlow.playbackScheduled = true
+        case "first_playback_buffer_scheduled": audioFlow.playbackScheduled = true; audioProgress.scheduled &+= 1
         case "first_playback_buffer_rendered": audioFlow.playbackRendered = true; audioProgress.rendered &+= 1
-        case "playback_render_progress": audioProgress.rendered &+= 50
+        case "playback_render_progress": audioProgress.rendered &+= 250
         default: break
         }
         confirmAudioRecoveryIfReady()
@@ -995,12 +1060,9 @@ final class CallSession: ObservableObject {
         audioFlowWatchdog = Task { [weak self] in
             do { try await Task.sleep(nanoseconds: 5_000_000_000) } catch { return }
             guard let self, self.isCurrent(current), self.transportActive else { return }
-            let sent = self.audioProgress.sent >= baseline.sent ? self.audioProgress.sent - baseline.sent : 0
-            let received = self.audioProgress.received >= baseline.received ? self.audioProgress.received - baseline.received : 0
-            let rendered = self.audioProgress.rendered >= baseline.rendered ? self.audioProgress.rendered - baseline.rendered : 0
             self.recordRuntimeDiagnostic(
                 "audio_flow_progress",
-                status: "sent=\(sent) received=\(received) rendered=\(rendered)",
+                status: "sent=\(self.audioProgress.sent) received=\(self.audioProgress.received) scheduled=\(self.audioProgress.scheduled) rendered=\(self.audioProgress.rendered)",
                 callID: current.serverCallID
             )
             if self.audioOperational, self.audioProgress.stalledStage(since: baseline) == nil {
@@ -1191,6 +1253,7 @@ final class CallSession: ObservableObject {
         guard isCurrent(current) else { return }
         recordRuntimeDiagnostic("call_failed_reason", status: String(describing: failure), callID: current.serverCallID)
         if serverCallAccepted || state.isAcceptedLifecycle, let callSignaling = try? signaling(for: current) {
+            recordRuntimeDiagnostic("terminal_mutation", status: "mutation=end reason=\(failure == .audioFailed ? "audio_recovery_exhausted" : "local_failure")", callID: current.serverCallID)
             registerTerminalCompensation(current, mutation: .end, signaling: callSignaling)
             enqueueTerminalMutation(current, mutation: .end)
         }
@@ -1238,7 +1301,7 @@ final class CallSession: ObservableObject {
         audio.onMuteChanged = { value in events?.yield(.muteChanged(next.id, value)) }
         callAudioCryptor?.erase(); callAudioCryptor = nil
         mediaToken = nil; mediaEpoch = nil; pendingPeerReadyEpochs.removeAll(keepingCapacity: false); createRequestID = nil; acceptRequestID = nil; terminalRequestID = nil; terminalMutation = nil
-        activatedCallKitUUID = nil; audioStartedForCallKitUUID = nil; serverCallCreated = false; serverCallAccepted = false; suppressedSystemEndDuringAcceptance = false; acceptanceSystemEndProtectionDeadline = nil; sequence = 0; isMuted = false; elapsedSeconds = 0
+        activatedCallKitUUID = nil; audioStartedForCallKitUUID = nil; serverCallCreated = false; serverCallAccepted = false; suppressedSystemEndDuringAcceptance = false; acceptanceSystemEndProtectionDeadline = nil; systemEndReconciliationInProgress = false; sequence = 0; isMuted = false; elapsedSeconds = 0
         firstSentFrameReported = false; firstRemoteFrameReported = false; firstSendFailureReported = false
         transportActive = false; audioOperational = false; audioFlow = AudioFlowMilestones()
         audioProgress = AudioProgressCounters(); decryptFailureCount = 0
@@ -1254,7 +1317,7 @@ final class CallSession: ObservableObject {
         if let expected, generation != expected { return }
         cancelCallTasks(); sendContinuation?.finish(); sendContinuation = nil; sendStream = nil; sendTask?.cancel(); sendTask = nil
         activeSignaling?.eraseSecrets(); callAudioCryptor?.erase(); callAudioCryptor = nil
-        generation = nil; activeSignaling = nil; activeCallKitUUID = nil; mediaEpoch = nil; mediaToken = nil; isOutgoingCall = false; callKitReported = false; incomingCallerName = nil; suppressedSystemEndDuringAcceptance = false; acceptanceSystemEndProtectionDeadline = nil
+        generation = nil; activeSignaling = nil; activeCallKitUUID = nil; mediaEpoch = nil; mediaToken = nil; isOutgoingCall = false; callKitReported = false; incomingCallerName = nil; suppressedSystemEndDuringAcceptance = false; acceptanceSystemEndProtectionDeadline = nil; systemEndReconciliationInProgress = false
         callHistoryRecordID = nil
     }
 
@@ -1278,6 +1341,7 @@ final class CallSession: ObservableObject {
               response.state == .accepted, let token = response.mediaToken, !token.isEmpty else {
             throw CallFailure.invalidServerState
         }
+        if state.isAcceptedLifecycle, serverCallAccepted, mediaToken == token { return }
         try configureAcceptedEncryption(response, signaling: signaling)
         guard isCurrent(current) else { throw CancellationError() }
         mediaToken = token
@@ -1291,10 +1355,10 @@ final class CallSession: ObservableObject {
 
     private func cancelCallTasks() {
         for task in tasks { task.cancel() }; tasks.removeAll(keepingCapacity: true)
-        mediaConnectTask?.cancel(); reconnectTask?.cancel(); durationTask?.cancel(); activationWatchdog?.cancel(); peerWatchdog?.cancel(); audioFlowWatchdog?.cancel(); terminalObserver?.cancel()
+        mediaConnectTask?.cancel(); reconnectTask?.cancel(); durationTask?.cancel(); activationWatchdog?.cancel(); peerWatchdog?.cancel(); audioFlowWatchdog?.cancel(); terminalObserver?.cancel(); ringingPollTask?.cancel()
         audioRecoveryTask?.cancel()
         playout.stop()
-        mediaConnectTask = nil; reconnectTask = nil; durationTask = nil; activationWatchdog = nil; peerWatchdog = nil; audioFlowWatchdog = nil; terminalObserver = nil
+        mediaConnectTask = nil; reconnectTask = nil; durationTask = nil; activationWatchdog = nil; peerWatchdog = nil; audioFlowWatchdog = nil; terminalObserver = nil; ringingPollTask = nil
         audioRecoveryTask = nil; audioRecoveryPending = false; audioRecoveryExpectedGraphGeneration = nil
         bufferedRecoveryPackets.removeAll(keepingCapacity: true)
     }
@@ -1335,7 +1399,7 @@ final class CallSession: ObservableObject {
     deinit {
         for task in tasks { task.cancel() }
         mediaConnectTask?.cancel(); reconnectTask?.cancel(); durationTask?.cancel()
-        activationWatchdog?.cancel(); peerWatchdog?.cancel(); audioFlowWatchdog?.cancel(); terminalObserver?.cancel()
+        activationWatchdog?.cancel(); peerWatchdog?.cancel(); audioFlowWatchdog?.cancel(); terminalObserver?.cancel(); ringingPollTask?.cancel()
     }
 
     private func isCurrent(_ current: CallGeneration) -> Bool { generation == current }

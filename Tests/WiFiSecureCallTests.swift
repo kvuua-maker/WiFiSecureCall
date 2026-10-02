@@ -1799,6 +1799,65 @@ final class WiFiSecureCallTests: XCTestCase {
     }
 
     @MainActor
+    func testSystemEndReconcileTransientFailureThenAcceptedPreservesCall() async throws {
+        let capture = RequestCapture()
+        let (session, adapter, serverID, localID) = try await prepareOutgoingRinging(capture: capture)
+        capture.getState = .accepted
+        capture.getResults = [.failure(URLError(.timedOut)), .success(.ringing), .success(.accepted)]
+
+        let disposition = try await adapter.approveEnd(localID, origin: .system)
+
+        XCTAssertEqual(disposition, .preserveCall)
+        XCTAssertEqual(session.state, .connecting(serverID))
+        XCTAssertFalse(capture.paths.contains { $0.hasSuffix("/cancel") || $0.hasSuffix("/end") })
+    }
+
+    @MainActor
+    func testAcceptedRemoteCloseReconnectsSameLogicalCallWithoutEnd() async throws {
+        let capture = RequestCapture(); capture.getState = .accepted
+        let audio = AudioEngineMock(), media = MediaTransportMock()
+        let session = makeSession(capture: capture, audio: audio, media: media)
+        let adapter = RetainedCallKitMock(); session.attach(callKit: adapter)
+        await session.startCall()
+        let serverID = try XCTUnwrap(session.state.callID), localID = try XCTUnwrap(adapter.startedIDs.first)
+        try await adapter.approveStart(localID)
+        adapter.onAudioActivated?(localID)
+        await eventually { !media.connectionIDs.isEmpty }
+        let firstEpoch = try XCTUnwrap(media.connectionIDs.first)
+        media.onPeerReady?(serverID, firstEpoch)
+        establishAudioFlow(audio: audio, media: media, callID: serverID, epoch: firstEpoch)
+        await eventually { session.state == .active(serverID) }
+
+        media.onDisconnect?(.init(callID: serverID, connectionID: firstEpoch, closeCode: nil, reason: .remoteClosed))
+        await eventually { media.connectionIDs.count == 2 }
+
+        XCTAssertEqual(session.state, .reconnecting(serverID))
+        XCTAssertEqual(media.connectedCallIDs, [serverID, serverID])
+        XCTAssertFalse(capture.paths.contains { $0.hasSuffix("/end") || $0.hasSuffix("/cancel") })
+    }
+
+    @MainActor
+    func testPlaybackFrameDiagnosticsAreBoundedAndTerminalReasonSurvives() throws {
+        let suite = "WiFiSecureCallTests.DiagnosticsFrames.\(UUID())"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let diagnostics = Diagnostics(defaults: defaults)
+        let callID = UUID()
+        diagnostics.record(role: .B, callID: callID, category: "state", value: "connecting")
+        for _ in 0..<500 {
+            diagnostics.record(role: .B, callID: callID, category: "playback_frame_scheduled", value: "generation=9")
+            diagnostics.record(role: .B, callID: callID, category: "playback_frame_rendered", value: "generation=9")
+        }
+        diagnostics.record(role: .B, callID: callID, category: "call_failed_reason", value: "networkLost")
+        let report = Diagnostics(defaults: defaults).lastCallReport()
+
+        XCTAssertEqual(diagnostics.events.filter { $0.category == "playback_frame_scheduled" }.count, 1)
+        XCTAssertEqual(diagnostics.events.filter { $0.category == "playback_frame_rendered" }.count, 1)
+        XCTAssertTrue(report.contains("state: connecting"))
+        XCTAssertTrue(report.contains("call_failed_reason: networkLost"))
+    }
+
+    @MainActor
     func testIncomingWatchSystemEndDuringAcceptedConnectingIsPreserved() async throws {
         let capture = RequestCapture()
         let (session, adapter, serverID, localID, _, _) = try await prepareIncomingAcceptedWatch(capture: capture)
@@ -2524,6 +2583,7 @@ private final class RequestCapture: @unchecked Sendable {
     var mutationState: ServerCallState = .ended
     var getState: ServerCallState = .ringing
     var getError: Error?
+    var getResults: [Result<ServerCallState, Error>] = []
     var acceptedMediaToken: String? = "media-token"
     var onRequest: ((URLRequest) -> Void)?
     var clientRole: DeviceRole = .B
@@ -2561,6 +2621,13 @@ private final class RequestCapture: @unchecked Sendable {
             return (response(request, 204), Data())
         }
         if request.httpMethod == "GET" {
+            if let result = lock.withLock({ getResults.isEmpty ? nil : getResults.removeFirst() }) {
+                switch result {
+                case let .success(state):
+                    return (response(request, 200), callResponse(callID: callID, state: state, mediaToken: state == .accepted ? acceptedMediaToken : nil, outgoing: callID == createdCallID))
+                case let .failure(error): throw error
+                }
+            }
             if let getError { throw getError }
             let state = getState
             return (response(request, 200), callResponse(callID: callID, state: state, mediaToken: state == .accepted ? acceptedMediaToken : nil, outgoing: callID == createdCallID))
