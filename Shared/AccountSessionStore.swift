@@ -138,6 +138,7 @@ final class AccountSessionStore: ObservableObject {
         if let profile = response.user { profiles[response.account.accountID] = profile }
         persistMetadata()
         accountAdded?(response.account.accountID)
+        SecureMessageStore.shared.invalidateIdentityRegistration(accountID: response.account.accountID)
     }
 
     func addLinkedAccount(accountID: UUID, phoneNumber: String, tokens: AccountTokens) throws {
@@ -149,6 +150,7 @@ final class AccountSessionStore: ObservableObject {
         activeAccountID = accountID
         persistMetadata()
         accountAdded?(accountID)
+        SecureMessageStore.shared.invalidateIdentityRegistration(accountID: accountID)
     }
 
     func addLinkedAccount(accountID: UUID, phoneNumber: String?, tokens: AccountTokens) throws {
@@ -164,6 +166,7 @@ final class AccountSessionStore: ObservableObject {
         if activate { activeAccountID = accountID }
         persistMetadata()
         accountAdded?(accountID)
+        SecureMessageStore.shared.invalidateIdentityRegistration(accountID: accountID)
     }
 
     @discardableResult
@@ -202,6 +205,7 @@ final class AccountSessionStore: ObservableObject {
     }
 
     private func removeLocal(accountID: UUID) throws {
+        SecureMessageStore.shared.invalidateIdentityRegistration(accountID: accountID)
         try tokenStore.delete(accountID: accountID)
         AccountE2EEContext.shared.invalidate(accountID: accountID)
         accounts.removeAll { $0.accountID == accountID }

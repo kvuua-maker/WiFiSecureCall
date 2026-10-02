@@ -256,6 +256,66 @@ final class SecureMessengerTransmitMuteTests: XCTestCase {
 }
 
 final class SecureMessengerCryptoTests: XCTestCase {
+    func testDuplicateDeviceWithSameCryptographicBundleCreatesOneEnvelope() throws {
+        let sender = E2EEDeviceIdentity(deviceID: UUID(), signingPrivateKey: .init(), agreementPrivateKey: .init(), keyVersion: 1)
+        let shared = E2EEDeviceIdentity(deviceID: UUID(), signingPrivateKey: .init(), agreementPrivateKey: .init(), keyVersion: 2).publicBundle
+        let duplicateWithDifferentDates = E2EEPublicDeviceBundle(
+            deviceID: shared.deviceID, signingPublicKey: shared.signingPublicKey,
+            agreementPublicKey: shared.agreementPublicKey, keyVersion: shared.keyVersion,
+            protocolVersion: shared.protocolVersion, createdAt: .distantPast, updatedAt: .distantFuture
+        )
+        let input = try SecureMessageCrypto.encrypt(
+            text: "hello", conversationID: UUID(), senderUserID: UUID(), identity: sender,
+            recipientDevices: [shared], senderOtherDevices: [duplicateWithDifferentDates]
+        )
+        XCTAssertEqual(input.envelopes.map(\.deviceID), [shared.deviceID])
+    }
+
+    func testDuplicateDeviceWithChangedAgreementKeyFailsClosed() throws {
+        let original = E2EEDeviceIdentity(deviceID: UUID(), signingPrivateKey: .init(), agreementPrivateKey: .init(), keyVersion: 1).publicBundle
+        let replacement = E2EEDeviceIdentity(deviceID: original.deviceID, signingPrivateKey: .init(), agreementPrivateKey: .init(), keyVersion: 1).publicBundle
+        let changed = E2EEPublicDeviceBundle(deviceID: original.deviceID, signingPublicKey: original.signingPublicKey, agreementPublicKey: replacement.agreementPublicKey, keyVersion: original.keyVersion, protocolVersion: original.protocolVersion, createdAt: nil, updatedAt: nil)
+        XCTAssertThrowsError(try SecureMessageCrypto.mergedEncryptionDevices(recipientDevices: [original], senderOtherDevices: [changed])) {
+            XCTAssertEqual($0 as? SecureMessageCryptoError, .conflictingDeviceBundle)
+        }
+    }
+
+    func testDuplicateDeviceWithChangedSigningKeyFailsClosed() throws {
+        let original = E2EEDeviceIdentity(deviceID: UUID(), signingPrivateKey: .init(), agreementPrivateKey: .init(), keyVersion: 1).publicBundle
+        let replacement = E2EEDeviceIdentity(deviceID: original.deviceID, signingPrivateKey: .init(), agreementPrivateKey: .init(), keyVersion: 1).publicBundle
+        let changed = E2EEPublicDeviceBundle(deviceID: original.deviceID, signingPublicKey: replacement.signingPublicKey, agreementPublicKey: original.agreementPublicKey, keyVersion: original.keyVersion, protocolVersion: original.protocolVersion, createdAt: nil, updatedAt: nil)
+        XCTAssertThrowsError(try SecureMessageCrypto.mergedEncryptionDevices(recipientDevices: [original], senderOtherDevices: [changed])) {
+            XCTAssertEqual($0 as? SecureMessageCryptoError, .conflictingDeviceBundle)
+        }
+    }
+
+    func testDuplicateDeviceWithChangedKeyVersionFailsClosed() throws {
+        let original = E2EEDeviceIdentity(deviceID: UUID(), signingPrivateKey: .init(), agreementPrivateKey: .init(), keyVersion: 1).publicBundle
+        let changed = E2EEPublicDeviceBundle(deviceID: original.deviceID, signingPublicKey: original.signingPublicKey, agreementPublicKey: original.agreementPublicKey, keyVersion: original.keyVersion + 1, protocolVersion: original.protocolVersion, createdAt: nil, updatedAt: nil)
+        XCTAssertThrowsError(try SecureMessageCrypto.mergedEncryptionDevices(recipientDevices: [original], senderOtherDevices: [changed])) {
+            XCTAssertEqual($0 as? SecureMessageCryptoError, .conflictingDeviceBundle)
+        }
+    }
+
+    func testEmptyRecipientDeviceListFailsClosed() {
+        XCTAssertThrowsError(try SecureMessageCrypto.mergedEncryptionDevices(recipientDevices: [], senderOtherDevices: [])) {
+            XCTAssertEqual($0 as? SecureMessageCryptoError, .noRecipientDevices)
+        }
+    }
+
+    func testMessagePageMergeToleratesDuplicatesAndServerValueWins() {
+        let id = UUID(), conversationID = UUID(), senderID = UUID()
+        func message(_ text: String, at seconds: TimeInterval) -> DecryptedMessage {
+            DecryptedMessage(id: id, conversationID: conversationID, senderUserID: senderID, text: text, createdAt: Date(timeIntervalSince1970: seconds), isSentByCurrentUser: false, delivered: false, read: false)
+        }
+        let merged = SecureMessageStore.mergedMessages(
+            prior: [message("old-a", at: 1), message("old-b", at: 2)],
+            decoded: [message("server", at: 3)]
+        )
+        XCTAssertEqual(merged.count, 1)
+        XCTAssertEqual(merged.first?.text, "server")
+    }
+
     func testMessageRoundTripDeviceEnvelopesTamperAndNoPlaintextEncoding() throws {
         let sender = E2EEDeviceIdentity(deviceID: UUID(), signingPrivateKey: .init(), agreementPrivateKey: .init(), keyVersion: 1)
         let recipient = E2EEDeviceIdentity(deviceID: UUID(), signingPrivateKey: .init(), agreementPrivateKey: .init(), keyVersion: 1)
@@ -3904,6 +3964,7 @@ final class SecureRingingUpgradeRegressionTests: XCTestCase {
         await session.startCall(signaling: signaling)
         try await adapter.approveStart(try XCTUnwrap(adapter.startedIDs.first))
         await waitUntil { signaling.terminalRequestIDs.count >= 2 }
+        await waitUntil { session.state.isTerminal }
         XCTAssertTrue(session.state.isTerminal)
         XCTAssertGreaterThanOrEqual(signaling.terminalMutations.count, 2)
         XCTAssertTrue(signaling.terminalMutations.allSatisfy { $0 == .end })

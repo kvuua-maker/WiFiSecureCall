@@ -54,33 +54,7 @@ private struct WatchChatsHomeView: View {
 
     var body: some View {
         ScrollView(showsIndicators: false) {
-            LazyVStack(spacing: 5) {
-                HStack(spacing: 8) {
-                    NavigationLink {
-                        WatchMoreView(session: session, accountStore: accountStore, messages: messages, callHistory: callHistory, runtime: runtime)
-                    } label: {
-                        Image(systemName: "line.3.horizontal")
-                            .frame(maxWidth: .infinity, minHeight: 30)
-                    }
-                    .accessibilityLabel("Меню: виклики, контакти й налаштування")
-                    NavigationLink {
-                        RecipientSearchView(messageStore: messages, runtime: runtime)
-                    } label: {
-                        Image(systemName: "square.and.pencil")
-                            .frame(maxWidth: .infinity, minHeight: 30)
-                    }
-                    .accessibilityLabel("Новий чат")
-                    Button {
-                        showsSearch.toggle()
-                        if !showsSearch { query = "" }
-                    } label: {
-                        Image(systemName: "magnifyingglass")
-                            .frame(maxWidth: .infinity, minHeight: 30)
-                    }
-                    .accessibilityLabel("Пошук чатів")
-                }
-                .font(.caption)
-                .buttonStyle(.bordered)
+            LazyVStack(spacing: 2) {
                 if showsSearch { TextField("Пошук", text: $query).textInputAutocapitalization(.never) }
                 if messages.state == .loading { ProgressView().accessibilityLabel("Завантаження чатів") }
                 else if loadError != nil {
@@ -101,6 +75,12 @@ private struct WatchChatsHomeView: View {
         }
         .navigationTitle("Чати")
         .toolbar {
+            ToolbarItem(placement: .cancellationAction) {
+                NavigationLink {
+                    WatchMoreView(session: session, accountStore: accountStore, messages: messages, callHistory: callHistory, runtime: runtime)
+                } label: { Image(systemName: "ellipsis") }
+                    .accessibilityLabel("Меню")
+            }
             ToolbarItem(placement: .primaryAction) {
                 Button {
                     if session.state == .idle || session.state.isTerminal { showsAccounts = true }
@@ -123,9 +103,9 @@ private struct WatchChatsHomeView: View {
     }
 
     private func row(_ conversation: SecureConversation, accountID: UUID) -> some View {
-        HStack(spacing: 6) {
+        HStack(spacing: 7) {
             Text(String(conversation.peerDisplayName.prefix(1)).uppercased())
-                .font(.caption.bold()).frame(width: 30, height: 30).background(Circle().fill(.blue.opacity(0.25)))
+                .font(.caption.bold()).frame(width: 28, height: 28).background(Circle().fill(.blue.opacity(0.25)))
             VStack(alignment: .leading, spacing: 2) {
                 Text(conversation.peerDisplayName).font(.caption.bold()).lineLimit(1).truncationMode(.tail)
                 Text(messages.messages(conversationID: conversation.id, accountID: accountID).last?.text ?? "Відкрити розмову")
@@ -134,7 +114,8 @@ private struct WatchChatsHomeView: View {
             Spacer(minLength: 2)
             Text(conversation.updatedAt, style: .time).font(.system(size: 9)).foregroundStyle(.secondary)
         }
-        .frame(minHeight: 48)
+        .frame(minHeight: 44)
+        .padding(.horizontal, 4)
         .contentShape(Rectangle())
     }
 }
@@ -321,13 +302,25 @@ private struct WatchMoreView: View {
 
     var body: some View {
         List {
+            if session.state != .idle && !session.state.isTerminal {
+                NavigationLink("Поточний виклик") { ActiveCallView(session: session) }
+            }
+            NavigationLink("Новий чат") { RecipientSearchView(messageStore: messages, runtime: runtime) }
+            NavigationLink("Пошук") { WatchConversationSearchView(messages: messages, runtime: runtime) }
             NavigationLink("Дзвінки") {
                 if session.state == .idle || session.state.isTerminal { CallHistoryView(store: callHistory, accountID: accountStore.activeAccountID, runtime: runtime) }
                 else { ActiveCallView(session: session) }
             }
             NavigationLink("Контакти") { WatchContactsView(messageStore: messages, runtime: runtime) }
-            NavigationLink("Набрати номер") { WatchDialEntry(messageStore: messages, runtime: runtime) }
-            NavigationLink("Акаунт і безпека") {
+            NavigationLink {
+                WatchSystemDialerView()
+            } label: {
+                Label("Мобільний дзвінок", systemImage: "phone.arrow.up.right")
+            }
+            NavigationLink("Акаунти") {
+                WatchAccountSwitcher(store: accountStore, isPresented: .constant(false), canSwitchAccounts: { session.state == .idle || session.state.isTerminal })
+            }
+            NavigationLink("Налаштування") {
                 List {
                     WatchAccountLinkView(store: accountStore, canSwitchAccounts: { session.state == .idle || session.state.isTerminal })
                     CallKeyChangeWarningsView(accountID: accountStore.activeAccountID)
@@ -338,6 +331,26 @@ private struct WatchMoreView: View {
             }
         }
         .navigationTitle("Меню")
+    }
+}
+
+private struct WatchConversationSearchView: View {
+    @ObservedObject var messages: SecureMessageStore
+    let runtime: NotificationRuntime
+    @State private var query = ""
+
+    var body: some View {
+        List {
+            ForEach(messages.conversations.filter { query.isEmpty || $0.peerDisplayName.localizedCaseInsensitiveContains(query) }) { conversation in
+                if let accountID = messages.activeAccountID {
+                    NavigationLink(conversation.peerDisplayName) {
+                        WatchConversationView(store: messages, conversation: conversation, accountID: accountID, runtime: runtime)
+                    }
+                }
+            }
+        }
+        .searchable(text: $query, prompt: "Пошук")
+        .navigationTitle("Пошук")
     }
 }
 
@@ -370,7 +383,7 @@ private struct WatchContactsView: View {
                             ForEach(contact.numbers) { number in
                                 NavigationLink {
                                     if let canonical = number.canonicalE164 {
-                                        RecipientSearchView(messageStore: messageStore, runtime: runtime, initialRecipient: canonical)
+                                        WatchContactActions(number: canonical, messageStore: messageStore, runtime: runtime)
                                     } else {
                                         WatchCountryPrefixConfirmation(number: number, messageStore: messageStore, runtime: runtime)
                                     }
@@ -408,7 +421,7 @@ private struct WatchCountryPrefixConfirmation: View {
                 Text("Введіть повний міжнародний номер. Код країни не визначається автоматично.").font(.caption2)
                 TextField("+код і номер", text: $internationalNumber)
                 NavigationLink("Перевірити") {
-                    RecipientSearchView(messageStore: messageStore, runtime: runtime, initialRecipient: normalized ?? "")
+                    WatchContactActions(number: normalized ?? "", messageStore: messageStore, runtime: runtime)
                 }
                 .disabled(normalized == nil)
             }
@@ -423,35 +436,21 @@ private struct WatchCountryPrefixConfirmation: View {
     }
 }
 
-private struct WatchDialEntry: View {
+private struct WatchContactActions: View {
+    let number: String
     @ObservedObject var messageStore: SecureMessageStore
     let runtime: NotificationRuntime
-    @State private var number = "+"
-    private let columns = Array(repeating: GridItem(.flexible(), spacing: 4), count: 3)
-    private let keys = ["1", "2", "3", "4", "5", "6", "7", "8", "9", "+", "0", "⌫"]
 
     var body: some View {
-        ScrollView {
-            VStack(spacing: 6) {
-                Text(number).font(.headline.monospacedDigit()).lineLimit(2).minimumScaleFactor(0.7)
-                LazyVGrid(columns: columns, spacing: 4) {
-                    ForEach(keys, id: \.self) { key in
-                        Button(key) {
-                            if key == "⌫" { if !number.isEmpty { number.removeLast() } }
-                            else if key == "+" { if number.isEmpty { number = "+" } }
-                            else if number.count < 16 { number += key }
-                        }
-                        .buttonStyle(.bordered)
-                        .accessibilityLabel(key == "⌫" ? "Видалити" : key)
-                    }
-                }
-                NavigationLink("Знайти користувача") {
-                    RecipientSearchView(messageStore: messageStore, runtime: runtime, initialRecipient: number)
-                }
-                .disabled(number.count < 3 || !number.hasPrefix("+"))
-                Text("Перед дзвінком номер перевіряється у сервісі.").font(.caption2)
+        List {
+            NavigationLink("Захищений виклик") {
+                RecipientSearchView(messageStore: messageStore, runtime: runtime, initialRecipient: number)
+            }
+            NavigationLink("Мобільний дзвінок") { WatchSystemDialerView(initialNumber: number) }
+            NavigationLink("Повідомлення") {
+                RecipientSearchView(messageStore: messageStore, runtime: runtime, initialRecipient: number)
             }
         }
-        .navigationTitle("Номер")
+        .navigationTitle("Дії")
     }
 }

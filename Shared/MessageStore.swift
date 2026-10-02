@@ -122,9 +122,7 @@ final class SecureMessageStore: ObservableObject {
             try requireCallable(accountID)
             updateCache(accountID) { cache in
                 let prior = append ? (cache.messages[conversationID] ?? []) : []
-                var merged = Dictionary(uniqueKeysWithValues: prior.map { ($0.id, $0) })
-                for message in decoded { merged[message.id] = message }
-                cache.messages[conversationID] = merged.values.sorted { $0.createdAt < $1.createdAt }
+                cache.messages[conversationID] = Self.mergedMessages(prior: prior, decoded: decoded)
                 cache.safetyDevices[conversationID] = devices.sorted { $0.deviceID.uuidString < $1.deviceID.uuidString }
                 cache.keyChangeWarnings[conversationID] = warnings.sorted { $0.deviceID.uuidString < $1.deviceID.uuidString }
                 if let next = page.nextCursor { cache.nextCursor[conversationID] = next } else { cache.nextCursor.removeValue(forKey: conversationID) }
@@ -227,7 +225,12 @@ final class SecureMessageStore: ObservableObject {
         let record = try await api.send(accountID: accountID, conversationID: conversation.id, input: input)
         try requireCallable(accountID)
         let local = DecryptedMessage(id: record.messageID, conversationID: conversation.id, senderUserID: profile.userID, text: text, createdAt: record.createdAt, isSentByCurrentUser: true, delivered: record.receipts.contains { $0.deliveredAt != nil }, read: record.receipts.contains { $0.readAt != nil })
-        updateCache(accountID) { $0.messages[conversation.id, default: []].append(local) }
+        updateCache(accountID) { cache in
+            var values = cache.messages[conversation.id, default: []]
+            values.removeAll { $0.id == local.id }
+            values.append(local)
+            cache.messages[conversation.id] = values.sorted { $0.createdAt < $1.createdAt }
+        }
     }
 
     func markRead(conversationID: UUID, accountID: UUID) async {
@@ -250,6 +253,17 @@ final class SecureMessageStore: ObservableObject {
 
     func keyChangeWarnings(conversationID: UUID, accountID: UUID) -> [E2EEKeyChangeWarning] {
         caches[accountID]?.keyChangeWarnings[conversationID] ?? []
+    }
+
+    func invalidateIdentityRegistration(accountID: UUID) {
+        registeredAccounts.remove(accountID)
+    }
+
+    nonisolated static func mergedMessages(prior: [DecryptedMessage], decoded: [DecryptedMessage]) -> [DecryptedMessage] {
+        var merged: [UUID: DecryptedMessage] = [:]
+        for message in prior { merged[message.id] = message }
+        for message in decoded { merged[message.id] = message }
+        return merged.values.sorted { $0.createdAt < $1.createdAt }
     }
 
     private func decode(_ record: SecureMessageRecord, accountID: UUID, conversationID: UUID, profile: UserProfile, identity: E2EEDeviceIdentity, safetyDevices: inout [E2EESafetyDevice], keyChanges: inout [E2EEKeyChangeWarning]) async throws -> DecryptedMessage {
@@ -357,7 +371,18 @@ final class SecureMessageStore: ObservableObject {
 
     static func safeError(_ error: Error) -> String {
         if error is E2EEIdentityError { return "Encryption identity needs attention" }
-        if error is SecureMessageCryptoError { return "Secure message could not be processed" }
+        if let crypto = error as? SecureMessageCryptoError {
+            switch crypto {
+            case .noRecipientDevices: return "Немає доступного пристрою одержувача."
+            case .conflictingDeviceBundle: return "Ключі пристрою змінилися. Оновіть розмову та спробуйте ще раз."
+            default: return "Не вдалося безпечно обробити повідомлення."
+            }
+        }
+        if let apiError = error as? AccountAPIError,
+           case .status(_, let response) = apiError,
+           response?.error == "self_message_not_allowed" {
+            return "Не можна створити розмову із цим самим акаунтом."
+        }
         return "Network request failed"
     }
 
