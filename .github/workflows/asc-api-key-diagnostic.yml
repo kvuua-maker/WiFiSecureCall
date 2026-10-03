@@ -64,6 +64,9 @@ jobs:
       - name: Run the production key writing step for comparison
         env:
           PRODUCTION_BRANCH: kilo/ivory-lance-nmi
+          # The extracted step reads this under `set -u`, so it has to be in its environment even
+          # though the step itself never sees a command line.
+          PRIVATE_KEY: ${{ secrets.APPSTORE_PRIVATE_KEY }}
         run: |
           set -euo pipefail
           umask 077
