@@ -346,7 +346,7 @@ jobs:
             icon_files_raw="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIcons:CFBundlePrimaryIcon:CFBundleIconFiles' "$app/Info.plist" 2>/dev/null || true)"
             icon_files="$(printf '%s\n' "$icon_files_raw" \
               | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' \
-              | grep -vE '^(Array.*\{|\}|Empty array)$|^$' | tr '\n' ' ')"
+              | grep -vE '^(Array.*\{|\}|Empty array)$|^$' | tr '\n' ' ' || true)"
             [ -n "$icon_name$icon_files" ] || { echo "::error::$app declares no primary app icon."; exit 1; }
             if [ -n "$icon_name" ]; then
               LC_ALL=C grep -qa "$icon_name" "$app/Assets.car" \
