@@ -133,6 +133,51 @@ jobs:
           grep -q 'target arm64-apple-ios' /tmp/compile.log
           echo 'Both the iPhone and Apple Watch targets compiled.'
 
+      # Compiling proves the code builds; it says nothing about whether it behaves. The scheme already
+      # carries WiFiSecureCallTests in its TestAction with skipped="NO", so the tests only ever needed to
+      # be run. They are a gate on purpose: package and testflight both depend on this job, so a failing
+      # test stops the build rather than being reported next to it.
+      - name: Run the unit tests
+        run: |
+          set -euo pipefail
+          # The simulator is taken from what this image actually provides rather than from a hard coded
+          # device name, which breaks whenever the image changes its device set. iOS 26 simulators can host
+          # a target whose deployment setting is lower, so no upper bound is imposed.
+          device="$(xcrun simctl list devices available -j | python3 -c '
+          import json, sys
+          devices = json.load(sys.stdin)["devices"]
+          # Runtimes are keyed by identifier and are not ordered newest first, so compare versions.
+          def version(runtime):
+              tail = runtime.rsplit(".", 1)[-1]
+              return [int(part) for part in tail.split("-") if part.isdigit()]
+          newest = max(devices, key=version, default=None)
+          if newest is None:
+              raise SystemExit("no simulator runtime is available")
+          for candidate in devices[newest]:
+              if candidate.get("isAvailable") and candidate.get("name", "").startswith("iPhone"):
+                  print(candidate["name"])
+                  break
+          else:
+              raise SystemExit("no available iPhone simulator on the newest runtime " + newest)
+          ')"
+          echo "Running the unit tests on iPhone simulator: $device"
+
+          xcodebuild \
+            -project WiFiSecureCall.xcodeproj \
+            -scheme WiFiSecureCall \
+            -configuration Debug \
+            -destination "platform=iOS Simulator,name=$device" \
+            -derivedDataPath DerivedDataTests \
+            test | tee /tmp/unit-tests.log
+
+          # The log is kept rather than discarded: on a failure this is the only place the assertion that
+          # failed is written down.
+          tests="$(grep -cE "^Test Suite .* (passed|failed)" /tmp/unit-tests.log || true)"
+          echo "Test Suite lines: $tests"
+          grep -qE "TEST SUCCEEDED|Executed [0-9]+ tests?, with 0 failures" /tmp/unit-tests.log \
+            || { echo '::error::the unit tests did not report success.'; exit 1; }
+          echo 'Unit tests passed.'
+
   package:
     name: Build the app bundle
     if: github.event_name != 'pull_request'
@@ -281,6 +326,16 @@ jobs:
             [ -f "$app/PrivacyInfo.xcprivacy" ] \
               || { echo "::error::$app ships no PrivacyInfo.xcprivacy."; exit 1; }
             echo "found $app/PrivacyInfo.xcprivacy"
+          done
+
+          # An app with no icon builds and installs, and is only noticed when it looks wrong on a device.
+          # The rendition names are Xcode's to choose, so this checks that the catalog compiled and produced
+          # icons at all, in both the phone app and the watch app, rather than asserting specific names.
+          for app in "$iphone_app" "$watch_app"; do
+            [ -f "$app/Assets.car" ] || { echo "::error::$app has no compiled asset catalog."; exit 1; }
+            icons="$(find "$app" -maxdepth 1 -name 'AppIcon*.png' | wc -l | tr -d ' ')"
+            [ "$icons" -gt 0 ] || { echo "::error::$app has no rendered AppIcon renditions."; exit 1; }
+            echo "$app: Assets.car present, $icons AppIcon rendition(s)"
           done
 
           work="$(mktemp -d)"
