@@ -446,8 +446,9 @@ jobs:
             echo "::error::TestFlight needs these repository secrets: $missing"
             exit 1
           fi
-          # Shapes only, never the values. A 401 from App Store Connect is almost always one of these
-          # three disagreeing with each other, and the log is the only place the pairings are visible:
+          # Shapes only, never the values. A 401 from App Store Connect does not say which of these three
+          # is at fault, and a shape such as a stray space is one of the reasons it can happen, so the log
+          # is the only place the pairings are visible:
           # a key id is 10 characters, an issuer id 36, and neither may carry stray whitespace from a
           # copy and paste, which is what makes them fail in a way that looks like bad credentials.
           case "$KEY_ID" in
@@ -517,36 +518,69 @@ jobs:
           # A candidate body is written out as PEM and judged by openssl. Nothing else decides what the key is.
           # The locals matter: without them this function would overwrite the loop variable the caller reads its
           # candidates from, and every attempt after the first would trim an already trimmed string.
-          validate() {
-            local body="$1" size="${#1}"
-            [ "$(( size % 4 ))" -eq 0 ] || return 1
+          #
+          # It writes the scratch file, never KEY_PATH. Writing the accepted key straight to KEY_PATH meant that
+          # any candidate examined after the accepted one overwrote it, so the path the rest of this job signs
+          # with could hold a rejected body while `match` still named the accepted one, and the declared-length
+          # trim below then compared one key's structure against another key's length.
+          probe="$work/probe.pem"
+          try_body() {
+            local body="$1"
+            [ "$(( ${#body} % 4 ))" -eq 0 ] || return 1
             {
               printf '%s\n' '-----BEGIN PRIVATE KEY-----'
               printf '%s' "$body" | fold -w 64
               printf '\n%s\n' '-----END PRIVATE KEY-----'
-            } > "$KEY_PATH"
-            openssl pkey -in "$KEY_PATH" -noout -check >/dev/null 2>&1
+            } > "$probe"
+            openssl pkey -in "$probe" -noout -check >/dev/null 2>&1
           }
 
           match=''
+          match_fp=''
+          ambiguous=0
+          # Whether two accepted bodies are the same key is decided by the key they decode to, not by
+          # comparing them as text. openssl accepts a body with extra characters at its end, so one key
+          # legitimately validates at more than one length, and comparing strings would call that
+          # ambiguity and refuse a perfectly good secret.
+          fingerprint_of() {
+            openssl pkey -in "$1" -pubout -outform DER 2>/dev/null | openssl dgst -sha256 2>/dev/null \
+              | sed 's/^.*= //' || true
+          }
           while IFS= read -r candidate; do
             [ -n "$candidate" ] || continue
+            [ "$ambiguous" -eq 1 ] && continue
             size="${#candidate}"
             # Trimming is tried in order of how much is removed, so the smallest valid body wins and the written
-            # file holds the key alone rather than the key plus whatever came with it.
+            # file holds the key alone rather than the key plus whatever came with it. break 2 here only ends the
+            # search over this candidate's own offsets; the next candidate is still examined, because a second
+            # key in the same secret is something to refuse rather than to silently prefer.
             for total in $(seq 0 64); do
               length="$(( size - total ))"
               [ "$length" -ge 120 ] || break
               [ "$(( length % 4 ))" -eq 0 ] || continue
               for front in $(seq 0 "$total"); do
                 back="$(( total - front ))"
-                if validate "${candidate:$front:$length}"; then
-                  match="${candidate:$front:$length}"
+                if try_body "${candidate:$front:$length}"; then
+                  body="${candidate:$front:$length}"
+                  accepted="$(fingerprint_of "$probe")"
+                  if [ -z "$match" ]; then
+                    match="$body"
+                    match_fp="$accepted"
+                  elif [ "$match_fp" != "$accepted" ]; then
+                    ambiguous=1
+                  fi
                   break 2
                 fi
               done
             done
           done < "$candidates"
+
+          if [ "$ambiguous" -eq 1 ]; then
+            echo '::error::APPSTORE_PRIVATE_KEY holds more than one different private key.'
+            echo '::error::Nothing in the secret says which one is the AuthKey_<KEY_ID>.p8 for this key id, so there'
+            echo '::error::is no basis for choosing and no file was written. Store only the contents of one file.'
+            exit 1
+          fi
 
           if [ -z "$match" ]; then
             # A passphrase protected key is a real and common mistake here: exporting from Keychain or from a
@@ -567,9 +601,19 @@ jobs:
           fi
 
           # openssl stops reading once the key structure is complete and ignores whatever follows it, so a body
-          # with extra characters at its end still validates. The PEM is rewritten from the length the structure
-          # itself declares, which leaves the file holding the key and nothing else.
-          structure="$(openssl asn1parse -in "$KEY_PATH" -inform PEM 2>/dev/null | head -1)"
+          # with extra characters at its end still validates. The body is cut back to the length the structure
+          # itself declares, which leaves only the key.
+          #
+          # The accepted body is written to the scratch file again first. After the loop the scratch file
+          # holds whichever candidate was tried last, which is not the accepted one whenever other
+          # candidates followed it, so reading the structure from it would describe the wrong key.
+          if ! try_body "$match"; then
+            echo '::error::The accepted key body did not validate on its own, so no key file was written.'
+            exit 1
+          fi
+          # `|| true` because asn1parse exits non-zero on a body it cannot read, and a failure here must be
+          # reported by the checks below rather than by a silent exit from set -e inside a substitution.
+          structure="$(openssl asn1parse -in "$probe" -inform PEM 2>/dev/null | head -1 || true)"
           # asn1parse prints "hl=3 l= 135", so l= and its value are separate words. A space rather than \b is
           # used to tell l= from the l inside hl=, because BSD grep on the macOS runner has no word boundary.
           header_len="$(printf '%s' "$structure" | grep -oE 'hl= *[0-9]+' | grep -oE '[0-9]+' || true)"
@@ -578,11 +622,20 @@ jobs:
           if [ -n "$declared" ] && [ "$declared" -gt 0 ]; then
             wanted=$(( (declared + 2) / 3 * 4 ))
             if [ "$wanted" -lt "${#match}" ] && [ "$wanted" -ge 120 ]; then
-              if validate "${match:0:$wanted}"; then
+              if try_body "${match:0:$wanted}"; then
                 match="${match:0:$wanted}"
               fi
             fi
           fi
+
+          # The one and only write to KEY_PATH. It happens after the body has been accepted and after the
+          # declared-length trim, from a body re-verified against the scratch file, so the path the archive
+          # and the fingerprint sign with cannot disagree with the body that was selected.
+          if ! try_body "$match"; then
+            echo '::error::The accepted key body stopped validating, so no key file was written.'
+            exit 1
+          fi
+          cp "$probe" "$KEY_PATH"
 
           # App Store Connect only ever issues EC prime256v1 keys, and the requests it signs are ES256 JWTs. A key
           # of any other type is one xcodebuild would reject much later, and with a far less obvious message.
@@ -599,8 +652,8 @@ jobs:
           rm -rf "$work"
           echo "The API key is a valid prime256v1 private key (${#match} base64 characters)."
 
-      # The 401 says the three secrets do not authenticate together and names none of them, and asking
-      # again would say the same thing. What can be settled without Apple is whether the key in the
+      # A 401 from this check does not establish a cause and asks again only to repeat it. What can be
+      # established without Apple is whether the key in the
       # secret is the key that was downloaded: this prints a fingerprint of the canonical PKCS#8 DER
       # that the owner can reproduce from their own AuthKey_<KEY_ID>.p8 with one openssl command.
       # Matching digests prove the two files hold the same key and nothing more. They do not prove that
@@ -645,9 +698,11 @@ jobs:
           umask 077
           work="$(mktemp -d)"
 
-          # The length the key structure declares. A prime256v1 PKCS#8 body is 138 bytes, which is 184
-          # base64 characters. Anything else is still a key openssl can read, but it is a body that was
-          # assembled rather than downloaded, and that is worth seeing in the log before a 401.
+          # The length the key structure declares, as a shape and not as provenance. A minimal
+          # prime256v1 PKCS#8 structure is 138 bytes, which is 184 base64 characters, while a key
+          # downloaded from App Store Connect declares 150 because that file also carries the public key.
+          # Either length is expected; a length that is neither is worth seeing in the log. Neither
+          # length establishes where the key came from, and neither is evidence of a cause for a 401.
           declared_bytes="$(openssl asn1parse -in "$KEY_PATH" -inform PEM 2>/dev/null \
             | head -1 | grep -oE 'hl= *[0-9]+|(^| )l= *[0-9]+' | grep -oE '[0-9]+' \
             | awk '{ total += $1 } END { print total }')"
@@ -746,7 +801,7 @@ jobs:
               ;;
             401)
               echo '::error::App Store Connect rejected the signed request.'
-              echo '::error::This says the three secrets do not authenticate together. It does not name which one is'
+              echo '::error::This does not establish a cause and does not name which secret is at fault, if any.'
               echo '::error::at fault: the issuer may be another team, the key may have been revoked, or the key id may'
               echo '::error::not belong to the uploaded .p8. Check whether AuthKey_<KEY_ID>.p8 and APPSTORE_KEY_ID share a'
               echo '::error::key id, and whether APPSTORE_ISSUER_ID is the issuer listed on that same key.'
