@@ -72,6 +72,49 @@ jobs:
           echo "IOS_SDK=$(xcrun --sdk iphoneos --show-sdk-version)"
           echo "WATCHOS_SDK=$(xcrun --sdk watchos --show-sdk-version)"
 
+      # Two questions that are easy to confuse and are answered by different evidence. One is whether
+      # this Xcode documents the authentication flags for the command line. The other is which
+      # ExportOptions.plist keys it reads. The help text settles the first and, insofar as it lists
+      # the plist keys, documents the second. Neither is evidence that an export succeeds: only an
+      # export that runs to completion is, so this step reports and never gates on the answer.
+      - name: Record what xcodebuild documents
+        run: |
+          set -euo pipefail
+          help_file="$RUNNER_TEMP/xcodebuild-help.txt"
+          xcodebuild -help > "$help_file" 2>&1 || true
+          [ -s "$help_file" ] || { echo '::error::xcodebuild -help produced no output.'; exit 1; }
+          echo "xcodebuild -help is $(wc -l < "$help_file" | tr -d ' ') lines, $(wc -c < "$help_file" | tr -d ' ') bytes."
+
+          echo 'authentication flags, searched in xcodebuild -help:'
+          for flag in -authenticationKeyPath -authenticationKeyID -authenticationKeyIssuerID -allowProvisioningUpdates; do
+            if grep -q -e "$flag" "$help_file"; then
+              echo "  documented:    $flag"
+            else
+              echo "  NOT documented: $flag"
+            fi
+          done
+
+          # The plist keys an export can be given, checked against the help of the Xcode that will run
+          # the export rather than against an assumption about which Xcode ships it.
+          echo 'ExportOptions.plist keys named in xcodebuild -help:'
+          for key in uploadAPIKey manageAppVersionAndBuildNumber signingStyle signingCertificate uploadSymbols teamID destination method provisioningProfiles; do
+            if grep -q -e "$key" "$help_file"; then
+              echo "  named:     $key"
+            else
+              echo "  not named: $key"
+            fi
+          done
+
+          {
+            echo '<details><summary>xcodebuild -help, full output</summary>'
+            echo
+            echo '```'
+            cat "$help_file"
+            echo '```'
+            echo
+            echo '</details>'
+          } >> "$GITHUB_STEP_SUMMARY"
+
       # Debug and unsigned, so nothing has to be configured. Building the iPhone scheme compiles and
       # embeds the watchOS app through the embed phase, which is what keeps the two platforms compiling
       # together on every change.
