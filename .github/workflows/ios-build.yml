@@ -393,6 +393,17 @@ jobs:
             exit 1
           fi
 
+          # A passphrase protected key is a real, common mistake here: exporting one from Keychain or
+          # from a .p12 produces this header. App Store Connect issues unencrypted keys, and openssl
+          # reports the failure as an unreadable structure, so name the actual cause.
+          case "$header" in
+            *ENCRYPTED*)
+              echo '::error::APPSTORE_PRIVATE_KEY is a password protected key (BEGIN ENCRYPTED PRIVATE KEY).'
+              echo '::error::App Store Connect keys are not encrypted. Download AuthKey_<KEY_ID>.p8 again and store it as it is.'
+              exit 1
+              ;;
+          esac
+
           {
             printf '%s\n' "$header"
             printf '%s' "$body" | fold -w 64
