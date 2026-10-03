@@ -599,6 +599,39 @@ jobs:
           rm -rf "$work"
           echo "The API key is a valid prime256v1 private key (${#match} base64 characters)."
 
+      # The 401 says the three secrets do not authenticate together and names none of them, and asking
+      # again would say the same thing. What can be settled without Apple is whether the key in the
+      # secret is the key that was downloaded: this prints a fingerprint of the canonical PKCS#8 DER
+      # that the owner can reproduce from their own AuthKey_<KEY_ID>.p8 with one openssl command.
+      # Matching digests prove the two files hold the same key and nothing more. They do not prove that
+      # the key is the one Apple has on record, which is exactly what the 401 leaves unestablished.
+      - name: Fingerprint the API key
+        run: |
+          set -euo pipefail
+          KEY_PATH_FOR_PROBE="$KEY_PATH" node --input-type=module <<'NODE'
+          import { createHash, createPrivateKey, createPublicKey } from 'node:crypto';
+          import { readFileSync } from 'node:fs';
+
+          const pem = readFileSync(process.env.KEY_PATH_FOR_PROBE, 'utf8');
+          const key = createPrivateKey({ key: pem, format: 'pem' });
+          const hex = (bytes) => createHash('sha256').update(bytes).digest('hex');
+
+          // Exported from the parsed key rather than re-derived from the base64 by hand. The secret can
+          // arrive with escaped newlines or wrapped, and the base64 of those shapes differs even though
+          // the key is identical, so a hand-decoded digest would not be comparable with anything.
+          const privateDer = key.export({ type: 'pkcs8', format: 'der' });
+          const publicDer = createPublicKey(key).export({ type: 'spki', format: 'der' });
+
+          console.log(`${key.asymmetricKeyDetails?.namedCurve}, ${privateDer.length} bytes of canonical PKCS#8 DER`);
+          console.log(`  sha256(private DER) = ${hex(privateDer)}`);
+          console.log(`  sha256(public  DER) = ${hex(publicDer)}`);
+          console.log('These are digests of key material, not the key: neither can be turned back into it.');
+          console.log('To compare against the file downloaded from App Store Connect:');
+          console.log('  openssl pkcs8 -topk8 -nocrypt -in AuthKey_<KEY_ID>.p8 -outform DER | openssl dgst -sha256');
+          console.log('The pkcs8 step matters: `openssl pkey -outform DER` writes the SEC1 structure instead,');
+          console.log('which is a different byte sequence and digests to something not comparable.');
+          NODE
+
       # xcodebuild reports every credential problem the same way: "Communication with Apple failed: a
       # non-HTTP 200 response was received (401)", with nothing about which of the three secrets is
       # wrong. This step asks App Store Connect directly, so the run either passes here with a 200 and
