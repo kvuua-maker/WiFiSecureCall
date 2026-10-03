@@ -605,23 +605,32 @@ jobs:
                   print(f"  {detail}")
           PYTHON
 
+          # Each branch says only what that status proves. A 200 settles the signature and nothing
+          # beyond it, and a 401 does not name the secret at fault, so neither is allowed to imply a
+          # cause the run has not established.
           case "$status" in
             200|201)
-              echo 'The API key authenticates. Signing is an Xcode or provisioning matter, not a credential one.'
+              echo 'The signature is accepted for /v1/apps. That settles authentication only: whether the key can'
+              echo 'drive automatic signing, and whether the profiles exist, are not confirmed by this request.'
               ;;
             401)
-              echo '::error::App Store Connect rejected the signature, so the three secrets do not belong together.'
-              echo '::error::APPSTORE_PRIVATE_KEY and APPSTORE_KEY_ID come from one and the same AuthKey_<KEY_ID>.p8 download.'
-              echo '::error::APPSTORE_ISSUER_ID is the issuer on that same key in Users and Access -> Integrations -> App Store Connect API.'
+              echo '::error::App Store Connect rejected the signed request.'
+              echo '::error::This says the three secrets do not authenticate together. It does not name which one is'
+              echo '::error::at fault: the issuer may be another team, the key may have been revoked, or the key id may'
+              echo '::error::not belong to the uploaded .p8. Check whether AuthKey_<KEY_ID>.p8 and APPSTORE_KEY_ID share a'
+              echo '::error::key id, and whether APPSTORE_ISSUER_ID is the issuer listed on that same key.'
+              echo '::error::Apple serves the .p8 for a download only once. If the file is lost, create a new key and'
+              echo '::error::replace all three secrets together; there is nothing to re-download.'
               exit 1
               ;;
             403)
-              echo '::error::The key authenticated but App Store Connect refused access for want of a role.'
-              echo '::error::Give it the Developer role in Users and Access, or the Admin role on the team.'
+              echo '::error::The request was refused, so this says nothing about the signature. Refusal here is usually'
+              echo '::error::a role or app scope matter: check the key role in Users and Access, and whether this team'
+              echo '::error::can see the apps being listed.'
               exit 1
               ;;
             *)
-              echo '::error::App Store Connect could not be reached, so this run says nothing about the credentials.'
+              echo '::error::App Store Connect answered HTTP '"$status"', which settles nothing about the credentials.'
               exit 1
               ;;
           esac

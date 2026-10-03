@@ -54,10 +54,12 @@ Signing is automatic. `Config/Base.xcconfig` sets `CODE_SIGN_STYLE = Automatic` 
 
 Before it builds anything, the `testflight` job signs a real JWT with the key and asks App Store Connect who it is. That check exists because `xcodebuild` reports every credential problem identically, as `Communication with Apple failed: a non-HTTP 200 response was received (401)`, without saying which of the three secrets is wrong, and a 401 that is really a mismatched key looks exactly like a 401 that is really an expired one. The check separates them:
 
-| Result | Meaning |
+| Result | What it settles |
 | --- | --- |
-| `200` | The three secrets belong together. Anything that fails after this is signing or provisioning, not the key. |
-| `401` | The three do not belong together. Re-download the key: `APPSTORE_PRIVATE_KEY` and `APPSTORE_KEY_ID` come from one `AuthKey_<KEY_ID>.p8`, and `APPSTORE_ISSUER_ID` is the issuer listed next to that key. |
-| `403` | The key is good but has no role. Give it Developer in Users and Access. |
+| `200` | The signature is accepted for `/v1/apps`. Nothing more: automatic signing rights and the profiles are still unconfirmed, so a failure after this line is not a credential problem. |
+| `401` | The three secrets do not authenticate together, but the code does not name which one is at fault. The issuer may be another team, the key may have been revoked, or `APPSTORE_KEY_ID` may not belong to the uploaded `.p8`. |
+| `403` | The request was refused, which says nothing about the signature. Usually a role or app scope matter. |
+
+If the `.p8` is lost there is nothing to re-download: Apple serves the private key once, at creation. Create a new API key and replace `APPSTORE_PRIVATE_KEY`, `APPSTORE_KEY_ID` and `APPSTORE_ISSUER_ID` together.
 
 The job also reports the DER length the key structure declares. A `prime256v1` PKCS#8 key is 138 bytes, so anything else is a body that was assembled rather than downloaded, which is worth seeing before a `401`.
