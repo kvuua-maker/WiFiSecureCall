@@ -347,9 +347,11 @@ jobs:
           fi
           echo 'App Store Connect API key found.'
 
-      # Accepts the key as raw PEM, as base64, or as a single line with escaped newlines, because all
-      # three are common ways to paste an AuthKey file into a repository secret. openssl is used instead
-      # of base64 so the step behaves the same on the macOS runner and on Linux.
+      # The AuthKey .p8 gets pasted into a repository secret in several ways, and copying it through
+      # verbatim only works for some of them. A PEM pasted as one long line keeps its header but loses
+      # the line wrapping, and openssl refuses to read that. So the PEM is rebuilt from the markers and
+      # the body is rewrapped, which accepts PEM with real newlines, PEM with escaped newlines, PEM on
+      # one line with no separators, and any of those base64 encoded.
       - name: Write the App Store Connect API key
         env:
           PRIVATE_KEY: ${{ secrets.APPSTORE_PRIVATE_KEY }}
@@ -357,20 +359,64 @@ jobs:
           set -euo pipefail
           umask 077
           mkdir -p "$(dirname "$KEY_PATH")"
-          if printf '%s' "$PRIVATE_KEY" | tr -d '\n' | openssl base64 -d -A > "$KEY_PATH" 2>/dev/null \
-             && head -1 "$KEY_PATH" | grep -q 'BEGIN PRIVATE KEY'; then
+          work="$(mktemp -d)"
+
+          # Collapsed onto one line before anything is looked for, so a PEM that lost its line breaks is
+          # still recognized. Escaped newlines become real ones, carriage returns and a byte order mark
+          # go away. Spaces stay, because the PEM markers contain them; the body filter below drops the
+          # ones that do not belong there.
+          flat="$(printf '%s' "$PRIVATE_KEY" | sed -e 's/\\n/\n/g' | LC_ALL=C tr -d '\t\r\n\357\273\277')"
+
+          if ! printf '%s' "$flat" | grep -q -- '-----BEGIN'; then
+            # No marker anywhere, so the only remaining shape is the whole PEM base64 encoded.
+            printf '%s' "$flat" | openssl base64 -d -A > "$work/decoded" 2>/dev/null || true
+            if ! grep -q -- '-----BEGIN' "$work/decoded" 2>/dev/null; then
+              echo '::error::APPSTORE_PRIVATE_KEY contains no PEM marker. It must hold the AuthKey .p8 file.'
+              exit 1
+            fi
+            flat="$(LC_ALL=C tr -d '\t\r\n' < "$work/decoded")"
             echo 'Decoded a base64 encoded API key.'
-          else
-            printf '%s\n' "$PRIVATE_KEY" | sed 's/\\n/\n/g' > "$KEY_PATH"
-            echo 'Using the API key as stored.'
           fi
-          if ! grep -q 'BEGIN PRIVATE KEY' "$KEY_PATH"; then
-            echo '::error::APPSTORE_PRIVATE_KEY is neither a PEM key nor base64 encoded PEM.'
+
+          # `|| true` because pipefail would otherwise end the step, silently, the moment grep finds no
+          # marker. The emptiness of the results is what the check below reports.
+          header="$(printf '%s' "$flat" | grep -oE -- '\-{5}BEGIN[A-Z0-9 ]+\-{5}' | head -1 || true)"
+          footer="$(printf '%s' "$flat" | grep -oE -- '\-{5}END[A-Z0-9 ]+\-{5}' | head -1 || true)"
+          body="$(printf '%s' "$flat" \
+            | sed -E -e 's/^.*\-{5}BEGIN[A-Z0-9 ]+\-{5}//' -e 's/\-{5}END[A-Z0-9 ]+\-{5}.*$//' \
+            | LC_ALL=C tr -dc 'A-Za-z0-9+/=')"
+          if [ -z "$header" ] || [ -z "$footer" ] || [ -z "$body" ]; then
+            echo '::error::APPSTORE_PRIVATE_KEY is missing the PEM header, the footer or the key body.'
             exit 1
           fi
+
+          {
+            printf '%s\n' "$header"
+            printf '%s' "$body" | fold -w 64
+            printf '\n%s\n' "$footer"
+          } > "$KEY_PATH"
           chmod 600 "$KEY_PATH"
-          openssl pkey -in "$KEY_PATH" -noout -check >/dev/null 2>&1 \
-            || echo '::warning::openssl could not parse the key; xcodebuild will report the real problem.'
+
+          # A hard failure on purpose. A key openssl cannot read is one xcodebuild would reject much
+          # later, and its own error is far harder to read than this one.
+          if ! openssl pkey -in "$KEY_PATH" -noout -check >/dev/null 2>"$work/error"; then
+            echo "::error::The API key is not a readable private key. openssl says: $(tr '\n' ' ' < "$work/error")"
+            echo '::error::APPSTORE_PRIVATE_KEY must be the AuthKey_<KEY_ID>.p8 downloaded from App Store Connect.'
+            exit 1
+          fi
+          # App Store Connect only ever issues EC prime256v1 keys, and the requests it signs are ES256
+          # JWTs. A key of any other type parses fine and then fails much later with a 401, so it is
+          # rejected here where the message can still say what is actually wrong.
+          curve="$(openssl pkey -in "$KEY_PATH" -noout -text 2>/dev/null | grep -m1 -E 'ASN1 OID|NIST CURVE' || true)"
+          case "$curve" in
+            *prime256v1*|*P-256*) ;;
+            *)
+              echo "::error::The API key must be the EC prime256v1 key App Store Connect issues, but this one is: ${curve:-not an EC key}"
+              exit 1
+              ;;
+          esac
+          rm -rf "$work"
+          echo 'The API key is a valid prime256v1 private key.'
 
       - name: Materialize Config/Secrets.xcconfig
         env:
