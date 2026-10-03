@@ -350,7 +350,7 @@ jobs:
           fi
           # Shapes only, never the values. A 401 from App Store Connect is almost always one of these
           # three disagreeing with each other, and the log is the only place the pairings are visible:
-          # a key id is 10 characters, an issuer id 39, and neither may carry stray whitespace from a
+          # a key id is 10 characters, an issuer id 36, and neither may carry stray whitespace from a
           # copy and paste, which is what makes them fail in a way that looks like bad credentials.
           case "$KEY_ID" in
             *[[:space:]]*) echo '::error::APPSTORE_KEY_ID contains whitespace. Re-save it without spaces or a trailing newline.'; exit 1 ;;
@@ -359,7 +359,7 @@ jobs:
             *[[:space:]]*) echo '::error::APPSTORE_ISSUER_ID contains whitespace. Re-save it without spaces or a trailing newline.'; exit 1 ;;
           esac
           echo "APPSTORE_KEY_ID is ${#KEY_ID} characters (an App Store Connect key id has 10)."
-          echo "APPSTORE_ISSUER_ID is ${#ISSUER_ID} characters (an issuer id is a 39 character UUID)."
+          echo "APPSTORE_ISSUER_ID is ${#ISSUER_ID} characters (an issuer id is a 36 character UUID)."
           [ "${#KEY_ID}" -eq 10 ] || echo '::warning::That is not a 10 character key id. Check APPSTORE_KEY_ID against the AuthKey file name.'
           # The issuer is a UUID. Checking the shape catches the common mistakes at a glance: a team id
           # pasted instead, or the value from a different key's page.
@@ -500,6 +500,131 @@ jobs:
           chmod 600 "$KEY_PATH"
           rm -rf "$work"
           echo "The API key is a valid prime256v1 private key (${#match} base64 characters)."
+
+      # xcodebuild reports every credential problem the same way: "Communication with Apple failed: a
+      # non-HTTP 200 response was received (401)", with nothing about which of the three secrets is
+      # wrong. This step asks App Store Connect directly, so the run either passes here with a 200 and
+      # the archive is attempted, or it stops with the one fact that decides what to re-save.
+      - name: Verify the key against App Store Connect
+        env:
+          KEY_ID: ${{ secrets.APPSTORE_KEY_ID }}
+          ISSUER_ID: ${{ secrets.APPSTORE_ISSUER_ID }}
+        run: |
+          set -euo pipefail
+          umask 077
+          work="$(mktemp -d)"
+
+          # The length the key structure declares. A prime256v1 PKCS#8 body is 138 bytes, which is 184
+          # base64 characters. Anything else is still a key openssl can read, but it is a body that was
+          # assembled rather than downloaded, and that is worth seeing in the log before a 401.
+          declared_bytes="$(openssl asn1parse -in "$KEY_PATH" -inform PEM 2>/dev/null \
+            | head -1 | grep -oE 'hl= *[0-9]+|(^| )l= *[0-9]+' | grep -oE '[0-9]+' \
+            | awk '{ total += $1 } END { print total }')"
+          echo "The key structure declares ${declared_bytes:-unknown} DER bytes."
+
+          # ES256, which is what App Store Connect issues and what the requests it signs require. The
+          # signature openssl produces is DER encoded, and ES256 expects the bare r and s values, so the
+          # conversion happens here rather than being left to whichever reader sees the JWT.
+          cat > "$work/jwt.py" <<'PYTHON'
+          import base64
+          import json
+          import os
+          import subprocess
+          import sys
+          import time
+
+          key_path, key_id, issuer_id = sys.argv[1], sys.argv[2], sys.argv[3]
+          work = os.environ["JWT_WORK"]
+
+          def b64url(raw):
+              return base64.urlsafe_b64encode(raw).decode().rstrip("=")
+
+          compact = lambda value: json.dumps(value, separators=(",", ":"))
+          header = b64url(compact({"alg": "ES256", "kid": key_id, "typ": "JWT"}).encode())
+          issued = int(time.time())
+          payload = b64url(compact({
+              "iss": issuer_id,
+              "iat": issued,
+              "exp": issued + 1200,
+              "aud": "appstoreconnect-v1",
+          }).encode())
+          signing_input = f"{header}.{payload}"
+
+          with open(f"{work}/signing_input", "wb") as fh:
+              fh.write(signing_input.encode())
+          subprocess.run(
+              ["openssl", "dgst", "-sha256", "-sign", key_path, "-out", f"{work}/der", f"{work}/signing_input"],
+              check=True,
+          )
+
+          der = open(f"{work}/der", "rb").read()
+
+          # SEQUENCE { INTEGER r, INTEGER s }. Each integer is 32 bytes, plus a leading zero byte when
+          # the top bit is set, so every one is padded or cut back down to 32 before they are joined.
+          def to_raw(der):
+              index = 2 if der[1] < 0x80 else 2 + (der[1] & 0x7F)
+              if der[0] != 0x30:
+                  raise SystemExit("the signature is not a DER SEQUENCE")
+              parts = []
+              for _ in range(2):
+                  if der[index] != 0x02:
+                      raise SystemExit("the signature does not hold two INTEGERs")
+                  length = der[index + 1]
+                  parts.append(der[index + 2:index + 2 + length].rjust(32, b"\x00")[-32:])
+                  index += 2 + length
+              return b"".join(parts)
+
+          sys.stdout.write(signing_input + "." + b64url(to_raw(der)))
+          PYTHON
+
+          token="$(JWT_WORK="$work" python3 "$work/jwt.py" "$KEY_PATH" "$KEY_ID" "$ISSUER_ID")"
+          rm -rf "$work"
+
+          status="$(curl --silent --show-error --max-time 30 --output "$RUNNER_TEMP/asc.json" --write-out '%{http_code}' \
+            --header "Authorization: Bearer $token" \
+            'https://api.appstoreconnect.apple.com/v1/apps?limit=1')"
+          echo "App Store Connect answered the signed request with HTTP $status."
+
+          # Apple states the reason in the body, in words. Losing it here would mean losing the only
+          # sentence that names the problem, because xcodebuild prints none of this.
+          python3 - "$RUNNER_TEMP/asc.json" <<'PYTHON'
+          import json
+          import sys
+
+          try:
+              with open(sys.argv[1]) as fh:
+                  errors = json.load(fh).get("errors", [])
+          except Exception:
+              raise SystemExit(0)
+          for error in errors:
+              code = error.get("code", "?")
+              title = error.get("title", "")
+              detail = error.get("detail", "")
+              print(f"App Store Connect said [{code}]: {title}")
+              if detail:
+                  print(f"  {detail}")
+          PYTHON
+
+          case "$status" in
+            200|201)
+              echo 'The API key authenticates. Signing is an Xcode or provisioning matter, not a credential one.'
+              ;;
+            401)
+              echo '::error::App Store Connect rejected the signature, so the three secrets do not belong together.'
+              echo '::error::APPSTORE_PRIVATE_KEY and APPSTORE_KEY_ID come from one and the same AuthKey_<KEY_ID>.p8 download.'
+              echo '::error::APPSTORE_ISSUER_ID is the issuer on that same key in Users and Access -> Integrations -> App Store Connect API.'
+              exit 1
+              ;;
+            403)
+              echo '::error::The key authenticated but App Store Connect refused access for want of a role.'
+              echo '::error::Give it the Developer role in Users and Access, or the Admin role on the team.'
+              exit 1
+              ;;
+            *)
+              echo '::error::App Store Connect could not be reached, so this run says nothing about the credentials.'
+              exit 1
+              ;;
+          esac
 
       - name: Materialize Config/Secrets.xcconfig
         env:

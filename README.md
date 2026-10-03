@@ -48,6 +48,16 @@ Repository secrets, all optional for the default path:
 | `APPSTORE_KEY_ID`, `APPSTORE_ISSUER_ID`, `APPSTORE_PRIVATE_KEY` | the App Store Connect API key, the only Apple credential the `testflight` job needs |
 | `GH_PAT` | optional, only to publish the release with a personal token instead of `GITHUB_TOKEN` |
 
-Signing is automatic. The project pins manual signing in its Release configurations, but the `testflight` job overrides that from the command line and passes `-allowProvisioningUpdates` with the API key, so `xcodebuild` creates or refreshes the Apple Distribution certificate and both provisioning profiles itself. Nothing to upload but the key: no `.p12`, no password and no `.mobileprovision`.
+Signing is automatic. `Config/Base.xcconfig` sets `CODE_SIGN_STYLE = Automatic` and pins no certificate or profile, and the `testflight` job passes `-allowProvisioningUpdates` with the API key, so `xcodebuild` creates or refreshes the Apple Distribution certificate and both provisioning profiles itself. Nothing to upload but the key: no `.p12`, no password and no `.mobileprovision`.
 
 `APPSTORE_PRIVATE_KEY` accepts the contents of `AuthKey_<KEY_ID>.p8` pasted as PEM, as base64, or as one line with `\n` escapes, so it does not matter how the secret was filled in. The key must belong to a role with the Developer role in App Store Connect, and it is the only secret that leaves Apple; `xcodebuild` reuses it for the upload.
+
+Before it builds anything, the `testflight` job signs a real JWT with the key and asks App Store Connect who it is. That check exists because `xcodebuild` reports every credential problem identically, as `Communication with Apple failed: a non-HTTP 200 response was received (401)`, without saying which of the three secrets is wrong, and a 401 that is really a mismatched key looks exactly like a 401 that is really an expired one. The check separates them:
+
+| Result | Meaning |
+| --- | --- |
+| `200` | The three secrets belong together. Anything that fails after this is signing or provisioning, not the key. |
+| `401` | The three do not belong together. Re-download the key: `APPSTORE_PRIVATE_KEY` and `APPSTORE_KEY_ID` come from one `AuthKey_<KEY_ID>.p8`, and `APPSTORE_ISSUER_ID` is the issuer listed next to that key. |
+| `403` | The key is good but has no role. Give it Developer in Users and Access. |
+
+The job also reports the DER length the key structure declares. A `prime256v1` PKCS#8 key is 138 bytes, so anything else is a body that was assembled rather than downloaded, which is worth seeing before a `401`.
