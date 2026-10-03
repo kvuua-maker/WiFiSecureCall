@@ -821,10 +821,14 @@ jobs:
       # The export needs the same App Store Connect credentials the archive used, and it takes them
       # the way xcodebuild documents for -exportArchive: as authentication flags on the command line,
       # the same flags the archive step above already uses. The credentials used to sit in an
-      # uploadAPIKey dictionary inside ExportOptions.plist, and nothing could establish that Xcode
-      # reads it: plutil -lint only proves the file is well-formed XML, and xcodebuild -help documents
-      # command line options rather than plist keys. A field there that Xcode ignores fails at upload
-      # time, long after the archive, which is exactly where this job needs no new unknown.
+      # uploadAPIKey dictionary inside ExportOptions.plist. Xcode 27.0 does enumerate the
+      # ExportOptions.plist keys it recognises in xcodebuild -help, and uploadAPIKey is absent from that
+      # list while manageAppVersionAndBuildNumber, signingStyle, signingCertificate, uploadSymbols,
+      # teamID, destination, method and provisioningProfiles are all named. So that field rested on an
+      # assumption rather than on documentation, and a field Xcode does not read fails at upload time,
+      # long after the archive, which is exactly where this job needs no new unknown. Being documented
+      # is not evidence that an export succeeds: only an export that runs to completion is, and no run
+      # has reached this step.
       - name: Upload to TestFlight
         env:
           KEY_ID: ${{ secrets.APPSTORE_KEY_ID }}
