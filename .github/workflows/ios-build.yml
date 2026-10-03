@@ -146,19 +146,22 @@ jobs:
           device="$(xcrun simctl list devices available -j | python3 -c '
           import json, sys
           devices = json.load(sys.stdin)["devices"]
+          # Only iOS runtimes can host these tests. Taking the newest runtime of any platform picks the
+          # watchOS one, because its version is not lower.
+          ios = [runtime for runtime in devices if ".iOS-" in runtime]
           # Runtimes are keyed by identifier and are not ordered newest first, so compare versions.
           def version(runtime):
               tail = runtime.rsplit(".", 1)[-1]
               return [int(part) for part in tail.split("-") if part.isdigit()]
-          newest = max(devices, key=version, default=None)
+          newest = max(ios, key=version, default=None)
           if newest is None:
-              raise SystemExit("no simulator runtime is available")
+              raise SystemExit("no iOS simulator runtime is available")
           for candidate in devices[newest]:
               if candidate.get("isAvailable") and candidate.get("name", "").startswith("iPhone"):
                   print(candidate["name"])
                   break
           else:
-              raise SystemExit("no available iPhone simulator on the newest runtime " + newest)
+              raise SystemExit("no available iPhone simulator on the newest iOS runtime " + newest)
           ')"
           echo "Running the unit tests on iPhone simulator: $device"
 
