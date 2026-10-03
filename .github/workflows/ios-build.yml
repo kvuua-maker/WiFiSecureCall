@@ -365,10 +365,14 @@ jobs:
           work="$(mktemp -d)"
 
           # Collapsed onto one line before anything is looked for, so a PEM that lost its line breaks is
-          # still recognized. Escaped newlines become real ones, carriage returns and a byte order mark
-          # go away. Spaces stay, because the PEM markers contain them; the body filter below drops the
-          # ones that do not belong there.
-          flat="$(printf '%s' "$PRIVATE_KEY" | sed -e 's/\\n/\n/g' | LC_ALL=C tr -d '\t\r\n\357\273\277')"
+          # still recognized. Spaces stay, because the PEM markers contain them; the body filter below
+          # drops the ones that do not belong there.
+          #
+          # The escaped carriage return is removed before the escaped newline. A value pasted out of
+          # JSON or a Windows editor carries \r\n, and dropping only the real characters would leave a
+          # literal backslash-r behind, whose letter the body filter keeps: the base64 would then gain
+          # one stray character per line and openssl would reject a key that is in fact intact.
+          flat="$(printf '%s' "$PRIVATE_KEY" | sed -e 's/\\r//g' -e 's/\\n/\n/g' | LC_ALL=C tr -d '\t\r\n\357\273\277')"
 
           if ! printf '%s' "$flat" | grep -q -- '-----BEGIN'; then
             # No marker anywhere, so the only remaining shape is the whole PEM base64 encoded.
