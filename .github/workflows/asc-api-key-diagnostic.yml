@@ -1,17 +1,18 @@
 name: App Store Connect API key diagnostic
 
-# An isolated check of one question: does App Store Connect accept this API key?
+# An isolated diagnosis of one question: does App Store Connect accept this API key?
 #
 # It compiles nothing, archives nothing and publishes nothing, and it runs on workflow_dispatch only.
-# Its purpose is to separate a credential problem from a signing-code problem. ios-build.yml signs its
-# JWT with Python and OpenSSL and reports whatever Apple answers; if that answer is a 401, there is no
-# telling whether the secrets disagree or the code does. This workflow signs the same secrets with
-# jose, an implementation sharing no code with it, so the two results can be compared.
+# Its purpose is to separate a credential problem from a defect in the signing code. ios-build.yml
+# signs its JWT with Python and OpenSSL and reports whatever Apple answers; when that answer is a 401
+# there is no telling whether the secrets disagree or the code does. This workflow signs the same
+# secrets with jose, which shares no code with it, and then checks each step of the path in turn so
+# that what is proven and what merely remains unproven are both visible.
 #
 # The private key is read from the secret as it stands. Nothing is trimmed, decoded or reconstructed,
 # because a key that needed rescuing would pass here while still failing in Xcode.
 #
-# Secrets are never printed. The log carries shapes, lengths, a public key fingerprint and Apple's own
+# Secrets are never printed. The log carries booleans, lengths, a public key digest and Apple's own
 # error text.
 
 on:
@@ -28,7 +29,7 @@ jobs:
   probe:
     name: Sign a request with jose and ask Apple
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v7
 
@@ -36,8 +37,8 @@ jobs:
         with:
           node-version: '22'
 
-      - name: Install jose
-        run: npm install --no-save --prefix "$RUNNER_TEMP/probe" jose@5
+      - name: Install the libraries
+        run: npm install --no-save --prefix "$RUNNER_TEMP/probe" jose@5 js-yaml@4
 
       # The secret is written to disk verbatim so the probe can read it as a file. GitHub hands a
       # secret over as an environment variable, which cannot carry the newlines a PEM needs, so the
@@ -48,7 +49,6 @@ jobs:
         run: |
           set -euo pipefail
           umask 077
-          mkdir -p "$RUNNER_TEMP/probe"
           if [ -z "${PRIVATE_KEY:-}" ]; then
             echo '::error::APPSTORE_PRIVATE_KEY is not set on this repository.'
             exit 1
@@ -56,7 +56,45 @@ jobs:
           printf '%s' "$PRIVATE_KEY" > "$RUNNER_TEMP/probe/AuthKey.p8"
           echo "Wrote the secret verbatim: $(wc -c < "$RUNNER_TEMP/probe/AuthKey.p8") bytes, not printed."
 
-      - name: Ask App Store Connect who the key is
+      # Runs the real key writing step out of ios-build.yml, taken from the branch rather than pasted
+      # here, so the comparison is against the code that actually runs. If the two readers derive
+      # different public keys then the workflow is altering the key it signs with, which no amount of
+      # openssl validation would reveal. The step is optional: the check needs js-yaml and the step
+      # itself, and neither failing should hide the rest of the diagnosis.
+      - name: Run the production key writing step for comparison
+        env:
+          PRODUCTION_BRANCH: kilo/ivory-lance-nmi
+        run: |
+          set -euo pipefail
+          umask 077
+          mkdir -p "$RUNNER_TEMP/probe"
+          export NODE_PATH="$RUNNER_TEMP/probe/node_modules"
+          git fetch --depth=1 origin "$PRODUCTION_BRANCH"
+          if ! git show "FETCH_HEAD:.github/workflows/ios-build.yml" > "$RUNNER_TEMP/probe/production.yml" 2>/dev/null; then
+            echo 'Could not read ios-build.yml from the branch; the key comparison will be skipped.'
+            exit 0
+          fi
+          if ! node -e '
+            const yaml = require("js-yaml");
+            const fs = require("node:fs");
+            const doc = yaml.load(fs.readFileSync(process.argv[1], "utf8"));
+            const step = doc.jobs.testflight.steps.find((s) => s.name === "Write the App Store Connect API key");
+            if (!step) process.exit(3);
+            fs.writeFileSync(process.argv[2], step.run);
+          ' "$RUNNER_TEMP/probe/production.yml" "$RUNNER_TEMP/probe/key-step.sh"; then
+            echo 'That step is not present on the branch; the key comparison will be skipped.'
+            exit 0
+          fi
+          export KEY_PATH="$RUNNER_TEMP/probe/workflow-processed.p8"
+          if bash "$RUNNER_TEMP/probe/key-step.sh" > "$RUNNER_TEMP/probe/key-step.log" 2>&1; then
+            echo "The production key writing step ran and produced $(wc -c < "$KEY_PATH") bytes."
+          else
+            echo "::warning::The production key writing step failed here; the key comparison is skipped."
+            sed -E 's/(BEGIN|END) [A-Z ]+/*** KEY MARKER ***/' "$RUNNER_TEMP/probe/key-step.log" | tail -6
+            rm -f "$KEY_PATH"
+          fi
+
+      - name: Run the probe
         env:
           KEY_ID: ${{ secrets.APPSTORE_KEY_ID }}
           ISSUER_ID: ${{ secrets.APPSTORE_ISSUER_ID }}
@@ -67,27 +105,19 @@ jobs:
             exit 1
           fi
           cp .github/actions/asc-auth-probe/probe.mjs "$RUNNER_TEMP/probe/probe.mjs"
+          processed=''
+          [ -f "$RUNNER_TEMP/probe/workflow-processed.p8" ] && processed="$RUNNER_TEMP/probe/workflow-processed.p8"
           NODE_PATH="$RUNNER_TEMP/probe/node_modules" \
             node "$RUNNER_TEMP/probe/probe.mjs" \
-              "$RUNNER_TEMP/probe/AuthKey.p8" "$KEY_ID" "$ISSUER_ID"
+              "$RUNNER_TEMP/probe/AuthKey.p8" \
+              "$KEY_ID" \
+              "$ISSUER_ID" \
+              '54ef353e-06cf-40e5-a6a2-176655627032' \
+              '62TCR6LG4Y' \
+              "$processed"
 
-      # Answers one question without naming the value: is the stored key id the one the owner expects?
-      # A mismatch here would mean the secret was saved from a different key than the one in hand,
-      # which reads from Apple's side as the same 401 as a revoked key.
-      - name: Check the key id against the expected one
-        env:
-          KEY_ID: ${{ secrets.APPSTORE_KEY_ID }}
-          EXPECTED_KEY_ID: 62TCR6LG4Y
-        run: |
-          set -euo pipefail
-          if [ "$KEY_ID" = "$EXPECTED_KEY_ID" ]; then
-            echo 'KEY_ID_MATCH=true'
-          else
-            echo 'KEY_ID_MATCH=false'
-          fi
-
-      # Removes the temporary files the probe and this comparison need, and takes the comparison value
-      # with them, so neither survives the job.
+      # Removes the key and the comparison files together with the value compared against, so neither
+      # survives the job.
       - name: Remove the key
         if: always()
         run: rm -rf "$RUNNER_TEMP/probe"

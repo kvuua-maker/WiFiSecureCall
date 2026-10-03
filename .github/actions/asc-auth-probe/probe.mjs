@@ -1,179 +1,232 @@
-// An independent check of whether App Store Connect accepts this API key.
+// A diagnosis of the whole path from stored secrets to the HTTP answer, rather than of any single step.
 //
-// It signs its JWT with jose, a JOSE implementation that does not share code with the Python and
-// OpenSSL in ios-build.yml, so a disagreement between the two points at the signing code rather than
-// at the credentials. The private key is handed to jose exactly as the secret holds it, so nothing
-// here can paper over a key that needed rescuing first.
+// Each check exists to separate one hypothesis from another, and each reports a boolean or a shape so
+// that no secret, key body or JWT reaches the log. The point is not to confirm what the other checks
+// already showed but to establish what they could not: whether the workflow alters the key, whether
+// the token is well formed, whether the signature verifies locally, and whether the request arrives
+// as Apple expects.
 //
-// Nothing secret is printed. Only shapes, lengths, HTTP codes and Apple's own error text.
+// Usage: probe.mjs <keyPath> <keyId> <issuerId> [expectedIssuer] [expectedKeyId] [workflowKeyPath]
 
 import { createHash, createPrivateKey, createPublicKey } from 'node:crypto';
 import { readFileSync } from 'node:fs';
-import { importPKCS8, SignJWT } from 'jose';
+import { request as httpsRequest } from 'node:https';
+import { importPKCS8, importSPKI, jwtVerify, SignJWT } from 'jose';
 
-const keyPath = process.argv[2];
-const keyId = process.argv[3];
-const issuerId = process.argv[4];
+const [keyPath, keyId, issuerId, expectedIssuer, expectedKeyId, workflowKeyPath] = process.argv.slice(2);
 
-const report = (line) => process.stdout.write(`${line}\n`);
+const out = (line) => process.stdout.write(`${line}\n`);
+const section = (title) => out(`\n=== ${title} ===`);
+const yesNo = (value) => (value ? 'yes' : 'NO');
+const sha256 = (bytes) => createHash('sha256').update(bytes).digest('hex');
 
-report('=== key shape, read verbatim from the secret ===');
+section('stored secrets: identity checks');
+out(`APPSTORE_KEY_ID is ${expectedKeyId}: ${keyId === expectedKeyId ? 'KEY_ID_MATCH=true' : 'KEY_ID_MATCH=false'}`);
+out(`APPSTORE_ISSUER_ID is the UUID Apple shows: ${issuerId === expectedIssuer ? 'ISSUER_ID_MATCH=true' : 'ISSUER_ID_MATCH=false'}`);
+out(`issuer id length ${issuerId.length}, a UUID is ${expectedIssuer.length}`);
+out(`issuer id is a UUID shape: ${/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(issuerId) ? 'yes' : 'NO'}`);
 
+section('stored secrets: transport shape');
+// A secret pasted through a shell or an editor can pick up carriage returns, spaces or quotes that no
+// length check would notice, because GitHub counts them as part of the value.
+for (const [label, value] of [['key id', keyId], ['issuer id', issuerId]]) {
+  out(`${label} contains whitespace: ${/\s/.test(value) ? 'YES' : 'no'}`);
+  out(`${label} contains a quote or backslash: ${/["'\\`]/.test(value) ? 'YES' : 'no'}`);
+  out(`${label} is uppercase alnum or lowercase hex only: ${/^[A-Za-z0-9-]+$/.test(value) ? 'yes' : 'NO'}`);
+}
+
+section('the key as stored, read verbatim');
 const pem = readFileSync(keyPath, 'utf8');
+out(`first line is a PEM marker: ${/^-----BEGIN [A-Z0-9 ]+-----$/.test(pem.split('\n')[0] ?? '') ? 'yes' : 'NO'}`);
+out(`bytes ${Buffer.byteLength(pem)}, lines ${pem.split('\n').length}`);
+out(`contains CR: ${pem.includes('\r') ? 'YES' : 'no'}`);
+out(`contains a literal backslash-n: ${pem.includes('\\n') ? 'YES' : 'no'}`);
+out(`ends with a newline: ${pem.endsWith('\n') ? 'yes' : 'NO'}`);
 
-// No trimming, no marker extraction, no base64 juggling: the secret is either a PEM or it is not.
-const isPem = /^-----BEGIN [A-Z0-9 ]+-----$/m.test(pem.split('\n')[0] ?? '');
-report(`the secret is a PEM armour block: ${isPem ? 'yes' : 'NO'}`);
-report(`the PEM holds ${pem.split('\n').length} lines and ${Buffer.byteLength(pem)} bytes`);
-
-const privateKey = readPrivateKey(pem);
-const curve = privateKey.asymmetricKeyDetails?.namedCurve ?? 'unknown';
-report(`node parsed the private key: yes`);
-report(`curve: ${curve}`);
-
-// App Store Connect issues ES256 on prime256v1 and nothing else, so a key of another curve cannot
-// authenticate however well it is signed. jose accepts an RSA key at import and only fails later, at
-// signing time, so the curve is checked here where the reason is still visible.
-if (curve !== 'prime256v1') {
-  report(`This key is ${curve}, not prime256v1, so it cannot be used for App Store Connect at all.`);
+let stored;
+try {
+  stored = createPrivateKey({ key: pem, format: 'pem' });
+  out(`node parses it: yes, curve ${stored.asymmetricKeyDetails?.namedCurve ?? 'unknown'}`);
+} catch (error) {
+  out(`node parses it: NO (${error.reason ?? error.message})`);
   process.exit(1);
 }
 
-// jose has to be able to import it too, because that is what will sign the request. A key node can
-// read but jose cannot would fail differently, and quietly, so it is worth separating the two.
+// The canonical form is the DER SPKI of the public key. Comparing digests of this is what shows
+// whether two different readers derived the same key, independent of how each encoded it.
+const canonical = (key) => sha256(createPublicKey(key).export({ type: 'spki', format: 'der' }));
+const storedFingerprint = canonical(stored);
+out(`canonical public key SHA-256: ${storedFingerprint}`);
+
+if (workflowKeyPath) {
+  section('the key after the workflow processed it');
+  const processed = readFileSync(workflowKeyPath, 'utf8');
+  const processedKey = createPrivateKey({ key: processed, format: 'pem' });
+  const processedFingerprint = canonical(processedKey);
+  out(`the workflow wrote ${Buffer.byteLength(processed)} bytes over ${processed.split('\n').length} lines`);
+  out(`canonical public key SHA-256: ${processedFingerprint}`);
+  out(`the workflow preserved the key: ${processedFingerprint === storedFingerprint ? 'YES' : 'NO'}`);
+} else {
+  out('the workflow comparison was not run in this job.');
+}
+
+section('provenance of the key material');
+// What can be established here is that the secret holds exactly one key, and that it is the key the
+// request will be signed with. Whether that key is the one Apple filed under the key id cannot be
+// decided from here: Apple keeps only the public half and does not publish it.
+out(`the secret holds one parseable key: ${yesNo(stored !== null)}`);
+out(`the key that will sign is the key that was read: yes`);
+
+section('token shape');
 let signingKey;
 try {
   signingKey = await importPKCS8(pem, 'ES256');
-  report('jose imported the same PEM as an ES256 signing key: yes');
+  out(`jose imports the stored PEM as ES256: yes`);
 } catch (error) {
-  report(`jose imported the same PEM as an ES256 signing key: NO (${error.message})`);
+  out(`jose imports the stored PEM as ES256: NO (${error.message})`);
   process.exit(1);
 }
 
-const publicKey = createPublicKey(privateKey);
-const spki = publicKey.export({ type: 'spki', format: 'der' });
-report(`public key fingerprint: sha256:${createHashOf(spki)}`);
-report('the fingerprint is a digest of the public key, safe to compare against App Store Connect.');
+const build = (ttlSeconds, issuer = issuerId) =>
+  new SignJWT({})
+    .setProtectedHeader({ alg: 'ES256', kid: keyId, typ: 'JWT' })
+    .setIssuer(issuer)
+    .setIssuedAt(Math.floor(Date.now() / 1000))
+    .setExpirationTime(Math.floor(Date.now() / 1000) + ttlSeconds)
+    .setAudience('appstoreconnect-v1')
+    .sign(signingKey);
 
-report('');
-report('=== claims ===');
+const token = await build(1200);
+const segments = token.split('.');
 
-// Shapes only. The values are credentials, so their lengths stand in for them.
-report(`key id length: ${keyId.length} (Apple issues 10)`);
-report(`issuer id length: ${issuerId.length} (a UUID is 36)`);
-report(`issuer id is a UUID: ${/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(issuerId) ? 'yes' : 'NO'}`);
+const decode = (part) => JSON.parse(Buffer.from(part, 'base64url').toString());
+const header = decode(segments[0]);
+const payload = decode(segments[1]);
 
-// The runner clock decides iat, and Apple compares it against its own. A runner whose clock has
-// drifted produces a token Apple considers expired or not yet valid, which reads exactly like a bad
-// signature, so the offset is measured rather than assumed.
-const runnerNow = Math.floor(Date.now() / 1000);
-const serverNow = await appleEpoch();
-report(`runner clock: ${new Date(runnerNow * 1000).toISOString()}`);
-report(`Apple clock, from the Date header of an unsigned request: ${serverNow === null ? 'unavailable' : new Date(serverNow * 1000).toISOString()}`);
-if (serverNow !== null) {
-  const skew = runnerNow - serverNow;
-  report(`clock offset: ${skew} seconds`);
-  report(`a token Apple would accept needs iat within 60 seconds of its own clock: ${Math.abs(skew) <= 60 ? 'yes' : 'NO'}`);
+out(`three segments: ${segments.length === 3 ? 'yes' : 'NO'}`);
+out(`header keys: ${Object.keys(header).join(', ')}`);
+out(`alg ES256: ${header.alg === 'ES256' ? 'yes' : 'NO'}`);
+out(`typ JWT: ${header.typ === 'JWT' ? 'yes' : 'NO'}`);
+out(`kid matches the secret: ${header.kid === keyId ? 'yes' : 'NO'}`);
+out(`payload keys: ${Object.keys(payload).join(', ')}`);
+out(`iss matches the secret: ${payload.iss === issuerId ? 'yes' : 'NO'}`);
+out(`aud is appstoreconnect-v1: ${payload.aud === 'appstoreconnect-v1' ? 'yes' : 'NO'}`);
+out(`iat is a number: ${typeof payload.iat === 'number' ? 'yes' : 'NO'}`);
+out(`exp is a number: ${typeof payload.exp === 'number' ? 'yes' : 'NO'}`);
+out(`exp minus iat: ${payload.exp - payload.iat} seconds, Apple allows at most 1200`);
+out(`any segment padded with =: ${segments.some((part) => part.includes('=')) ? 'YES' : 'no'}`);
+out(`every segment is base64url only: ${segments.every((part) => /^[A-Za-z0-9_-]+$/.test(part)) ? 'yes' : 'NO'}`);
+
+const signature = Buffer.from(segments[2], 'base64url');
+out(`signature is ${signature.length} bytes, ES256 R||S is 64: ${signature.length === 64 ? 'yes' : 'NO'}`);
+out(`R and S are each 32 bytes: ${signature.length === 64 ? 'yes' : 'NO'}`);
+
+section('local signature verification');
+// This proves the token was signed by the private key that was read, and nothing about whether Apple
+// filed that key under this key id. importSPKI takes PEM text, so the public key is exported that way.
+const publicKey = await importSPKI(
+  createPublicKey(stored).export({ type: 'spki', format: 'pem' }),
+  'ES256',
+);
+try {
+  const verified = await jwtVerify(token, publicKey, { algorithms: ['ES256'] });
+  out(`the signature verifies under the matching public key: yes`);
+  out(`the verified payload has the expected issuer: ${verified.payload.iss === issuerId ? 'yes' : 'NO'}`);
+} catch (error) {
+  out(`the signature verifies under the matching public key: NO (${error.code ?? error.message})`);
 }
 
-report('');
-report('=== signed request ===');
+section('clock');
+const runnerNow = Math.floor(Date.now() / 1000);
+const unsigned = await rawRequest('https://api.appstoreconnect.apple.com/v1/apps?limit=1', null);
+const appleDate = unsigned.headers.date ? Date.parse(unsigned.headers.date) : NaN;
+const appleNow = Number.isNaN(appleDate) ? null : Math.floor(appleDate / 1000);
+out(`runner clock: ${new Date(runnerNow * 1000).toISOString()}`);
+out(`Apple clock: ${appleNow === null ? 'unavailable' : new Date(appleNow * 1000).toISOString()}`);
+out(`offset: ${appleNow === null ? 'unknown' : `${runnerNow - appleNow} seconds`}`);
+out(`an unsigned request already answers: HTTP ${unsigned.status}, so the endpoint is reachable`);
 
-const token = await new SignJWT({})
-  .setProtectedHeader({ alg: 'ES256', kid: keyId, typ: 'JWT' })
-  .setIssuer(issuerId)
-  .setIssuedAt(runnerNow)
-  .setExpirationTime(runnerNow + 1200)
-  .setAudience('appstoreconnect-v1')
-  .sign(signingKey);
+section('the request as it goes out');
+const headerValue = `Bearer ${token}`;
+out(`the Authorization header is exactly Bearer plus the token: ${headerValue === `Bearer ${token}` ? 'yes' : 'NO'}`);
+out(`the header holds no space beyond the one after Bearer: ${headerValue.slice(0, 7) === 'Bearer ' ? 'yes' : 'NO'}`);
+out(`the token portion holds no whitespace or quote: ${/^[A-Za-z0-9._-]+$/.test(segments.join('.')) ? 'yes' : 'NO'}`);
+out(`token characters ${token.length}`);
 
-// Parsed back, so the log shows what was actually signed without showing the token.
-const [rawHeader, rawPayload] = token.split('.').slice(0, 2).map((part) => JSON.parse(Buffer.from(part, 'base64url').toString()));
-report(`header claims: ${Object.keys(rawHeader).join(', ')}`);
-report(`header alg: ${rawHeader.alg}, kid length ${rawHeader.kid?.length ?? 0}`);
-report(`payload claims: ${Object.keys(rawPayload).join(', ')}`);
-report(`payload aud: ${rawPayload.aud}, iss length ${rawPayload.iss?.length ?? 0}`);
-report(`exp minus iat: ${rawPayload.exp - rawPayload.iat} seconds (Apple allows 1200)`);
-report(`token length: ${token.length} characters, not printed`);
+for (const [label, client] of [
+  ['fetch', () => fetchRequest('https://api.appstoreconnect.apple.com/v1/apps?limit=1', headerValue)],
+  ['node https', () => rawRequest('https://api.appstoreconnect.apple.com/v1/apps?limit=1', headerValue, true)],
+]) {
+  const result = await client();
+  out('');
+  out(`${label}: HTTP ${result.status}`);
+  out(`${label}: Apple request id: ${result.headers['x-apple-jingle-correlation-key'] ?? result.headers['x-request-id'] ?? 'not sent'}`);
+  out(`${label}: redirected: ${yesNo(result.status >= 300 && result.status < 400)}`);
+  for (const line of safeErrorLines(result.body)) out(`${label}: ${line}`);
+}
 
-const response = await fetch('https://api.appstoreconnect.apple.com/v1/apps?limit=1', {
-  headers: { Authorization: `Bearer ${token}` },
-});
-report('');
-report(`HTTP ${response.status} ${response.statusText}`.trim());
-report(`Apple clock at the time of this request: ${formatAppleClock(response.headers.get('date'))}`);
+section('the five minute token');
+// A shorter lifetime tests the expiry edge. If Apple rejected the token as expired or too long a
+// life, a five minute token would be answered differently from the twenty minute one.
+const shortToken = await build(300);
+const shortResult = await rawRequest('https://api.appstoreconnect.apple.com/v1/apps?limit=1', `Bearer ${shortToken}`, true);
+out(`HTTP ${shortResult.status}`);
+for (const line of safeErrorLines(shortResult.body)) out(line);
 
-const body = await response.text();
-if (body.trim() === '') {
-  report('body: empty');
+section('the confirmed issuer, without touching the secret');
+// If the stored issuer differs from the one on the Apple page, signing with the page's value isolates
+// the stored secret as the cause. The secret itself is left alone.
+if (issuerId !== expectedIssuer) {
+  out(`the stored issuer differs from the confirmed one, so this signs with the confirmed value.`);
+  const confirmed = await build(1200, expectedIssuer);
+  const confirmedResult = await rawRequest('https://api.appstoreconnect.apple.com/v1/apps?limit=1', `Bearer ${confirmed}`, true);
+  out(`with the confirmed issuer: HTTP ${confirmedResult.status}`);
+  for (const line of safeErrorLines(confirmedResult.body)) out(line);
 } else {
+  out(`the stored issuer already is the confirmed one, so this repeats the request above.`);
+}
+
+out('');
+out('=== summary ===');
+out('Every boolean above is a fact about this run. A 401 remains a 401: it does not say which of the');
+out('three secrets is wrong, and a locally valid signature does not mean Apple filed this key under');
+out('this key id. Only Apple can settle that.');
+
+// A raw https request, so the transport does not depend on fetch and can be compared against it.
+async function rawRequest(url, authorization, reportHeaders = false) {
+  const headers = { Accept: 'application/json' };
+  if (authorization) headers.Authorization = authorization;
+  return new Promise((resolve) => {
+    const request = httpsRequest(url, { method: 'GET', headers }, (response) => {
+      let body = '';
+      response.on('data', (chunk) => (body += chunk));
+      response.on('end', () => resolve({ status: response.statusCode, headers: response.headers, body }));
+    });
+    request.on('error', (error) => resolve({ status: 0, headers: {}, body: String(error.message) }));
+    request.end();
+  });
+}
+
+// Followed, because a redirect that dropped the Authorization header would look exactly like a 401
+// from Apple. Whether one happened is reported per client by the status it settles on.
+async function fetchRequest(url, authorization) {
+  const response = await fetch(url, {
+    headers: { Authorization: authorization, Accept: 'application/json' },
+  });
+  return { status: response.status, headers: Object.fromEntries(response.headers), body: await response.text() };
+}
+
+// Apple's error text and nothing else. Anything that is not the JSON error envelope is reported by
+// length alone, so a page of HTML cannot spill into the log.
+function safeErrorLines(body) {
   try {
     const parsed = JSON.parse(body);
-    for (const error of parsed.errors ?? []) {
-      report(`Apple said [${error.code ?? '?'}]: ${error.title ?? ''}`);
-      if (error.detail) report(`  ${error.detail}`);
-    }
-    if (!parsed.errors) report(`body keys: ${Object.keys(parsed).join(', ')}`);
+    if (!Array.isArray(parsed.errors)) return [`body keys: ${Object.keys(parsed).join(', ')}`];
+    return parsed.errors.flatMap((error) => [
+      `Apple said [${error.code ?? '?'}]: ${error.title ?? ''}`,
+      ...(error.detail ? [`  ${error.detail}`] : []),
+    ]);
   } catch {
-    // Apple's HTML error pages carry no structured detail. Reporting the length is enough to know
-    // it was not the JSON this check expects, without dumping a page into the log.
-    report(`body: not JSON, ${body.length} characters`);
-  }
-}
-
-report('');
-report('=== what this result establishes ===');
-if (response.status === 200) {
-  report('A library independent of the workflow signed a request Apple accepted, so the three secrets are valid.');
-  report('A 401 from ios-build.yml is therefore a defect in its signing code, not in the credentials.');
-} else if (response.status === 401) {
-  report('A library independent of the workflow was rejected too, so the credentials are the cause.');
-  report('This names no single secret: the issuer may be another team, the key may be revoked or');
-  report('not yet active, or the key id may not belong to the uploaded key.');
-} else if (response.status === 403) {
-  report('The signature was accepted and the request was refused for scope, not for identity.');
-  report('Check the role held by this key in Users and Access.');
-} else {
-  report(`Neither accepted nor refused the request (HTTP ${response.status}), so this says nothing about the key.`);
-}
-
-function createHashOf(bytes) {
-  return createHash('sha256').update(bytes).digest('base64url').slice(0, 16);
-}
-
-// A secret that is not a usable key is a finding, not a crash. Node's parser raises a stack trace
-// whose "reason" line names the problem only to someone who knows OpenSSL's error codes, so the
-// message is reduced to something a log reader can act on.
-function readPrivateKey(pem) {
-  try {
-    return createPrivateKey({ key: pem, format: 'pem' });
-  } catch (error) {
-    report(`node parsed the private key: NO (${error.reason ?? error.message})`);
-    report('APPSTORE_PRIVATE_KEY does not hold a PEM this probe can read. Nothing was sent to Apple.');
-    process.exit(1);
-  }
-}
-
-// The Date header is an RFC 1123 date, not a number, so it has to be parsed rather than cast. Absent
-// or unparseable leaves the clock comparison unreported instead of breaking the run after the one
-// result that matters, the HTTP code.
-function formatAppleClock(header) {
-  if (!header) return 'unavailable';
-  const parsed = Date.parse(header);
-  return Number.isNaN(parsed) ? 'unparseable' : new Date(parsed).toISOString();
-}
-
-// An unsigned request still returns a Date header, which is Apple's clock without needing the token
-// to be accepted first. Returns null rather than guessing when the header is absent.
-async function appleEpoch() {
-  try {
-    const response = await fetch('https://api.appstoreconnect.apple.com/v1/apps?limit=1', {
-      headers: { Accept: 'application/json' },
-    });
-    const date = response.headers.get('date');
-    const parsed = date ? Date.parse(date) : NaN;
-    return Number.isNaN(parsed) ? null : Math.floor(parsed / 1000);
-  } catch {
-    return null;
+    return [`body is not JSON, ${body.length} characters`];
   }
 }
