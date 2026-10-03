@@ -348,6 +348,23 @@ jobs:
             echo "::error::TestFlight needs these repository secrets: $missing"
             exit 1
           fi
+          # Shapes only, never the values. A 401 from App Store Connect is almost always one of these
+          # three disagreeing with each other, and the log is the only place the pairings are visible:
+          # a key id is 10 characters, an issuer id 39, and neither may carry stray whitespace from a
+          # copy and paste, which is what makes them fail in a way that looks like bad credentials.
+          case "$KEY_ID" in
+            *[[:space:]]*) echo '::error::APPSTORE_KEY_ID contains whitespace. Re-save it without spaces or a trailing newline.'; exit 1 ;;
+          esac
+          case "$ISSUER_ID" in
+            *[[:space:]]*) echo '::error::APPSTORE_ISSUER_ID contains whitespace. Re-save it without spaces or a trailing newline.'; exit 1 ;;
+          esac
+          echo "APPSTORE_KEY_ID is ${#KEY_ID} characters (an App Store Connect key id has 10)."
+          echo "APPSTORE_ISSUER_ID is ${#ISSUER_ID} characters (an issuer id is a 39 character UUID)."
+          [ "${#KEY_ID}" -eq 10 ] || echo '::warning::That is not a 10 character key id. Check APPSTORE_KEY_ID against the AuthKey file name.'
+          # The issuer is a UUID. Checking the shape catches the common mistakes at a glance: a team id
+          # pasted instead, or the value from a different key's page.
+          printf '%s' "$ISSUER_ID" | grep -Eqi '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$' \
+            || echo '::warning::APPSTORE_ISSUER_ID is not a UUID. Copy it from Users and Access -> Integrations -> App Store Connect API, not the Team ID.'
           echo 'App Store Connect API key found.'
 
       - name: Write the App Store Connect API key
