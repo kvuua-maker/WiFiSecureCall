@@ -31,8 +31,21 @@ The MVP protects signaling and media in transit with system TLS/WSS. It does not
 
 | Job | Runs on | Purpose |
 | --- | --- | --- |
-| `validate` | pull requests, pushes | Unsigned Debug build that compiles the iPhone target and the embedded Apple Watch target |
-| `release` | pushes to `main`, `v*` tags, manual dispatch | Signed Release archive, then the TestFlight submission |
-| `github-release` | tags, manual dispatch | Attaches the archive to a GitHub Release using `GH_PAT` |
+| `validate` | pull requests, pushes | Unsigned build that compiles the iPhone target and the embedded Apple Watch target |
+| `package` | pushes to `main`, tags, manual dispatch | Builds the app bundle without signing and packs it as `WiFiSecureCall-<configuration>-<build>-unsigned.ipa` |
+| `publish` | after `package` | Attaches the `.ipa` to a GitHub Release: the tag name for `v*` tags, otherwise the rolling `ci-latest` release, replaced on every run |
+| `testflight` | manual dispatch only | Optional signed build and TestFlight submission, needs the Apple credentials listed below |
 
-Repository secrets: `IOS_BEARER_TOKEN` and `WATCH_BEARER_TOKEN` write `Config/Secrets.xcconfig`, which the Release build phases require. `APPLE_DISTRIBUTION_CERT_P12` (base64) with `APPLE_DISTRIBUTION_CERT_PASSWORD`, plus `APPLE_PROFILE_IOS` and `APPLE_PROFILE_WATCH` (base64 of `WiFiSecureCallAppStoreD24.mobileprovision` and `WiFiSecureCallWatchAppStore.provisionprofile`), provide the manual signing the Release target configurations pin. `APP_STORE_CONNECT_KEY_ID`, `APP_STORE_CONNECT_ISSUER_ID` and `APP_STORE_CONNECT_PRIVATE_KEY` authenticate the upload itself. `GH_PAT` is a GitHub token and cannot authenticate against App Store Connect, so it is only used to publish the release. Without the Apple secrets the workflow still compiles both platforms and reports what is missing instead of failing.
+The default path needs no Apple certificate, no provisioning profile and no App Store Connect key, and no secret at all: the release upload uses the built-in `GITHUB_TOKEN`. Without `IOS_BEARER_TOKEN` and `WATCH_BEARER_TOKEN` the artifact is built in the Debug configuration, because the Release build phases validate those tokens; with them it is built in the Release configuration.
+
+**The published `.ipa` is unsigned.** It contains the iPhone app and its embedded Apple Watch app, and it proves the build was compiled for both platforms, but Apple only accepts signed bundles on a device. Re-sign it with your own certificate, or configure the credentials below and use the `testflight` job.
+
+Repository secrets, all optional for the default path:
+
+| Secret | Used for |
+| --- | --- |
+| `IOS_BEARER_TOKEN`, `WATCH_BEARER_TOKEN` | write `Config/Secrets.xcconfig`, which the Release build phases require, and enable the Release configuration |
+| `APPLE_DISTRIBUTION_CERT_P12` (base64) + `APPLE_DISTRIBUTION_CERT_PASSWORD` | Apple Distribution certificate for the `testflight` job |
+| `APPLE_PROFILE_IOS`, `APPLE_PROFILE_WATCH` (base64 of `WiFiSecureCallAppStoreD24.mobileprovision` and `WiFiSecureCallWatchAppStore.provisionprofile`) | the manual signing the Release target configurations pin |
+| `APP_STORE_CONNECT_KEY_ID`, `APP_STORE_CONNECT_ISSUER_ID`, `APP_STORE_CONNECT_PRIVATE_KEY` (base64 of the `.p8`) | authenticating the TestFlight submission |
+| `GH_PAT` | optional, only to publish the release with a personal token instead of `GITHUB_TOKEN` |

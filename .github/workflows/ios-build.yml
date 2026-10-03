@@ -1,36 +1,41 @@
-name: iOS Build & TestFlight
+name: iOS Build
 
-# Builds the WiFiSecureCall iPhone app together with its embedded Apple Watch app, and submits the
-# signed build to TestFlight.
+# Builds the WiFiSecureCall iPhone app together with its embedded Apple Watch app and publishes the
+# result as a downloadable artifact in GitHub Releases.
 #
-# Secrets, and what each one is actually for:
-#   GH_PAT                        GitHub personal access token. Used only to create the GitHub Release
-#                                 and attach the archive. A GitHub token cannot talk to App Store
-#                                 Connect, so it is never used for the TestFlight upload.
-#   IOS_BEARER_TOKEN              64 hex characters, must equal the value configured on the server.
-#   WATCH_BEARER_TOKEN            A different 64 hex character value.
-#   APPLE_DISTRIBUTION_CERT_P12       base64 of the Apple Distribution .p12 export.
-#   APPLE_DISTRIBUTION_CERT_PASSWORD  password of that .p12.
-#   APPLE_PROFILE_IOS             base64 of WiFiSecureCallAppStoreD24.mobileprovision.
-#   APPLE_PROFILE_WATCH           base64 of WiFiSecureCallWatchAppStore.provisionprofile.
-#   APP_STORE_CONNECT_KEY_ID      App Store Connect API key id, 10 characters.
-#   APP_STORE_CONNECT_ISSUER_ID   Issuer UUID shown on the key page.
-#   APP_STORE_CONNECT_PRIVATE_KEY base64 of AuthKey_<KEY_ID>.p8.
+# No Apple certificate, provisioning profile or App Store Connect key is needed for that path. The
+# bundle is therefore UNSIGNED: it proves the build, it is what you re-sign with your own certificate
+# before installing it on a device, and it is not installable on a stock device as-is. TestFlight upload
+# is a separate, opt-in job that does require the Apple credentials listed in Docs/WatchAudioArchitecture.md
+# and README.md.
 #
-# Without the six Apple secrets the workflow still compiles both platforms and reports what is
-# missing instead of failing the run, so a fork or a fresh clone stays green.
+# Optional repository secrets, all optional because the default path needs none of them:
+#   IOS_BEARER_TOKEN, WATCH_BEARER_TOKEN  build the Release configuration instead of Debug.
+#   APPLE_DISTRIBUTION_CERT_P12, APPLE_DISTRIBUTION_CERT_PASSWORD, APPLE_PROFILE_IOS,
+#   APPLE_PROFILE_WATCH, APP_STORE_CONNECT_KEY_ID, APP_STORE_CONNECT_ISSUER_ID,
+#   APP_STORE_CONNECT_PRIVATE_KEY        enable the opt-in TestFlight job.
+#   GH_PAT                               optional, the built-in GITHUB_TOKEN already has release access.
 
 on:
   workflow_dispatch:
     inputs:
-      upload_to_testflight:
-        description: Upload the signed archive to TestFlight
-        type: boolean
-        default: true
+      build_configuration:
+        description: Build configuration for the published artifact
+        type: choice
+        default: auto
+        options: [auto, Release, Debug]
       build_number:
         description: Override CFBundleVersion, must exceed Config/Base.xcconfig
         type: string
         default: ""
+      publish_release:
+        description: Attach the artifact to a GitHub Release
+        type: boolean
+        default: true
+      upload_to_testflight:
+        description: Also produce a signed build and upload it to TestFlight
+        type: boolean
+        default: false
   push:
     branches: [main]
     tags: ["v*"]
@@ -47,13 +52,13 @@ permissions:
 jobs:
   validate:
     name: Compile iPhone and Apple Watch targets
-    # The carrier probe is compiled behind `#if compiler(>=6.4)`, so the build needs the Swift 6.4
+    # The carrier probe compiles behind `#if compiler(>=6.4)`, so the build needs the Swift 6.4
     # toolchain from Xcode 27, which is what the xcode-27 image provides and what CircleCI uses.
-    # If that preview image is unavailable, macos-26 works for everything except the probe code.
+    # macos-26 works for everything except the probe code.
     runs-on: xcode-27
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Report toolchain
         run: |
@@ -63,9 +68,9 @@ jobs:
           echo "IOS_SDK=$(xcrun --sdk iphoneos --show-sdk-version)"
           echo "WATCHOS_SDK=$(xcrun --sdk watchos --show-sdk-version)"
 
-      # Debug and unsigned, so no certificate or profile is required. Building the iPhone scheme
-      # compiles and embeds the watchOS app through the embed phase, which is what keeps the two
-      # platforms compiling together on every change.
+      # Debug and unsigned, so nothing has to be configured. Building the iPhone scheme compiles and
+      # embeds the watchOS app through the embed phase, which is what keeps the two platforms compiling
+      # together on every change.
       - name: Build both targets without signing
         run: |
           set -euo pipefail
@@ -81,78 +86,58 @@ jobs:
           grep -q 'target arm64-apple-ios' /tmp/compile.log
           echo 'Both the iPhone and Apple Watch targets compiled.'
 
-  release:
-    name: Signed archive and TestFlight upload
+  package:
+    name: Build the app bundle
     if: github.event_name != 'pull_request'
     needs: validate
     runs-on: xcode-27
     timeout-minutes: 60
     outputs:
-      signed: ${{ steps.signing.outputs.signed }}
+      configuration: ${{ steps.configuration.outputs.configuration }}
       version: ${{ steps.version.outputs.marketing_version }}
       build_number: ${{ steps.version.outputs.build_number }}
-    env:
-      PROJECT: WiFiSecureCall.xcodeproj
-      SCHEME: WiFiSecureCall
-      TEAM_ID: 9V5XXDXF3N
-      IOS_BUNDLE_ID: com.vkapps.wifisecurecall
-      WATCH_BUNDLE_ID: com.vkapps.wifisecurecall.watchkitapp
-      IOS_PROFILE_NAME: WiFiSecureCallAppStoreD24
-      WATCH_PROFILE_NAME: WiFiSecureCallWatchAppStore
-      ARCHIVE: ${{ github.workspace }}/archives/WiFiSecureCall.xcarchive
+      artifact: ${{ steps.package.outputs.artifact }}
+      publish: ${{ steps.publish.outputs.publish }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Report toolchain
         run: |
           set -euo pipefail
           xcodebuild -version
-          xcrun swiftc --version
           echo "IOS_SDK=$(xcrun --sdk iphoneos --show-sdk-version)"
           echo "WATCHOS_SDK=$(xcrun --sdk watchos --show-sdk-version)"
 
-      # Release uses CODE_SIGN_STYLE=Manual with the profile names in the job env, so the
-      # distribution certificate and both profiles are needed before archiving.
-      - name: Check the signing material
-        id: signing
+      # Release configuration is only reproducible when the bearer tokens exist, because the Release
+      # build phases validate them against the built Info.plist. Without the secrets the Debug
+      # configuration is built instead, so this job never needs a certificate or a token.
+      - name: Choose the build configuration
+        id: configuration
         env:
-          CERT: ${{ secrets.APPLE_DISTRIBUTION_CERT_P12 }}
-          CERT_PASSWORD: ${{ secrets.APPLE_DISTRIBUTION_CERT_PASSWORD }}
-          IOS_PROFILE: ${{ secrets.APPLE_PROFILE_IOS }}
-          WATCH_PROFILE: ${{ secrets.APPLE_PROFILE_WATCH }}
-          KEY_ID: ${{ secrets.APP_STORE_CONNECT_KEY_ID }}
-          ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}
-          PRIVATE_KEY: ${{ secrets.APP_STORE_CONNECT_PRIVATE_KEY }}
+          REQUESTED: ${{ inputs.build_configuration }}
+          IOS_TOKEN: ${{ secrets.IOS_BEARER_TOKEN }}
+          WATCH_TOKEN: ${{ secrets.WATCH_BEARER_TOKEN }}
         run: |
           set -euo pipefail
-          # Plain string instead of an array: the macOS runner shell is bash 3.2, where expanding an
-          # empty array under `set -u` is an error.
-          missing=''
-          [ -n "$CERT" ] || missing="${missing:+$missing,}APPLE_DISTRIBUTION_CERT_P12"
-          [ -n "$CERT_PASSWORD" ] || missing="${missing:+$missing,}APPLE_DISTRIBUTION_CERT_PASSWORD"
-          [ -n "$IOS_PROFILE" ] || missing="${missing:+$missing,}APPLE_PROFILE_IOS"
-          [ -n "$WATCH_PROFILE" ] || missing="${missing:+$missing,}APPLE_PROFILE_WATCH"
-          signed=false
-          uploadable=false
-          if [ -z "$missing" ]; then signed=true; fi
-          if [ -n "$KEY_ID" ] && [ -n "$ISSUER_ID" ] && [ -n "$PRIVATE_KEY" ]; then
-            uploadable=true
-          else
-            missing="${missing:+$missing,}APP_STORE_CONNECT_KEY_ID/APP_STORE_CONNECT_ISSUER_ID/APP_STORE_CONNECT_PRIVATE_KEY"
+          tokens_present=false
+          if [ -n "${IOS_TOKEN:-}" ] && [ -n "${WATCH_TOKEN:-}" ]; then tokens_present=true; fi
+          case "${REQUESTED:-auto}" in
+            Release) configuration=Release ;;
+            Debug) configuration=Debug ;;
+            *)
+              if [ "$tokens_present" = true ]; then configuration=Release; else configuration=Debug; fi
+              ;;
+          esac
+          if [ "$configuration" = Release ] && [ "$tokens_present" != true ]; then
+            echo '::error::Release was requested but IOS_BEARER_TOKEN / WATCH_BEARER_TOKEN are not configured.'
+            exit 1
           fi
-          echo "signed=$signed" >> "$GITHUB_OUTPUT"
-          echo "uploadable=$uploadable" >> "$GITHUB_OUTPUT"
-          if [ "$signed" != true ] || [ "$uploadable" != true ]; then
-            echo "::notice::Signing material is incomplete, missing: ${missing}"
-            echo "::notice::Add the secrets above to produce a signed archive and upload it to TestFlight."
-          fi
+          echo "configuration=$configuration" >> "$GITHUB_OUTPUT"
+          echo "tokens_present=$tokens_present" >> "$GITHUB_OUTPUT"
+          echo "Building the $configuration configuration unsigned."
 
-      # The Release build phases validate the built Info.plist against the API and media URLs and
-      # require both bearer tokens, so Config/Secrets.xcconfig has to exist before archiving.
-      # Config/Base.xcconfig includes it optionally. Only the archive needs it, so this runs under the
-      # same condition as the archive step.
       - name: Materialize Config/Secrets.xcconfig
-        if: ${{ steps.signing.outputs.signed == 'true' }}
+        if: ${{ steps.configuration.outputs.configuration == 'Release' }}
         env:
           IOS_BEARER_TOKEN: ${{ secrets.IOS_BEARER_TOKEN }}
           WATCH_BEARER_TOKEN: ${{ secrets.WATCH_BEARER_TOKEN }}
@@ -161,7 +146,7 @@ jobs:
           umask 077
           for token in "$IOS_BEARER_TOKEN" "$WATCH_BEARER_TOKEN"; do
             if [ "${#token}" -lt 32 ]; then
-              echo '::error::IOS_BEARER_TOKEN and WATCH_BEARER_TOKEN must each be at least 32 characters.'
+              echo '::error::The bearer tokens must each be at least 32 characters.'
               exit 1
             fi
             case "$token" in
@@ -171,40 +156,6 @@ jobs:
           [ "$IOS_BEARER_TOKEN" != "$WATCH_BEARER_TOKEN" ] || { echo '::error::The two bearer tokens must differ.'; exit 1; }
           printf 'IOS_BEARER_TOKEN = %s\nWATCH_BEARER_TOKEN = %s\n' "$IOS_BEARER_TOKEN" "$WATCH_BEARER_TOKEN" > Config/Secrets.xcconfig
           echo 'Config/Secrets.xcconfig written.'
-
-      - name: Import the Apple Distribution certificate
-        if: ${{ steps.signing.outputs.signed == 'true' }}
-        env:
-          CERT_P12_BASE64: ${{ secrets.APPLE_DISTRIBUTION_CERT_P12 }}
-          CERT_PASSWORD: ${{ secrets.APPLE_DISTRIBUTION_CERT_PASSWORD }}
-        run: |
-          set -euo pipefail
-          echo "$CERT_P12_BASE64" | base64 --decode > "$RUNNER_TEMP/distribution.p12"
-          security create-keychain -p "$RUNNER_TEMP/keychain-password" build.keychain
-          security set-keychain-settings -lut 21600 build.keychain
-          security unlock-keychain -p "$RUNNER_TEMP/keychain-password" build.keychain
-          security import "$RUNNER_TEMP/distribution.p12" -P "$CERT_PASSWORD" -A -t cert -f pkcs12 -k build.keychain
-          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$RUNNER_TEMP/keychain-password" build.keychain
-          security list-keychain -d user -s build.keychain login.keychain-db
-          rm -f "$RUNNER_TEMP/distribution.p12"
-          security find-identity -v -p codesigning | sed 's/^/IDENTITY: /'
-
-      - name: Install the provisioning profiles
-        if: ${{ steps.signing.outputs.signed == 'true' }}
-        env:
-          IOS_PROFILE_BASE64: ${{ secrets.APPLE_PROFILE_IOS }}
-          WATCH_PROFILE_BASE64: ${{ secrets.APPLE_PROFILE_WATCH }}
-        run: |
-          set -euo pipefail
-          echo "$IOS_PROFILE_BASE64" | base64 --decode > "$RUNNER_TEMP/$IOS_PROFILE_NAME.mobileprovision"
-          echo "$WATCH_PROFILE_BASE64" | base64 --decode > "$RUNNER_TEMP/$WATCH_PROFILE_NAME.provisionprofile"
-          for directory in "$HOME/Library/MobileDevice/Provisioning Profiles" "$HOME/Library/Developer/Xcode/UserData/Provisioning Profiles"; do
-            mkdir -p "$directory"
-            cp "$RUNNER_TEMP/$IOS_PROFILE_NAME.mobileprovision" "$directory/"
-            cp "$RUNNER_TEMP/$WATCH_PROFILE_NAME.provisionprofile" "$directory/"
-          done
-          /usr/libexec/PlistBuddy -c 'Print :Name' "$RUNNER_TEMP/$IOS_PROFILE_NAME.mobileprovision" || true
-          /usr/libexec/PlistBuddy -c 'Print :Name' "$RUNNER_TEMP/$WATCH_PROFILE_NAME.provisionprofile" || true
 
       - name: Resolve the build number
         id: version
@@ -224,55 +175,229 @@ jobs:
           echo "marketing_version=$marketing" >> "$GITHUB_OUTPUT"
           echo "CFBundleVersion $build, project default $current, CFBundleShortVersionString $marketing."
 
-      - name: Archive the iPhone and Apple Watch apps
-        if: ${{ steps.signing.outputs.signed == 'true' }}
+      - name: Build the iPhone and Apple Watch apps without signing
         env:
+          CONFIGURATION: ${{ steps.configuration.outputs.configuration }}
           BUILD_NUMBER: ${{ steps.version.outputs.build_number }}
+        run: |
+          set -euo pipefail
+          xcodebuild \
+            -project WiFiSecureCall.xcodeproj \
+            -scheme WiFiSecureCall \
+            -configuration "$CONFIGURATION" \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath DerivedData \
+            CURRENT_PROJECT_VERSION="$BUILD_NUMBER" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            build | tee /tmp/package-build.log
+          grep -q 'target .*apple-watchos' /tmp/package-build.log
+
+      # An app without the embedded watch bundle is not a WiFi Secure Call build, so this check is not
+      # optional.
+      - name: Verify the bundle contains both apps
+        env:
+          CONFIGURATION: ${{ steps.configuration.outputs.configuration }}
+        run: |
+          set -euo pipefail
+          products="DerivedData/Build/Products/$CONFIGURATION-iphoneos"
+          [ -d "$products" ] || { echo "::error::missing $products."; exit 1; }
+          iphone_app="$(find "$products" -maxdepth 1 -type d -name '*.app' ! -name '*Watch*' -print -quit)"
+          [ -n "$iphone_app" ] || { echo '::error::no iPhone .app was produced.'; exit 1; }
+          watch_app="$(find "$iphone_app/Watch" -maxdepth 1 -type d -name '*.app' -print -quit)"
+          [ -n "$watch_app" ] || { echo '::error::the built app has no embedded Apple Watch app.'; exit 1; }
+          echo "iPhone app: $iphone_app"
+          echo "Watch app:  $watch_app"
+          for plist in "$iphone_app/Info.plist" "$watch_app/Info.plist"; do
+            identifier="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$plist")"
+            short="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$plist")"
+            revision="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$plist")"
+            echo "  $identifier version $short build $revision"
+          done
+
+      - name: Package the unsigned .ipa
+        id: package
+        env:
+          CONFIGURATION: ${{ steps.configuration.outputs.configuration }}
+          BUILD_NUMBER: ${{ steps.version.outputs.build_number }}
+        run: |
+          set -euo pipefail
+          products="DerivedData/Build/Products/$CONFIGURATION-iphoneos"
+          iphone_app="$(find "$products" -maxdepth 1 -type d -name '*.app' ! -name '*Watch*' -print -quit)"
+          artifact="WiFiSecureCall-$CONFIGURATION-$BUILD_NUMBER-unsigned.ipa"
+          rm -rf payload && mkdir -p payload/Payload
+          cp -R "$iphone_app" "payload/Payload/$(basename "$iphone_app")"
+          rm -f "$artifact"
+          (cd payload && zip -qry "../$artifact" Payload)
+          rm -rf payload
+          # Read the listing once: piping unzip into grep -q can fail under pipefail with SIGPIPE.
+          listing="$(unzip -l "$artifact")"
+          grep -qE 'Payload/[^/]+\.app/Info\.plist' <<<"$listing" \
+            || { echo '::error::the .ipa has no app Info.plist.'; exit 1; }
+          grep -qE 'Payload/[^/]+\.app/Watch/[^/]+\.app/Info\.plist' <<<"$listing" \
+            || { echo '::error::the .ipa has no embedded Apple Watch app.'; exit 1; }
+          echo "artifact=$artifact" >> "$GITHUB_OUTPUT"
+          tail -1 <<<"$listing"
+          echo "Packaged $artifact"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: WiFiSecureCall-unsigned-ipa
+          path: WiFiSecureCall-*-unsigned.ipa
+          retention-days: 30
+          if-no-files-found: error
+
+      - name: Decide whether to publish a release
+        id: publish
+        env:
+          REQUESTED: ${{ inputs.publish_release }}
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          set -euo pipefail
+          publish=true
+          if [ "$EVENT_NAME" = 'workflow_dispatch' ] && [ "$REQUESTED" = 'false' ]; then publish=false; fi
+          echo "publish=$publish" >> "$GITHUB_OUTPUT"
+          echo "publish=$publish"
+
+  publish:
+    name: Attach the build to a GitHub release
+    needs: package
+    if: needs.package.outputs.publish == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: WiFiSecureCall-unsigned-ipa
+          path: dist
+
+      - name: Create or update the release
+        env:
+          # The built-in token already has contents: write, a personal token is optional.
+          GH_TOKEN: ${{ secrets.GH_PAT != '' && secrets.GH_PAT || github.token }}
+          VERSION: ${{ needs.package.outputs.version }}
+          BUILD_NUMBER: ${{ needs.package.outputs.build_number }}
+          CONFIGURATION: ${{ needs.package.outputs.configuration }}
+          ARTIFACT: ${{ needs.package.outputs.artifact }}
+          RELEASE_TAG: ${{ github.ref_type == 'tag' && github.ref_name || 'ci-latest' }}
+        run: |
+          set -euo pipefail
+          notes="$(printf 'WiFi Secure Call %s build %s (%s configuration).\n\nThis bundle is **unsigned**: it contains the iPhone app and its embedded Apple Watch app, and it is the build that was verified in CI. Apple only accepts signed bundles on a device, so re-sign it with your own certificate before installing, or use the TestFlight job once App Store Connect credentials are configured.\n\nAttached: %s\n' "$VERSION" "$BUILD_NUMBER" "$CONFIGURATION" "$ARTIFACT")"
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" "dist/$ARTIFACT" --clobber
+            echo "Attached dist/$ARTIFACT to the existing release $RELEASE_TAG."
+          else
+            gh release create "$RELEASE_TAG" "dist/$ARTIFACT" --title "WiFi Secure Call $VERSION (build $BUILD_NUMBER)" --notes "$notes"
+            echo "Created release $RELEASE_TAG with dist/$ARTIFACT."
+          fi
+
+  testflight:
+    name: Signed build for TestFlight
+    needs: validate
+    # Opt-in only, and only when every Apple credential is present. The default push path never reaches
+    # this job, so the repository can stay green without a single certificate.
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.upload_to_testflight }}
+    runs-on: xcode-27
+    timeout-minutes: 60
+    env:
+      TEAM_ID: 9V5XXDXF3N
+      IOS_BUNDLE_ID: com.vkapps.wifisecurecall
+      WATCH_BUNDLE_ID: com.vkapps.wifisecurecall.watchkitapp
+      IOS_PROFILE_NAME: WiFiSecureCallAppStoreD24
+      WATCH_PROFILE_NAME: WiFiSecureCallWatchAppStore
+      ARCHIVE: ${{ github.workspace }}/archives/WiFiSecureCall.xcarchive
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Check the Apple credentials
+        id: credentials
+        env:
+          CERT: ${{ secrets.APPLE_DISTRIBUTION_CERT_P12 }}
+          CERT_PASSWORD: ${{ secrets.APPLE_DISTRIBUTION_CERT_PASSWORD }}
+          IOS_PROFILE: ${{ secrets.APPLE_PROFILE_IOS }}
+          WATCH_PROFILE: ${{ secrets.APPLE_PROFILE_WATCH }}
+          KEY_ID: ${{ secrets.APP_STORE_CONNECT_KEY_ID }}
+          ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}
+          PRIVATE_KEY: ${{ secrets.APP_STORE_CONNECT_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          # A plain string rather than an array: the macOS shell is bash 3.2, where expanding an empty
+          # array under `set -u` fails.
+          missing=''
+          [ -n "$CERT" ] || missing="${missing:+$missing,}APPLE_DISTRIBUTION_CERT_P12"
+          [ -n "$CERT_PASSWORD" ] || missing="${missing:+$missing,}APPLE_DISTRIBUTION_CERT_PASSWORD"
+          [ -n "$IOS_PROFILE" ] || missing="${missing:+$missing,}APPLE_PROFILE_IOS"
+          [ -n "$WATCH_PROFILE" ] || missing="${missing:+$missing,}APPLE_PROFILE_WATCH"
+          [ -n "$KEY_ID" ] || missing="${missing:+$missing,}APP_STORE_CONNECT_KEY_ID"
+          [ -n "$ISSUER_ID" ] || missing="${missing:+$missing,}APP_STORE_CONNECT_ISSUER_ID"
+          [ -n "$PRIVATE_KEY" ] || missing="${missing:+$missing,}APP_STORE_CONNECT_PRIVATE_KEY"
+          if [ -n "$missing" ]; then
+            echo "::error::TestFlight needs these repository secrets: $missing"
+            exit 1
+          fi
+          echo 'All Apple credentials are present.'
+
+      - name: Materialize Config/Secrets.xcconfig
+        env:
+          IOS_BEARER_TOKEN: ${{ secrets.IOS_BEARER_TOKEN }}
+          WATCH_BEARER_TOKEN: ${{ secrets.WATCH_BEARER_TOKEN }}
+        run: |
+          set -euo pipefail
+          umask 077
+          [ "${#IOS_BEARER_TOKEN}" -ge 32 ] && [ "${#WATCH_BEARER_TOKEN}" -ge 32 ] \
+            || { echo '::error::IOS_BEARER_TOKEN and WATCH_BEARER_TOKEN must each be at least 32 characters.'; exit 1; }
+          printf 'IOS_BEARER_TOKEN = %s\nWATCH_BEARER_TOKEN = %s\n' "$IOS_BEARER_TOKEN" "$WATCH_BEARER_TOKEN" > Config/Secrets.xcconfig
+          echo 'Config/Secrets.xcconfig written.'
+
+      - name: Import the Apple Distribution certificate
+        env:
+          CERT_P12_BASE64: ${{ secrets.APPLE_DISTRIBUTION_CERT_P12 }}
+          CERT_PASSWORD: ${{ secrets.APPLE_DISTRIBUTION_CERT_PASSWORD }}
+        run: |
+          set -euo pipefail
+          echo "$CERT_P12_BASE64" | base64 --decode > "$RUNNER_TEMP/distribution.p12"
+          security create-keychain -p "$RUNNER_TEMP/keychain-password" build.keychain
+          security set-keychain-settings -lut 21600 build.keychain
+          security unlock-keychain -p "$RUNNER_TEMP/keychain-password" build.keychain
+          security import "$RUNNER_TEMP/distribution.p12" -P "$CERT_PASSWORD" -A -t cert -f pkcs12 -k build.keychain
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$RUNNER_TEMP/keychain-password" build.keychain
+          security list-keychain -d user -s build.keychain login.keychain-db
+          rm -f "$RUNNER_TEMP/distribution.p12"
+          security find-identity -v -p codesigning | sed 's/^/IDENTITY: /'
+
+      - name: Install the provisioning profiles
+        env:
+          IOS_PROFILE_BASE64: ${{ secrets.APPLE_PROFILE_IOS }}
+          WATCH_PROFILE_BASE64: ${{ secrets.APPLE_PROFILE_WATCH }}
+        run: |
+          set -euo pipefail
+          echo "$IOS_PROFILE_BASE64" | base64 --decode > "$RUNNER_TEMP/$IOS_PROFILE_NAME.mobileprovision"
+          echo "$WATCH_PROFILE_BASE64" | base64 --decode > "$RUNNER_TEMP/$WATCH_PROFILE_NAME.provisionprofile"
+          for directory in "$HOME/Library/MobileDevice/Provisioning Profiles" "$HOME/Library/Developer/Xcode/UserData/Provisioning Profiles"; do
+            mkdir -p "$directory"
+            cp "$RUNNER_TEMP/$IOS_PROFILE_NAME.mobileprovision" "$directory/"
+            cp "$RUNNER_TEMP/$WATCH_PROFILE_NAME.provisionprofile" "$directory/"
+          done
+
+      - name: Archive for distribution
+        env:
+          BUILD_NUMBER: ${{ github.run_number }}
         run: |
           set -euo pipefail
           mkdir -p archives
           xcodebuild \
-            -project "$PROJECT" \
-            -scheme "$SCHEME" \
+            -project WiFiSecureCall.xcodeproj \
+            -scheme WiFiSecureCall \
             -configuration Release \
             -destination 'generic/platform=iOS' \
             -archivePath "$ARCHIVE" \
             -derivedDataPath DerivedData \
-            CURRENT_PROJECT_VERSION="$BUILD_NUMBER" \
+            CURRENT_PROJECT_VERSION="$(( BUILD_NUMBER + 100 ))" \
             archive | tee /tmp/archive.log
-          grep -q 'target .*apple-watchos' /tmp/archive.log
-
-      # One archive carries both deliverables. An archive without the watch app would ship an iPhone
-      # build that silently cannot reach the watch, so this check is not optional.
-      - name: Verify the archive contains both apps
-        if: ${{ steps.signing.outputs.signed == 'true' }}
-        run: |
-          set -euo pipefail
           iphone_app="$(find "$ARCHIVE/Products/Applications" -maxdepth 1 -name '*.app' -print -quit)"
-          [ -n "$iphone_app" ] || { echo '::error::no iPhone .app inside the archive.'; exit 1; }
           watch_app="$(find "$iphone_app/Watch" -maxdepth 1 -name '*.app' -print -quit)"
           [ -n "$watch_app" ] || { echo '::error::the archive has no embedded Apple Watch app.'; exit 1; }
-          echo "iPhone app: $iphone_app"
-          echo "Watch app:  $watch_app"
-          for plist in "$iphone_app/Info.plist" "$watch_app/Info.plist"; do
-            /usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$plist"
-            /usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$plist"
-            /usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$plist"
-          done
 
-      - uses: actions/upload-artifact@v4
-        if: ${{ steps.signing.outputs.signed == 'true' }}
-        with:
-          name: WiFiSecureCall-archive
-          path: archives/WiFiSecureCall.xcarchive
-          retention-days: 14
-          if-no-files-found: error
-
-      # destination: upload submits the signed archive straight to App Store Connect, after which the
-      # build appears in TestFlight. The App Store Connect API key is the only credential that can do
-      # this; a GitHub token cannot.
       - name: Upload to TestFlight
-        if: ${{ steps.signing.outputs.uploadable == 'true' && inputs.upload_to_testflight != false }}
         env:
           KEY_ID: ${{ secrets.APP_STORE_CONNECT_KEY_ID }}
           ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}
@@ -341,64 +466,30 @@ jobs:
           security delete-keychain build.keychain || true
           rm -rf "$RUNNER_TEMP/appstoreconnect" "$RUNNER_TEMP/distribution.p12" "$RUNNER_TEMP/export"
 
-  github-release:
-    name: Attach the build to a GitHub release
-    needs: release
-    if: >-
-      needs.release.outputs.signed == 'true'
-      && (github.event_name == 'workflow_dispatch' || github.ref_type == 'tag')
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    steps:
-      - name: Download the archive artifact
-        uses: actions/download-artifact@v4
-        with:
-          name: WiFiSecureCall-archive
-          path: archive
-
-      - name: Create or update the release
-        env:
-          GH_TOKEN: ${{ secrets.GH_PAT }}
-          TAG: ${{ github.ref_type == 'tag' && github.ref_name || format('build-{0}', github.run_number) }}
-          BUILD_NUMBER: ${{ needs.release.outputs.build_number }}
-        run: |
-          set -euo pipefail
-          if [ -z "${GH_TOKEN:-}" ]; then
-            echo '::notice::GH_PAT is not configured, skipping the GitHub release.'
-            exit 0
-          fi
-          archive="WiFiSecureCall-$TAG.xcarchive.zip"
-          zip -qry "$archive" archive/WiFiSecureCall.xcarchive
-          if gh release view "$TAG" >/dev/null 2>&1; then
-            gh release upload "$TAG" "$archive" --clobber
-          else
-            gh release create "$TAG" "$archive" \
-              --title "WiFi Secure Call $TAG (build $BUILD_NUMBER)" \
-              --generate-notes
-          fi
-          echo "Release $TAG updated with $archive."
-
   summary:
     name: Summary
-    needs: [release, github-release]
+    needs: [validate, package, publish]
     if: always()
     runs-on: ubuntu-latest
     steps:
       - run: |
           set -euo pipefail
-          signed='${{ needs.release.outputs.signed }}'
-          version='${{ needs.release.outputs.version }}'
-          build='${{ needs.release.outputs.build_number }}'
+          validate='${{ needs.validate.result }}'
+          package='${{ needs.package.result }}'
+          configuration='${{ needs.package.outputs.configuration }}'
+          version='${{ needs.package.outputs.version }}'
+          build='${{ needs.package.outputs.build_number }}'
+          artifact='${{ needs.package.outputs.artifact }}'
           {
             echo '### WiFi Secure Call build'
             echo
-            if [ "$signed" = 'true' ]; then
-              echo '- iPhone + Apple Watch archive: produced'
+            echo "- Compile check: $validate"
+            echo "- Bundle: $package"
+            if [ "$package" = success ]; then
+              echo "- Artifact: \`$artifact\` ($configuration configuration, unsigned)"
               if [ -n "$version" ]; then
-                echo "- Version: $version (build $build)"
+                echo "- Version: $version, build $build"
               fi
-            else
-              echo '- Signed archive: skipped, the Apple signing secrets are not configured'
+              echo '- Install note: unsigned, re-sign with your own certificate before putting it on a device.'
             fi
           } >> "$GITHUB_STEP_SUMMARY"

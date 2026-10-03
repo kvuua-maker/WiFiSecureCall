@@ -270,8 +270,9 @@ final class AudioEngine: AudioEngineHandling, @unchecked Sendable {
         try session.setCategory(.playAndRecord, mode: .voiceChat, options: [])
         #else
         try session.setCategory(.playAndRecord, mode: .voiceChat, options: [.allowBluetoothHFP, .defaultToSpeaker])
-        #endif
+        // API_UNAVAILABLE on watchOS, so it may only be requested on iOS.
         try? session.setPreferredIOBufferDuration(Self.preferredIOBufferDuration)
+        #endif
         guard announce else { return }
         emit("audio_session_configured", "success")
     }
@@ -602,7 +603,7 @@ final class AudioEngine: AudioEngineHandling, @unchecked Sendable {
     /// chosen at call setup is then wrong. Cosmetic route notifications must not consume the single
     /// audio recovery budget, so only a real format change is escalated.
     private func handleRouteChange(_ note: Notification) {
-        let reason = (note.userInfo?[AVAudioSessionRouteChangeReasonKey] as? UInt).map { String(AVAudioSession.RouteChangeReason(rawValue: $0).rawValue) } ?? "unknown"
+        let reason = (note.userInfo?[AVAudioSessionRouteChangeReasonKey] as? UInt).map { String($0) } ?? "unknown"
         let session = AVAudioSession.sharedInstance()
         let inputs = session.currentRoute.inputs.map(\.portType.rawValue).joined(separator: ",")
         let outputs = session.currentRoute.outputs.map(\.portType.rawValue).joined(separator: ",")
