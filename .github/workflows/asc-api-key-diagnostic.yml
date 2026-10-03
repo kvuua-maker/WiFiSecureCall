@@ -1,0 +1,76 @@
+name: App Store Connect API key diagnostic
+
+# An isolated check of one question: does App Store Connect accept this API key?
+#
+# It compiles nothing, archives nothing and publishes nothing, and it runs on workflow_dispatch only.
+# Its purpose is to separate a credential problem from a signing-code problem. ios-build.yml signs its
+# JWT with Python and OpenSSL and reports whatever Apple answers; if that answer is a 401, there is no
+# telling whether the secrets disagree or the code does. This workflow signs the same secrets with
+# jose, an implementation sharing no code with it, so the two results can be compared.
+#
+# The private key is read from the secret as it stands. Nothing is trimmed, decoded or reconstructed,
+# because a key that needed rescuing would pass here while still failing in Xcode.
+#
+# Secrets are never printed. The log carries shapes, lengths, a public key fingerprint and Apple's own
+# error text.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: asc-api-key-diagnostic
+  cancel-in-progress: false
+
+jobs:
+  probe:
+    name: Sign a request with jose and ask Apple
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: '22'
+
+      - name: Install jose
+        run: npm install --no-save --prefix "$RUNNER_TEMP/probe" jose@5
+
+      # The secret is written to disk verbatim so the probe can read it as a file. GitHub hands a
+      # secret over as an environment variable, which cannot carry the newlines a PEM needs, so the
+      # value is streamed rather than assigned.
+      - name: Write the private key as stored
+        env:
+          PRIVATE_KEY: ${{ secrets.APPSTORE_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          umask 077
+          mkdir -p "$RUNNER_TEMP/probe"
+          if [ -z "${PRIVATE_KEY:-}" ]; then
+            echo '::error::APPSTORE_PRIVATE_KEY is not set on this repository.'
+            exit 1
+          fi
+          printf '%s' "$PRIVATE_KEY" > "$RUNNER_TEMP/probe/AuthKey.p8"
+          echo "Wrote the secret verbatim: $(wc -c < "$RUNNER_TEMP/probe/AuthKey.p8") bytes, not printed."
+
+      - name: Ask App Store Connect who the key is
+        env:
+          KEY_ID: ${{ secrets.APPSTORE_KEY_ID }}
+          ISSUER_ID: ${{ secrets.APPSTORE_ISSUER_ID }}
+        run: |
+          set -euo pipefail
+          if [ -z "${KEY_ID:-}" ] || [ -z "${ISSUER_ID:-}" ]; then
+            echo '::error::APPSTORE_KEY_ID and APPSTORE_ISSUER_ID must both be set.'
+            exit 1
+          fi
+          cp .github/actions/asc-auth-probe/probe.mjs "$RUNNER_TEMP/probe/probe.mjs"
+          NODE_PATH="$RUNNER_TEMP/probe/node_modules" \
+            node "$RUNNER_TEMP/probe/probe.mjs" \
+              "$RUNNER_TEMP/probe/AuthKey.p8" "$KEY_ID" "$ISSUER_ID"
+
+      - name: Remove the key
+        if: always()
+        run: rm -rf "$RUNNER_TEMP/probe"
