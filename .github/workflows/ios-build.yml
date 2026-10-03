@@ -287,8 +287,26 @@ jobs:
           # This job has no checkout, so the repository has to be named explicitly: gh cannot infer it
           # from a git remote that does not exist here.
           if gh release view "$RELEASE_TAG" --repo "$REPOSITORY" >/dev/null 2>&1; then
+            # The rolling release must describe one build. Build numbers are baked into the file name,
+            # so without this every run would leave its predecessor behind and the release would grow a
+            # new .ipa per push with no way to tell which one is current.
+            if [ "$RELEASE_TAG" = ci-latest ]; then
+              while read -r asset; do
+                [ -n "$asset" ] || continue
+                [ "$asset" = "$ARTIFACT" ] && continue
+                gh release delete-asset "$RELEASE_TAG" "$asset" --repo "$REPOSITORY" --yes
+                echo "Removed the superseded asset $asset."
+              done < <(gh release view "$RELEASE_TAG" --repo "$REPOSITORY" --json assets --jq '.assets[].name')
+            fi
             gh release upload "$RELEASE_TAG" "dist/$ARTIFACT" --repo "$REPOSITORY" --clobber
             echo "Attached dist/$ARTIFACT to the existing release $RELEASE_TAG."
+            # The rolling release is a pointer at the current build, so its title and notes have to move
+            # with the asset. A tagged release keeps the changelog it was published with instead.
+            if [ "$RELEASE_TAG" = ci-latest ]; then
+              gh release edit "$RELEASE_TAG" --repo "$REPOSITORY" \
+                --title "WiFi Secure Call $VERSION (build $BUILD_NUMBER)" --notes "$notes"
+              echo "Updated the release notes to build $BUILD_NUMBER."
+            fi
           else
             gh release create "$RELEASE_TAG" "dist/$ARTIFACT" --repo "$REPOSITORY" \
               --title "WiFi Secure Call $VERSION (build $BUILD_NUMBER)" --notes "$notes"
