@@ -492,7 +492,12 @@ jobs:
           set -euo pipefail
           umask 077
           if [ -z "$IOS_BEARER_TOKEN" ] || [ -z "$WATCH_BEARER_TOKEN" ]; then
-            echo '::error::IOS_BEARER_TOKEN and WATCH_BEARER_TOKEN are required for a Release build.'
+            # These are not build settings the project can supply for itself. They are generated per
+            # deployment and shared with the backend out of band, which is why Config/Secrets.xcconfig
+            # is ignored by Git and why no copy of them exists anywhere in the tree or its history.
+            echo '::error::A Release build needs IOS_BEARER_TOKEN and WATCH_BEARER_TOKEN as repository secrets.'
+            echo '::error::They are not in this repository on purpose: Config/Secrets.xcconfig is gitignored (see README, "Local configuration").'
+            echo '::error::Set both from the same Config/Secrets.xcconfig used when the backend was deployed, so the app and the server accept each other.'
             exit 1
           fi
           for token in "$IOS_BEARER_TOKEN" "$WATCH_BEARER_TOKEN"; do
