@@ -13,6 +13,7 @@ struct IOSRootView: View {
         VStack(spacing: 24) {
             Text("WiFi Secure Call").font(.largeTitle.bold())
             Text(status).foregroundStyle(.secondary)
+            Text(audioPlacement).font(.footnote).foregroundStyle(.tertiary)
             controls
         }
         .padding(32)
@@ -47,12 +48,21 @@ struct IOSRootView: View {
         }
     }
 
+    private var audioPlacement: String {
+        switch session.state {
+        case .idle, .ended, .failed:
+            return "Microphone and speaker stay on this iPhone"
+        case .outgoingRinging, .incomingRinging, .connecting, .active, .reconnecting, .ending:
+            return session.isMuted ? "Muted on iPhone" : "Call audio on iPhone"
+        }
+    }
+
     @ViewBuilder private var controls: some View {
         switch session.state {
         case .idle:
             VStack {
                 Button("Secure Call to Watch") { beginSecureCall() }.buttonStyle(.borderedProminent)
-                Button("Call user") { if accountStore.callableAccounts.isEmpty { showAccount = true } else { showCallUser = true } }
+                Button("Call number or user") { if accountStore.callableAccounts.isEmpty { showAccount = true } else { showCallUser = true } }
                 Button(accountStore.activeAccount?.displayLabel ?? "Account") { showAccount = true }.font(.footnote)
                 Button("Dial diagnostics") { showDialDiagnostics = true }.font(.footnote)
                 Button("Carrier calling probe") { showCarrierCallingProbe = true }.font(.footnote)

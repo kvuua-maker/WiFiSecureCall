@@ -167,7 +167,7 @@ struct AudioPlayoutDiagnostic: Sendable {
 final class AudioPlayoutController: @unchecked Sendable {
     private let queue = DispatchQueue(label: "com.vkapps.wifisecurecall.audio.playout", qos: .userInteractive)
     private var timer: DispatchSourceTimer?
-    private var jitter = JitterBuffer()
+    private var jitter = JitterBuffer(initialMilliseconds: 60, maximumMilliseconds: 120)
     private var onFrame: (@Sendable (Data) -> Void)?
     private var onDiagnostic: (@Sendable (AudioPlayoutDiagnostic) -> Void)?
     private var emitted = Set<String>()
@@ -184,7 +184,7 @@ final class AudioPlayoutController: @unchecked Sendable {
     ) {
         queue.sync {
             stopLocked()
-            jitter = JitterBuffer()
+            jitter = JitterBuffer(initialMilliseconds: 60, maximumMilliseconds: 120)
             previousStats = jitter.stats
             emitted.removeAll(keepingCapacity: true)
             self.onFrame = onFrame
@@ -193,7 +193,7 @@ final class AudioPlayoutController: @unchecked Sendable {
             timer.schedule(deadline: .now() + .milliseconds(20), repeating: .milliseconds(20), leeway: .milliseconds(2))
             timer.setEventHandler { [weak self] in self?.tick() }
             self.timer = timer
-            emitOnce("audio_playout_started", "interval_ms=20 initial_ms=100 maximum_ms=240")
+            emitOnce("audio_playout_started", "interval_ms=20 initial_ms=60 maximum_ms=120")
             timer.resume()
         }
     }

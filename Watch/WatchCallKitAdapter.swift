@@ -61,8 +61,9 @@ final class WatchCallKitAdapter: NSObject, CallKitHandling, CXProviderDelegate {
     func reportOutgoingConnected(id: UUID) { provider.reportOutgoingCall(with: id, connectedAt: Date()) }
     func reportEnded(id: UUID, reason: CallEndReason) { provider.reportCall(with: id, endedAt: Date(), reason: Self.cxReason(reason)); clear(id) }
     private static func configuration() -> CXProviderConfiguration {
-        let configuration = CXProviderConfiguration()
+        let configuration = CXProviderConfiguration(localizedName: "WiFi Secure Call")
         configuration.supportsVideo = false; configuration.maximumCallGroups = 1; configuration.maximumCallsPerCallGroup = 1; configuration.supportedHandleTypes = [.generic]
+        configuration.includesCallsInRecents = true
         return configuration
     }
     private static func callUpdate(callerName: String? = nil) -> CXCallUpdate {

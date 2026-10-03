@@ -48,6 +48,14 @@ final class NotificationRuntime {
         return created
     }
 
+    static var localPlatform: String {
+        #if os(watchOS)
+        "watchOS"
+        #else
+        "iOS"
+        #endif
+    }
+
     func startCall() async {
         _ = ensureCallKit()
         await callSession.startCall()
@@ -59,6 +67,18 @@ final class NotificationRuntime {
     }
 
     func startPreferredCall(targetPlatform: String, accountID: UUID) async {
+        await startPreferredCall(preferredPlatforms: [targetPlatform], accountID: accountID, allowAnyPlatformFallback: false)
+    }
+
+    /// Places a call that stays on this device: this installation keeps its own media leg and only
+    /// the remote leg needs another registered device. On watchOS this is the path that produces a
+    /// call whose audio is captured and rendered by the Apple Watch alone.
+    func startLocalPeerCall(accountID: UUID) async {
+        let platforms = Self.localPlatform == "watchOS" ? ["watchOS", "iOS"] : ["iOS", "watchOS"]
+        await startPreferredCall(preferredPlatforms: platforms, accountID: accountID, allowAnyPlatformFallback: true)
+    }
+
+    func startPreferredCall(preferredPlatforms: [String], accountID: UUID, allowAnyPlatformFallback: Bool = false) async {
         guard accountStore.accounts.contains(where: { $0.accountID == accountID }) else {
             callSession.failToStart(.accountSessionInvalid)
             return
@@ -75,19 +95,29 @@ final class NotificationRuntime {
         let matches: [AccountDeviceSummary]
         do {
             matches = try await accountAPI.devices(accountID: accountID).filter {
-                $0.deviceID != InstallationIdentity.shared.id && $0.callReady && $0.platform == targetPlatform
+                $0.deviceID != InstallationIdentity.shared.id && $0.callReady
             }
         } catch {
             callSession.failToStart(Self.isInvalidAccountSession(error) ? .accountSessionInvalid : .serverUnavailable)
             return
         }
-        guard matches.count == 1 else {
-            callSession.failToStart(matches.isEmpty ? .targetUnavailable : .targetAmbiguous)
+        let preferred = matches.filter { preferredPlatforms.contains($0.platform) }
+        guard let target = Self.selectTarget(preferred: preferred, allReady: matches, allowAnyPlatformFallback: allowAnyPlatformFallback) else {
+            let ambiguous = preferred.count > 1 || (allowAnyPlatformFallback && preferred.isEmpty && matches.count > 1)
+            callSession.failToStart(ambiguous ? .targetAmbiguous : .targetUnavailable)
             return
         }
         _ = ensureCallKit()
-        let signaling = AccountCallSignaling(client: accountAPI, accountID: accountID, targetDeviceID: matches[0].deviceID, localSide: .caller)
+        let signaling = AccountCallSignaling(client: accountAPI, accountID: accountID, targetDeviceID: target.deviceID, localSide: .caller)
+        callSession.recordLifecycleDiagnostic("local_media_leg_selected", status: "local=\(Self.localPlatform) remote=\(target.platform)", callID: nil)
         await callSession.startCall(signaling: signaling)
+    }
+
+    private static func selectTarget(preferred: [AccountDeviceSummary], allReady: [AccountDeviceSummary], allowAnyPlatformFallback: Bool) -> AccountDeviceSummary? {
+        if preferred.count == 1 { return preferred[0] }
+        if preferred.count > 1 { return nil }
+        guard allowAnyPlatformFallback, allReady.count == 1 else { return nil }
+        return allReady[0]
     }
 
     func resolveRecipient(_ input: String, accountID: UUID) async throws -> ResolvedRecipient {

@@ -7,6 +7,7 @@ final class IOSNotificationController: NSObject, UIApplicationDelegate, UNUserNo
     private var alertRegistrationTask: Task<Void, Never>?
     private var voipRegistrationTask: Task<Void, Never>?
     private var voipRegistry: PKPushRegistry?
+    private var lastAlertToken: Data?
     private var lastVoIPToken: Data?
     private var notificationsAuthorized = false
 
@@ -20,14 +21,13 @@ final class IOSNotificationController: NSObject, UIApplicationDelegate, UNUserNo
         application.registerForRemoteNotifications(); configureVoIPPushes()
         Task { await NotificationRuntime.shared.api.reportNotificationDiagnostic(event: "apns_registration_started", status: "started") }
         center.requestAuthorization(options: [.alert, .sound, .badge]) { _, error in
-            center.getNotificationSettings { settings in Task { @MainActor in
-                self.notificationsAuthorized = settings.authorizationStatus == .authorized || settings.authorizationStatus == .provisional || settings.authorizationStatus == .ephemeral
-                let status = Self.authorizationStatus(settings.authorizationStatus, error: error)
-                Diagnostics.shared.record(role: .B, category: "notificationPermission", value: status)
-                await NotificationRuntime.shared.api.reportNotificationDiagnostic(event: "notification_permission", status: status)
-            } }
+            Task { @MainActor in await self.refreshNotificationAuthorization(requestError: error) }
         }
         return true
+    }
+
+    func applicationDidBecomeActive(_ application: UIApplication) {
+        Task { @MainActor in await refreshNotificationAuthorization() }
     }
 
     func application(_ application: UIApplication, didRegisterForRemoteNotificationsWithDeviceToken token: Data) { upload(token, pushType: .alert) }
@@ -37,6 +37,7 @@ final class IOSNotificationController: NSObject, UIApplicationDelegate, UNUserNo
 
     private func upload(_ token: Data, pushType: DevicePushType) {
         if pushType == .voip { lastVoIPToken = token }
+        else { lastAlertToken = token }
         let task = Task { @MainActor in
             await NotificationRuntime.shared.api.reportNotificationDiagnostic(event: "apns_registration_succeeded", status: "\(pushType.rawValue)_callback")
             for attempt in 1...3 {
@@ -60,6 +61,32 @@ final class IOSNotificationController: NSObject, UIApplicationDelegate, UNUserNo
     private func capabilities() -> DeviceCapabilities { .init(voipPush: true, alertPush: true, notificationsAuthorized: notificationsAuthorized, microphoneReady: true) }
     private func registrationFailed(_ error: Error) { let value = error as NSError; Diagnostics.shared.record(role: .B, category: "pushRegistration", value: "failed \(value.domain):\(value.code)"); Task { await NotificationRuntime.shared.api.reportNotificationDiagnostic(event: "apns_registration_failed", status: "domain=\(value.domain) code=\(value.code)") } }
     private static func authorizationStatus(_ status: UNAuthorizationStatus, error: Error?) -> String { if error != nil { return "error" }; switch status { case .notDetermined: return "notDetermined"; case .denied: return "denied"; case .authorized: return "authorized"; case .provisional: return "provisional"; case .ephemeral: return "ephemeral"; @unknown default: return "unknown" } }
+
+    /// A capability change has to reach the server. Without this the account device list keeps
+    /// advertising a stale notification capability and incoming calls are never routed to this iPhone.
+    private func refreshNotificationAuthorization(requestError: Error? = nil) async {
+        let settings = await withCheckedContinuation { (continuation: CheckedContinuation<UNNotificationSettings, Never>) in
+            UNUserNotificationCenter.current().getNotificationSettings { continuation.resume(returning: $0) }
+        }
+        let current: Bool
+        switch settings.authorizationStatus {
+        case .authorized, .provisional, .ephemeral: current = true
+        case .notDetermined, .denied: current = false
+        @unknown default: current = false
+        }
+        let previous = notificationsAuthorized
+        notificationsAuthorized = current
+        let status = Self.authorizationStatus(settings.authorizationStatus, error: requestError)
+        Diagnostics.shared.record(role: .B, category: "notificationPermission", value: status)
+        await NotificationRuntime.shared.api.reportNotificationDiagnostic(event: "notification_permission", status: status)
+        guard previous != current else { return }
+        await NotificationRuntime.shared.api.reportNotificationDiagnostic(event: "ios_notification_capabilities_refreshed", status: current ? "authorized" : "unauthorized")
+        if let lastAlertToken {
+            upload(lastAlertToken, pushType: .alert)
+        } else {
+            UIApplication.shared.registerForRemoteNotifications()
+        }
+    }
 
     nonisolated func userNotificationCenter(_ center: UNUserNotificationCenter, willPresent notification: UNNotification, withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void) {
         guard let envelope = ForegroundIncomingNotification.envelope(from: notification.request.content.userInfo) else { completionHandler([.banner, .sound]); return }

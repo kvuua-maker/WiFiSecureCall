@@ -197,6 +197,7 @@ final class AudioEngine: AudioEngineHandling, @unchecked Sendable {
     static let networkSampleRate: Double = 16_000
     static let samplesPerFrame: AVAudioFrameCount = 320
     static let bytesPerFrame = 640
+    static let preferredIOBufferDuration: TimeInterval = 0.01
 
     var onFrame: (@Sendable (Data) -> Void)?
     var onDiagnostic: (@Sendable (AudioEngineDiagnostic) -> Void)?
@@ -232,6 +233,10 @@ final class AudioEngine: AudioEngineHandling, @unchecked Sendable {
     private var playbackOverflowReported = false
     private var peakScheduledBuffers = 0
     private var observers: [NSObjectProtocol] = []
+    private var graphActive = false
+    private var interrupted = false
+    private var ownsActiveSession = false
+    private var hardwareOutputSampleRate: Double = 0
 
     init() { engine.attach(player); installObservers() }
     deinit { observers.forEach(NotificationCenter.default.removeObserver) }
@@ -257,13 +262,17 @@ final class AudioEngine: AudioEngineHandling, @unchecked Sendable {
         }
     }
 
-    func configureSession() throws {
+    func configureSession() throws { try applySessionCategory(announce: true) }
+
+    private func applySessionCategory(announce: Bool) throws {
         let session = AVAudioSession.sharedInstance()
         #if os(watchOS)
         try session.setCategory(.playAndRecord, mode: .voiceChat, options: [])
         #else
         try session.setCategory(.playAndRecord, mode: .voiceChat, options: [.allowBluetoothHFP, .defaultToSpeaker])
         #endif
+        try? session.setPreferredIOBufferDuration(Self.preferredIOBufferDuration)
+        guard announce else { return }
         emit("audio_session_configured", "success")
     }
 
@@ -281,10 +290,10 @@ final class AudioEngine: AudioEngineHandling, @unchecked Sendable {
         starting = true; emit("audio_engine_start_attempt", "started")
         do {
             cleanupGraph(); resetFirstFlags()
+            interrupted = false
+            try applySessionCategory(announce: false)
             let input = engine.inputNode, output = engine.outputNode
-            try input.setVoiceProcessingEnabled(true)
-            guard input.isVoiceProcessingEnabled, output.isVoiceProcessingEnabled else { throw NSError(domain: "WiFiSecureCall.AudioEngine", code: 20) }
-            emit("voice_processing_enabled", "input=YES output=YES")
+            enableVoiceProcessing(input: input, output: output)
             try applyMute(muted)
 
             let session = AVAudioSession.sharedInstance()
@@ -293,6 +302,7 @@ final class AudioEngine: AudioEngineHandling, @unchecked Sendable {
             let hardwareInput = input.inputFormat(forBus: 0)
             let outputFormat = output.inputFormat(forBus: 0)
             try validate(inputFormat); try validate(hardwareInput); try validate(outputFormat)
+            hardwareOutputSampleRate = output.outputFormat(forBus: 0).sampleRate
             emit("input_format", "client \(formatDescription(inputFormat)) hardware \(formatDescription(hardwareInput))")
             emit("output_format", "hardware \(formatDescription(outputFormat))")
 
@@ -314,6 +324,7 @@ final class AudioEngine: AudioEngineHandling, @unchecked Sendable {
                 removeSource: { [engine] in engine.disconnectNodeInput(sink); engine.detach(sink) }
             )
             player.play(); startCaptureWorker(); startCaptureWatchdog(ring)
+            graphActive = true; ownsActiveSession = true
             starting = false; emit("capture_source_connected", "av_audio_sink_node"); emit("audio_engine_start_success", "success")
         } catch {
             cleanupGraph(); starting = false
@@ -322,10 +333,37 @@ final class AudioEngine: AudioEngineHandling, @unchecked Sendable {
         }
     }
 
-    func stop() { controlQueue.sync { cleanupGraph() } }
+    private func enableVoiceProcessing(input: AVAudioInputNode, output: AVAudioOutputNode) {
+        // Echo cancellation and noise suppression are a quality feature, not a correctness
+        // requirement. Failing the call because a device does not expose the voice processing I/O
+        // bus is what made audio unusable on some hardware.
+        do { try input.setVoiceProcessingEnabled(true) }
+        catch { emit("voice_processing_unavailable", "enable_failed", error: error as NSError) }
+        let inputEnabled = input.isVoiceProcessingEnabled
+        let outputEnabled = output.isVoiceProcessingEnabled
+        let status = "input=\(inputEnabled ? "YES" : "NO") output=\(outputEnabled ? "YES" : "NO")"
+        emit(inputEnabled && outputEnabled ? "voice_processing_enabled" : "voice_processing_disabled", status)
+    }
+
+    func stop() {
+        controlQueue.sync {
+            cleanupGraph()
+            deactivateOwnedSession()
+        }
+    }
+
+    /// Leaving the session active after teardown keeps other apps interrupted, so music never comes
+    /// back after a call ends.
+    private func deactivateOwnedSession() {
+        guard ownsActiveSession else { return }
+        ownsActiveSession = false
+        do { try AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation) }
+        catch { emit("audio_session_deactivated", "ignored", error: error as NSError) }
+    }
 
     func play(_ payload: Data) {
         guard payload.count == Self.bytesPerFrame else { reportPlaybackFailure(NSError(domain: "WiFiSecureCall.AudioEngine", code: 30)); return }
+        guard !interrupted else { return }
         playbackQueue.async { [weak self] in self?.convertAndSchedule(payload) }
     }
 
@@ -463,6 +501,7 @@ final class AudioEngine: AudioEngineHandling, @unchecked Sendable {
     }
 
     private func convertAndSchedule(_ payload: Data) {
+        guard !interrupted else { return }
         guard engine.isRunning, let networkFormat, let converter = outputConverter,
               let source = Self.canonicalBuffer(from: payload, format: networkFormat) else {
             let error = NSError(domain: "WiFiSecureCall.AudioEngine", code: 32)
@@ -503,15 +542,81 @@ final class AudioEngine: AudioEngineHandling, @unchecked Sendable {
         captureLifecycle.remove { [engine] in guard let sink else { return }; engine.disconnectNodeInput(sink); engine.detach(sink) }
         captureSink = nil; captureRing = nil; engine.disconnectNodeOutput(player); engine.reset()
         inputConverter = nil; outputConverter = nil; networkFormat = nil; pcmRing.reset(); scheduledBuffers = 0
+        graphActive = false; interrupted = false; hardwareOutputSampleRate = 0
     }
 
     private func installObservers() {
         let center = NotificationCenter.default
         observers.append(center.addObserver(forName: .AVAudioEngineConfigurationChange, object: nil, queue: nil) { [weak self] _ in self?.onFailure?(.configurationChanged) })
-        observers.append(center.addObserver(forName: AVAudioSession.interruptionNotification, object: nil, queue: nil) { [weak self] note in self?.emit("audio_interruption", "\(note.userInfo?[AVAudioSessionInterruptionTypeKey] ?? "unknown")") })
-        observers.append(center.addObserver(forName: AVAudioSession.routeChangeNotification, object: nil, queue: nil) { [weak self] _ in self?.emit("audio_route_changed", "changed") })
+        observers.append(center.addObserver(forName: AVAudioSession.interruptionNotification, object: nil, queue: nil) { [weak self] note in self?.handleInterruption(note) })
+        observers.append(center.addObserver(forName: AVAudioSession.routeChangeNotification, object: nil, queue: nil) { [weak self] note in self?.handleRouteChange(note) })
         observers.append(center.addObserver(forName: AVAudioSession.mediaServicesWereResetNotification, object: nil, queue: nil) { [weak self] _ in self?.onFailure?(.configurationChanged) })
         if #available(iOS 17.0, watchOS 10.0, *) { observers.append(center.addObserver(forName: AVAudioApplication.inputMuteStateChangeNotification, object: nil, queue: nil) { [weak self] _ in guard let self else { return }; let muted = AVAudioApplication.shared.isInputMuted; self.emit("audio_input_mute", muted ? "system=muted" : "system=unmuted"); self.onMuteChanged?(muted) }) }
+    }
+
+    /// A cellular call, Siri or an alarm interrupts the session. Logging and continuing leaves capture
+    /// and playback running against a dead I/O path, which is silence for the rest of the call.
+    private func handleInterruption(_ note: Notification) {
+        guard let raw = note.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt,
+              let type = AVAudioSession.InterruptionType(rawValue: raw) else {
+            emit("audio_interruption", "unknown"); return
+        }
+        switch type {
+        case .began:
+            emit("audio_interruption", "began")
+            controlQueue.async { [weak self] in self?.suspendForInterruption() }
+        case .ended:
+            let resume = ((note.userInfo?[AVAudioSessionInterruptionOptionKey] as? UInt).map(AVAudioSession.InterruptionOptions.init(rawValue:)) ?? []).contains(.shouldResume)
+            emit("audio_interruption", resume ? "ended_resume" : "ended")
+            controlQueue.async { [weak self] in self?.resumeAfterInterruption(shouldResume: resume) }
+        @unknown default:
+            emit("audio_interruption", "unknown")
+        }
+    }
+
+    private func suspendForInterruption() {
+        guard graphActive, !interrupted else { return }
+        interrupted = true
+        captureTimer?.cancel(); captureTimer = nil
+        player.pause(); engine.pause()
+        emit("audio_interruption_suspended", "graph_paused")
+    }
+
+    private func resumeAfterInterruption(shouldResume: Bool) {
+        guard graphActive, interrupted else { return }
+        interrupted = false
+        guard shouldResume else { emit("audio_interruption_resume", "declined_by_system"); return }
+        do {
+            if ownsActiveSession { try AVAudioSession.sharedInstance().setActive(true) }
+            engine.prepare(); try engine.start()
+            if !player.isPlaying { player.play() }
+            startCaptureWorker()
+            emit("audio_interruption_resume", "graph_restarted")
+        } catch {
+            emit("audio_interruption_resume", "failed", error: error as NSError)
+            onFailure?(.captureStalled)
+        }
+    }
+
+    /// Connecting or removing a headset changes the hardware output format, and the conversion ratio
+    /// chosen at call setup is then wrong. Cosmetic route notifications must not consume the single
+    /// audio recovery budget, so only a real format change is escalated.
+    private func handleRouteChange(_ note: Notification) {
+        let reason = (note.userInfo?[AVAudioSessionRouteChangeReasonKey] as? UInt).map { String(AVAudioSession.RouteChangeReason(rawValue: $0).rawValue) } ?? "unknown"
+        let session = AVAudioSession.sharedInstance()
+        let inputs = session.currentRoute.inputs.map(\.portType.rawValue).joined(separator: ",")
+        let outputs = session.currentRoute.outputs.map(\.portType.rawValue).joined(separator: ",")
+        emit("audio_route_changed", "reason=\(reason) inputs=\(inputs) outputs=\(outputs)")
+        controlQueue.async { [weak self] in self?.rebuildGraphIfRouteFormatChanged() }
+    }
+
+    private func rebuildGraphIfRouteFormatChanged() {
+        guard graphActive, !starting else { return }
+        let rate = engine.outputNode.outputFormat(forBus: 0).sampleRate
+        guard rate > 0, rate != hardwareOutputSampleRate else { return }
+        hardwareOutputSampleRate = rate
+        emit("audio_output_format_changed", "sampleRate=\(rate)")
+        onFailure?(.configurationChanged)
     }
 
     private func validate(_ format: AVAudioFormat) throws { guard format.sampleRate > 0, format.channelCount > 0 else { throw CallFailure.audioFailed } }

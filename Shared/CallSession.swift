@@ -609,7 +609,7 @@ final class CallSession: ObservableObject {
         reconnectTask?.cancel()
         reconnectTask = Task { [weak self] in
             guard let self else { return }
-            let deadline = ProcessInfo.processInfo.systemUptime + CallTimeouts.reconnectTotal; var delay = 0.25
+            let deadline = ProcessInfo.processInfo.systemUptime + CallTimeouts.mediaReconnectTotal; var delay = 0.25
             while !Task.isCancelled, ProcessInfo.processInfo.systemUptime < deadline {
                 do { try await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000)) } catch { return }
                 guard self.isCurrent(current) else { return }

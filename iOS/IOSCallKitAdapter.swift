@@ -72,11 +72,12 @@ final class IOSCallKitAdapter: NSObject, CallKitHandling, CXProviderDelegate {
     }
 
     private static func configuration() -> CXProviderConfiguration {
-        let configuration = CXProviderConfiguration()
+        let configuration = CXProviderConfiguration(localizedName: "WiFi Secure Call")
         configuration.supportsVideo = false
         configuration.maximumCallGroups = 1
         configuration.maximumCallsPerCallGroup = 1
         configuration.supportedHandleTypes = [.generic]
+        configuration.includesCallsInRecents = true
         return configuration
     }
 

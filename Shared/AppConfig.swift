@@ -100,4 +100,16 @@ enum CallTimeouts {
     static let audioActivation: TimeInterval = 5
     static let initialMedia: TimeInterval = 5
     static let reconnectTotal: TimeInterval = 10
+
+    /// watchOS grants the audio-streaming networking exception (TN3135) only while a call audio
+    /// session is running, and the low-level media path is observed to be withdrawn and restored
+    /// periodically. Media reconnects on watchOS therefore get a wider recovery window than on iOS
+    /// so an expected path revocation does not terminate an otherwise healthy call.
+    static var mediaReconnectTotal: TimeInterval {
+        #if os(watchOS)
+        return 45
+        #else
+        return reconnectTotal
+        #endif
+    }
 }

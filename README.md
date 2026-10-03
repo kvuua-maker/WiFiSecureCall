@@ -8,6 +8,17 @@ Apple Watch links to an authenticated iPhone account through the server over the
 
 Independent iPhone and Apple Watch MVP for live Internet audio calls over HTTPS/WSS.
 
+## Call audio on Apple Watch
+
+Call audio runs on the device that places or answers the call. On the watch that means the microphone capture
+and the remote voice track are produced by the Apple Watch itself, with CallKit for the system call UI and
+PushKit for incoming calls; no paired iPhone process participates in the media path. The watch app exposes a
+secure dialer for numbers, a user call, and a linked-device call that keeps the local media leg on the watch.
+
+watchOS constraints and the reasoning behind the current media transport are documented in
+`Docs/WatchAudioArchitecture.md`. Carrier Wi-Fi Calling provisioning for the companion device remains
+unavailable to third-party apps, see `Docs/CarrierCallingPublicAPIResearch.md`.
+
 ## Local configuration
 
 Copy `Config/Secrets.xcconfig.example` to `Config/Secrets.xcconfig` and replace both values with distinct random 256-bit bearer tokens. The file is intentionally ignored by Git. Matching values are supplied to the server as protected environment variables.
