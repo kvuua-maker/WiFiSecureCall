@@ -219,6 +219,61 @@ jobs:
             echo "  $identifier version $short build $revision"
           done
 
+      # A manifest that is not inside the bundle is no manifest, and the required-reason declarations
+      # it carries are what App Store Connect reads. This checks the bundles the build actually
+      # produced rather than the source file, because target membership is what puts it there: the
+      # file exists in the repository whether or not a target copies it.
+      - name: Verify both apps ship the privacy manifest
+        env:
+          CONFIGURATION: ${{ steps.configuration.outputs.configuration }}
+        run: |
+          set -euo pipefail
+          products="DerivedData/Build/Products/$CONFIGURATION-iphoneos"
+          iphone_app="$(find "$products" -maxdepth 1 -type d -name '*.app' ! -name '*Watch*' -print -quit)"
+          [ -n "$iphone_app" ] || { echo '::error::no iPhone .app was produced.'; exit 1; }
+          watch_app="$(find "$iphone_app/Watch" -maxdepth 1 -type d -name '*.app' -print -quit)"
+          [ -n "$watch_app" ] || { echo '::error::the built app has no embedded Apple Watch app.'; exit 1; }
+
+          for app in "$iphone_app" "$watch_app"; do
+            [ -f "$app/PrivacyInfo.xcprivacy" ] \
+              || { echo "::error::$app ships no PrivacyInfo.xcprivacy."; exit 1; }
+            echo "found $app/PrivacyInfo.xcprivacy"
+          done
+
+          work="$(mktemp -d)"
+          cat > "$work/check.py" <<'PYTHON'
+          import json
+          import subprocess
+          import sys
+
+          # The pairs the shipped code needs: UserDefaults for the app's own installation id and
+          # generation counters, and system boot time for the media reconnect deadline. A category
+          # without its reason, or a reason Apple does not define, is not a declaration.
+          REQUIRED = {
+              ("NSPrivacyAccessedAPICategoryUserDefaults", "CA92.1"),
+              ("NSPrivacyAccessedAPICategorySystemBootTime", "35F9.1"),
+          }
+
+          for manifest in sys.argv[1:]:
+              converted = subprocess.run(
+                  ["plutil", "-convert", "json", "-o", "-", manifest],
+                  check=True, capture_output=True, text=True,
+              ).stdout
+              entries = json.loads(converted).get("NSPrivacyAccessedAPITypes") or []
+              declared = {
+                  (entry["NSPrivacyAccessedAPIType"], reason)
+                  for entry in entries
+                  for reason in entry["NSPrivacyAccessedAPITypeReasons"]
+              }
+              missing = REQUIRED - declared
+              if missing:
+                  pairs = ", ".join(sorted(category + " " + reason for category, reason in missing))
+                  raise SystemExit("::error::" + manifest + " does not declare " + pairs)
+              print("declared " + str(len(declared)) + " required-reason pairing(s): " + manifest)
+          PYTHON
+          python3 "$work/check.py" "$iphone_app/PrivacyInfo.xcprivacy" "$watch_app/PrivacyInfo.xcprivacy"
+          rm -rf "$work"
+
       - name: Package the unsigned .ipa
         id: package
         env:
@@ -720,12 +775,27 @@ jobs:
             echo "signed: $identifier build $revision"
           done
 
+      # The export needs the same App Store Connect credentials the archive used, and it takes them
+      # the way xcodebuild documents for -exportArchive: as authentication flags on the command line,
+      # the same flags the archive step above already uses. The credentials used to sit in an
+      # uploadAPIKey dictionary inside ExportOptions.plist, and nothing could establish that Xcode
+      # reads it: plutil -lint only proves the file is well-formed XML, and xcodebuild -help documents
+      # command line options rather than plist keys. A field there that Xcode ignores fails at upload
+      # time, long after the archive, which is exactly where this job needs no new unknown.
       - name: Upload to TestFlight
         env:
           KEY_ID: ${{ secrets.APPSTORE_KEY_ID }}
           ISSUER_ID: ${{ secrets.APPSTORE_ISSUER_ID }}
         run: |
           set -euo pipefail
+          # Recorded, not enforced: this is the evidence that the flags below exist on this runner's
+          # Xcode, and the log keeps it for the next run without turning a help-text difference into a
+          # failure of the upload itself.
+          xcodebuild -help 2>&1 \
+            | grep -oE -- '-authenticationKey(Path|ID|IssuerID)|-allowProvisioningUpdates' \
+            | sort -u | sed 's/^/xcodebuild -help documents: /' \
+            || echo '::warning::xcodebuild -help listed none of the authentication flags; the export below relies on the archive step using the same ones.'
+
           cat > "$RUNNER_TEMP/ExportOptions.plist" <<PLIST
           <?xml version="1.0" encoding="UTF-8"?>
           <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -743,18 +813,11 @@ jobs:
             <false/>
             <key>uploadSymbols</key>
             <true/>
-            <key>uploadAPIKey</key>
-            <dict>
-              <key>keyID</key>
-              <string>$KEY_ID</string>
-              <key>issuerID</key>
-              <string>$ISSUER_ID</string>
-              <key>keyPath</key>
-              <string>$KEY_PATH</string>
-            </dict>
           </dict>
           </plist>
           PLIST
+          # Well-formedness only. The credentials are not in this file, so there is nothing here for
+          # this check to confirm about authentication.
           plutil -lint "$RUNNER_TEMP/ExportOptions.plist"
 
           xcodebuild \
@@ -762,6 +825,10 @@ jobs:
             -archivePath "$ARCHIVE" \
             -exportOptionsPlist "$RUNNER_TEMP/ExportOptions.plist" \
             -exportPath "$RUNNER_TEMP/export" \
+            -authenticationKeyPath "$KEY_PATH" \
+            -authenticationKeyID "$KEY_ID" \
+            -authenticationKeyIssuerID "$ISSUER_ID" \
+            -allowProvisioningUpdates \
             | tee /tmp/testflight-upload.log
 
           grep -qE 'Upload succeeded|Delivered your binary|UPLOAD SUCCEEDED' /tmp/testflight-upload.log \
