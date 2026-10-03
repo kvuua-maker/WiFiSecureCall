@@ -62,7 +62,9 @@ try {
 const publicKey = createPublicKey(privateKey);
 const spki = publicKey.export({ type: 'spki', format: 'der' });
 report(`public key fingerprint: sha256:${createHashOf(spki)}`);
-report('the fingerprint is a digest of the public key, safe to compare against App Store Connect.');
+report('This is a digest of the public key. Comparing it with a file you already hold shows only that the');
+report('two hold the same key. It cannot be compared with anything Apple returns, so it does not show that');
+report('the key is the one Apple has on record for this key id.');
 
 report('');
 report('=== claims ===');
@@ -131,14 +133,18 @@ if (body.trim() === '') {
 report('');
 report('=== what this result establishes ===');
 if (response.status === 200) {
-  report('A library independent of the workflow signed a request Apple accepted, so the three secrets are valid.');
-  report('A 401 from ios-build.yml is therefore a defect in its signing code, not in the credentials.');
+  report('Apple accepted this one request, signed by jose, with these three secrets.');
+  report('That settles this request and nothing else: it does not show the key can drive automatic signing,');
+  report('that the profiles exist, that other endpoints accept the token, or that ios-build.yml differs.');
+  report('A 401 from ios-build.yml is not thereby a signing-code defect: the two runs may differ in the');
+  report('credentials, the clock, or anything else that this request did not reproduce.');
   process.exit(EXIT_ACCEPTED);
 }
 if (response.status === 401) {
-  report('A library independent of the workflow was rejected too, so the credentials are the cause.');
-  report('This names no single secret: the issuer may be another team, the key may be revoked or');
-  report('not yet active, or the key id may not belong to the uploaded key.');
+  report('Apple refused this request. That names no cause: not which secret, if any, is at fault, and not');
+  report('whether the same credentials would be refused on another run, by another endpoint, or by Xcode.');
+  report('Possible explanations include an issuer from another team, a revoked or inactive key, a key id');
+  report('that does not belong to this .p8, and a difference between this run and the one that failed.');
   report('This probe exits non-zero: Apple refused the request, so the run must not report success.');
   process.exit(EXIT_UNAUTHORIZED);
 }

@@ -57,9 +57,17 @@ Before it builds anything, the `testflight` job signs a real JWT with the key an
 | Result | What it settles |
 | --- | --- |
 | `200` | The signature is accepted for `/v1/apps`. Nothing more: automatic signing rights and the profiles are still unconfirmed, so a failure after this line is not a credential problem. |
-| `401` | The three secrets do not authenticate together, but the code does not name which one is at fault. The issuer may be another team, the key may have been revoked, or `APPSTORE_KEY_ID` may not belong to the uploaded `.p8`. |
+| `401` | Apple refused the request. That does not identify which secret is at fault, if any, and does not establish the cause: the issuer may belong to another team, the key may be revoked or inactive, `APPSTORE_KEY_ID` may not belong to this `.p8`, or the run may differ from another in clock or conditions. |
 | `403` | The request was refused, which says nothing about the signature. Usually a role or app scope matter. |
 
 If the `.p8` is lost there is nothing to re-download: Apple serves the private key once, at creation. Create a new API key and replace `APPSTORE_PRIVATE_KEY`, `APPSTORE_KEY_ID` and `APPSTORE_ISSUER_ID` together.
 
-The job also reports the DER length the key structure declares. A `prime256v1` PKCS#8 key is 138 bytes, so anything else is a body that was assembled rather than downloaded, which is worth seeing before a `401`.
+The job also reports two lengths for the key: the size its ASN.1 structure declares, and the size of a canonical PKCS#8 re-export. Both are shapes, not provenance. A minimal `prime256v1` PKCS#8 structure declares 138 bytes, while a key downloaded from App Store Connect declares 150, because that file also carries the public key. So a length other than either is worth looking at, but a length is not evidence of where a key came from and it is not evidence of a cause for a `401`.
+
+The job prints a SHA-256 of the canonical PKCS#8 DER, and the same digest can be produced from a downloaded file with:
+
+```
+openssl pkcs8 -topk8 -nocrypt -in AuthKey_<KEY_ID>.p8 -outform DER | openssl dgst -sha256
+```
+
+Matching digests show that the secret and that file hold the same key. They show nothing further: Apple returns no digest to compare against, so a match does not establish that the key is the one Apple has on record for this key id. Note that `openssl pkey -outform DER` writes the SEC1 structure instead, which is a different byte sequence and digests to something not comparable.

@@ -1,12 +1,13 @@
-// Does Apple's 401 distinguish anything? It answers the same request three ways:
+// Does Apple's 401 distinguish anything? It answers the same request four ways:
 //
 //   with the key stored in the repository secret
 //   with a key made here that Apple has never seen
 //   with no Authorization header at all
+//   with an empty bearer token
 //
-// If the three answers are identical, then the status carries no information about which secret is
-// wrong, and no further run against Apple from GitHub can settle it. That is the test that stops the
-// guessing, rather than another round of the same request.
+// If the answers are identical, the status distinguishes none of these cases from one another. That is a
+// statement about these four responses and not a limit on what can be established by other means: a
+// different endpoint, a different key, or evidence from outside Apple can still separate causes.
 //
 // Usage: probe2.mjs <secretKeyPath> <keyId> <issuerId>
 
@@ -66,7 +67,8 @@ console.log('');
 console.log(`distinct answers: ${distinct.size}`);
 if (distinct.size === 1) {
   console.log('Apple answers identically for a known key, an unknown key and no token.');
-  console.log('The 401 therefore names nothing, and no run from GitHub can tell the secrets apart.');
+  console.log('So the status alone tells these cases apart in no way, and repeating this exact request adds');
+  console.log('nothing. It does not establish the cause, and it does not rule out other means of finding it.');
 } else {
   console.log('Apple answers differently, so the status does carry information:');
   for (const answer of distinct) console.log(`  ${answer}`);
