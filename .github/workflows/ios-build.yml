@@ -44,7 +44,10 @@ on:
     branches: [main]
 
 concurrency:
-  group: ios-build-${{ github.ref }}
+  # The event is part of the group so that a push cannot cancel a manual dispatch that is already
+  # uploading to TestFlight: same ref, different intent, and a signed build is too long and too far
+  # along to throw away because someone pushed to main.
+  group: ios-build-${{ github.ref }}-${{ github.event_name }}
   cancel-in-progress: true
 
 permissions:
