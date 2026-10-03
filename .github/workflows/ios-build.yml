@@ -340,7 +340,13 @@ jobs:
           for app in "$iphone_app" "$watch_app"; do
             [ -f "$app/Assets.car" ] || { echo "::error::$app has no compiled asset catalog."; exit 1; }
             icon_name="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIcons:CFBundlePrimaryIcon:CFBundleIconName' "$app/Info.plist" 2>/dev/null || true)"
-            icon_files="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIcons:CFBundlePrimaryIcon:CFBundleIconFiles' "$app/Info.plist" 2>/dev/null || true)"
+            # PlistBuddy frames an array as "Array {" and "}" around one entry per line, and prints
+            # "Empty array" for none, so those frame lines are dropped before the entries are used as
+            # file names. Feeding the frame back in would look for a file called "Array".
+            icon_files_raw="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIcons:CFBundlePrimaryIcon:CFBundleIconFiles' "$app/Info.plist" 2>/dev/null || true)"
+            icon_files="$(printf '%s\n' "$icon_files_raw" \
+              | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' \
+              | grep -vE '^(Array.*\{|\}|Empty array)$|^$' | tr '\n' ' ')"
             [ -n "$icon_name$icon_files" ] || { echo "::error::$app declares no primary app icon."; exit 1; }
             if [ -n "$icon_name" ]; then
               LC_ALL=C grep -qa "$icon_name" "$app/Assets.car" \
