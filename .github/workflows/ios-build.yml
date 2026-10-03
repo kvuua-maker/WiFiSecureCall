@@ -274,6 +274,7 @@ jobs:
         env:
           # The built-in token already has contents: write, a personal token is optional.
           GH_TOKEN: ${{ secrets.GH_PAT != '' && secrets.GH_PAT || github.token }}
+          REPOSITORY: ${{ github.repository }}
           VERSION: ${{ needs.package.outputs.version }}
           BUILD_NUMBER: ${{ needs.package.outputs.build_number }}
           CONFIGURATION: ${{ needs.package.outputs.configuration }}
@@ -282,11 +283,14 @@ jobs:
         run: |
           set -euo pipefail
           notes="$(printf 'WiFi Secure Call %s build %s (%s configuration).\n\nThis bundle is **unsigned**: it contains the iPhone app and its embedded Apple Watch app, and it is the build that was verified in CI. Apple only accepts signed bundles on a device, so re-sign it with your own certificate before installing, or use the TestFlight job once App Store Connect credentials are configured.\n\nAttached: %s\n' "$VERSION" "$BUILD_NUMBER" "$CONFIGURATION" "$ARTIFACT")"
-          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
-            gh release upload "$RELEASE_TAG" "dist/$ARTIFACT" --clobber
+          # This job has no checkout, so the repository has to be named explicitly: gh cannot infer it
+          # from a git remote that does not exist here.
+          if gh release view "$RELEASE_TAG" --repo "$REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" "dist/$ARTIFACT" --repo "$REPOSITORY" --clobber
             echo "Attached dist/$ARTIFACT to the existing release $RELEASE_TAG."
           else
-            gh release create "$RELEASE_TAG" "dist/$ARTIFACT" --title "WiFi Secure Call $VERSION (build $BUILD_NUMBER)" --notes "$notes"
+            gh release create "$RELEASE_TAG" "dist/$ARTIFACT" --repo "$REPOSITORY" \
+              --title "WiFi Secure Call $VERSION (build $BUILD_NUMBER)" --notes "$notes"
             echo "Created release $RELEASE_TAG with dist/$ARTIFACT."
           fi
 
