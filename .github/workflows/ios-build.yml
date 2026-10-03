@@ -3,18 +3,19 @@ name: iOS Build
 # Builds the WiFiSecureCall iPhone app together with its embedded Apple Watch app and publishes the
 # result as a downloadable artifact in GitHub Releases.
 #
-# No Apple certificate, provisioning profile or App Store Connect key is needed for that path. The
-# bundle is therefore UNSIGNED: it proves the build, it is what you re-sign with your own certificate
-# before installing it on a device, and it is not installable on a stock device as-is. TestFlight upload
-# is a separate, opt-in job that does require the Apple credentials listed in Docs/WatchAudioArchitecture.md
-# and README.md.
+# No Apple credential is needed for that path. The bundle is therefore UNSIGNED: it proves the build, it
+# is what you re-sign with your own certificate before installing it on a device, and it is not
+# installable on a stock device as-is.
 #
 # Optional repository secrets, all optional because the default path needs none of them:
-#   IOS_BEARER_TOKEN, WATCH_BEARER_TOKEN  build the Release configuration instead of Debug.
-#   APPLE_DISTRIBUTION_CERT_P12, APPLE_DISTRIBUTION_CERT_PASSWORD, APPLE_PROFILE_IOS,
-#   APPLE_PROFILE_WATCH, APP_STORE_CONNECT_KEY_ID, APP_STORE_CONNECT_ISSUER_ID,
-#   APP_STORE_CONNECT_PRIVATE_KEY        enable the opt-in TestFlight job.
-#   GH_PAT                               optional, the built-in GITHUB_TOKEN already has release access.
+#   IOS_BEARER_TOKEN, WATCH_BEARER_TOKEN   build the Release configuration instead of Debug.
+#   APPSTORE_KEY_ID, APPSTORE_ISSUER_ID, APPSTORE_PRIVATE_KEY
+#                                           the App Store Connect API key, the only Apple credential the
+#                                           opt-in TestFlight job needs. Signing is fully automatic:
+#                                           xcodebuild creates or refreshes the Apple Distribution
+#                                           certificate and both provisioning profiles with this key, so
+#                                           no .p12 and no .mobileprovision have to be uploaded.
+#   GH_PAT                                 optional, the built-in GITHUB_TOKEN already has release access.
 
 on:
   workflow_dispatch:
@@ -297,48 +298,61 @@ jobs:
   testflight:
     name: Signed build for TestFlight
     needs: validate
-    # Opt-in only, and only when every Apple credential is present. The default push path never reaches
-    # this job, so the repository can stay green without a single certificate.
+    # Opt-in only, so an ordinary push never uploads a build. Automatic signing needs nothing but the
+    # App Store Connect API key; no certificate and no provisioning profile are uploaded by hand.
     if: ${{ github.event_name == 'workflow_dispatch' && inputs.upload_to_testflight }}
     runs-on: xcode-27
     timeout-minutes: 60
     env:
       TEAM_ID: 9V5XXDXF3N
-      IOS_BUNDLE_ID: com.vkapps.wifisecurecall
-      WATCH_BUNDLE_ID: com.vkapps.wifisecurecall.watchkitapp
-      IOS_PROFILE_NAME: WiFiSecureCallAppStoreD24
-      WATCH_PROFILE_NAME: WiFiSecureCallWatchAppStore
       ARCHIVE: ${{ github.workspace }}/archives/WiFiSecureCall.xcarchive
+      KEY_PATH: ${{ github.workspace }}/appstoreconnect/AuthKey_${{ secrets.APPSTORE_KEY_ID }}.p8
     steps:
       - uses: actions/checkout@v7
 
-      - name: Check the Apple credentials
-        id: credentials
+      - name: Check the App Store Connect credentials
         env:
-          CERT: ${{ secrets.APPLE_DISTRIBUTION_CERT_P12 }}
-          CERT_PASSWORD: ${{ secrets.APPLE_DISTRIBUTION_CERT_PASSWORD }}
-          IOS_PROFILE: ${{ secrets.APPLE_PROFILE_IOS }}
-          WATCH_PROFILE: ${{ secrets.APPLE_PROFILE_WATCH }}
-          KEY_ID: ${{ secrets.APP_STORE_CONNECT_KEY_ID }}
-          ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}
-          PRIVATE_KEY: ${{ secrets.APP_STORE_CONNECT_PRIVATE_KEY }}
+          KEY_ID: ${{ secrets.APPSTORE_KEY_ID }}
+          ISSUER_ID: ${{ secrets.APPSTORE_ISSUER_ID }}
+          PRIVATE_KEY: ${{ secrets.APPSTORE_PRIVATE_KEY }}
         run: |
           set -euo pipefail
           # A plain string rather than an array: the macOS shell is bash 3.2, where expanding an empty
           # array under `set -u` fails.
           missing=''
-          [ -n "$CERT" ] || missing="${missing:+$missing,}APPLE_DISTRIBUTION_CERT_P12"
-          [ -n "$CERT_PASSWORD" ] || missing="${missing:+$missing,}APPLE_DISTRIBUTION_CERT_PASSWORD"
-          [ -n "$IOS_PROFILE" ] || missing="${missing:+$missing,}APPLE_PROFILE_IOS"
-          [ -n "$WATCH_PROFILE" ] || missing="${missing:+$missing,}APPLE_PROFILE_WATCH"
-          [ -n "$KEY_ID" ] || missing="${missing:+$missing,}APP_STORE_CONNECT_KEY_ID"
-          [ -n "$ISSUER_ID" ] || missing="${missing:+$missing,}APP_STORE_CONNECT_ISSUER_ID"
-          [ -n "$PRIVATE_KEY" ] || missing="${missing:+$missing,}APP_STORE_CONNECT_PRIVATE_KEY"
+          [ -n "$KEY_ID" ] || missing="${missing:+$missing,}APPSTORE_KEY_ID"
+          [ -n "$ISSUER_ID" ] || missing="${missing:+$missing,}APPSTORE_ISSUER_ID"
+          [ -n "$PRIVATE_KEY" ] || missing="${missing:+$missing,}APPSTORE_PRIVATE_KEY"
           if [ -n "$missing" ]; then
             echo "::error::TestFlight needs these repository secrets: $missing"
             exit 1
           fi
-          echo 'All Apple credentials are present.'
+          echo 'App Store Connect API key found.'
+
+      # Accepts the key as raw PEM, as base64, or as a single line with escaped newlines, because all
+      # three are common ways to paste an AuthKey file into a repository secret. openssl is used instead
+      # of base64 so the step behaves the same on the macOS runner and on Linux.
+      - name: Write the App Store Connect API key
+        env:
+          PRIVATE_KEY: ${{ secrets.APPSTORE_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          umask 077
+          mkdir -p "$(dirname "$KEY_PATH")"
+          if printf '%s' "$PRIVATE_KEY" | tr -d '\n' | openssl base64 -d -A > "$KEY_PATH" 2>/dev/null \
+             && head -1 "$KEY_PATH" | grep -q 'BEGIN PRIVATE KEY'; then
+            echo 'Decoded a base64 encoded API key.'
+          else
+            printf '%s\n' "$PRIVATE_KEY" | sed 's/\\n/\n/g' > "$KEY_PATH"
+            echo 'Using the API key as stored.'
+          fi
+          if ! grep -q 'BEGIN PRIVATE KEY' "$KEY_PATH"; then
+            echo '::error::APPSTORE_PRIVATE_KEY is neither a PEM key nor base64 encoded PEM.'
+            exit 1
+          fi
+          chmod 600 "$KEY_PATH"
+          openssl pkey -in "$KEY_PATH" -noout -check >/dev/null 2>&1 \
+            || echo '::warning::openssl could not parse the key; xcodebuild will report the real problem.'
 
       - name: Materialize Config/Secrets.xcconfig
         env:
@@ -347,44 +361,30 @@ jobs:
         run: |
           set -euo pipefail
           umask 077
-          [ "${#IOS_BEARER_TOKEN}" -ge 32 ] && [ "${#WATCH_BEARER_TOKEN}" -ge 32 ] \
-            || { echo '::error::IOS_BEARER_TOKEN and WATCH_BEARER_TOKEN must each be at least 32 characters.'; exit 1; }
+          if [ -z "$IOS_BEARER_TOKEN" ] || [ -z "$WATCH_BEARER_TOKEN" ]; then
+            echo '::error::IOS_BEARER_TOKEN and WATCH_BEARER_TOKEN are required for a Release build.'
+            exit 1
+          fi
+          for token in "$IOS_BEARER_TOKEN" "$WATCH_BEARER_TOKEN"; do
+            if [ "${#token}" -lt 32 ]; then
+              echo '::error::The bearer tokens must each be at least 32 characters.'
+              exit 1
+            fi
+            case "$token" in
+              *[[:space:]]*) echo '::error::Bearer tokens must not contain whitespace.'; exit 1 ;;
+            esac
+          done
           printf 'IOS_BEARER_TOKEN = %s\nWATCH_BEARER_TOKEN = %s\n' "$IOS_BEARER_TOKEN" "$WATCH_BEARER_TOKEN" > Config/Secrets.xcconfig
           echo 'Config/Secrets.xcconfig written.'
 
-      - name: Import the Apple Distribution certificate
-        env:
-          CERT_P12_BASE64: ${{ secrets.APPLE_DISTRIBUTION_CERT_P12 }}
-          CERT_PASSWORD: ${{ secrets.APPLE_DISTRIBUTION_CERT_PASSWORD }}
-        run: |
-          set -euo pipefail
-          echo "$CERT_P12_BASE64" | base64 --decode > "$RUNNER_TEMP/distribution.p12"
-          security create-keychain -p "$RUNNER_TEMP/keychain-password" build.keychain
-          security set-keychain-settings -lut 21600 build.keychain
-          security unlock-keychain -p "$RUNNER_TEMP/keychain-password" build.keychain
-          security import "$RUNNER_TEMP/distribution.p12" -P "$CERT_PASSWORD" -A -t cert -f pkcs12 -k build.keychain
-          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$RUNNER_TEMP/keychain-password" build.keychain
-          security list-keychain -d user -s build.keychain login.keychain-db
-          rm -f "$RUNNER_TEMP/distribution.p12"
-          security find-identity -v -p codesigning | sed 's/^/IDENTITY: /'
-
-      - name: Install the provisioning profiles
-        env:
-          IOS_PROFILE_BASE64: ${{ secrets.APPLE_PROFILE_IOS }}
-          WATCH_PROFILE_BASE64: ${{ secrets.APPLE_PROFILE_WATCH }}
-        run: |
-          set -euo pipefail
-          echo "$IOS_PROFILE_BASE64" | base64 --decode > "$RUNNER_TEMP/$IOS_PROFILE_NAME.mobileprovision"
-          echo "$WATCH_PROFILE_BASE64" | base64 --decode > "$RUNNER_TEMP/$WATCH_PROFILE_NAME.provisionprofile"
-          for directory in "$HOME/Library/MobileDevice/Provisioning Profiles" "$HOME/Library/Developer/Xcode/UserData/Provisioning Profiles"; do
-            mkdir -p "$directory"
-            cp "$RUNNER_TEMP/$IOS_PROFILE_NAME.mobileprovision" "$directory/"
-            cp "$RUNNER_TEMP/$WATCH_PROFILE_NAME.provisionprofile" "$directory/"
-          done
-
-      - name: Archive for distribution
+      # The project pins manual signing in its Release configurations, so automatic signing is turned on
+      # from the command line and the pinned profile names are cleared. Xcode then asks App Store Connect
+      # for the certificate and the profiles with this API key and signs both bundles, phone and watch.
+      - name: Archive with automatic signing
         env:
           BUILD_NUMBER: ${{ github.run_number }}
+          KEY_ID: ${{ secrets.APPSTORE_KEY_ID }}
+          ISSUER_ID: ${{ secrets.APPSTORE_ISSUER_ID }}
         run: |
           set -euo pipefail
           mkdir -p archives
@@ -396,23 +396,36 @@ jobs:
             -archivePath "$ARCHIVE" \
             -derivedDataPath DerivedData \
             CURRENT_PROJECT_VERSION="$(( BUILD_NUMBER + 100 ))" \
+            -authenticationKeyPath "$KEY_PATH" \
+            -authenticationKeyID "$KEY_ID" \
+            -authenticationKeyIssuerID "$ISSUER_ID" \
+            -allowProvisioningUpdates \
+            CODE_SIGN_STYLE=Automatic \
+            CODE_SIGN_IDENTITY="Apple Distribution" \
+            PROVISIONING_PROFILE_SPECIFIER="" \
             archive | tee /tmp/archive.log
+
+      - name: Verify both apps are signed
+        run: |
+          set -euo pipefail
           iphone_app="$(find "$ARCHIVE/Products/Applications" -maxdepth 1 -name '*.app' -print -quit)"
+          [ -n "$iphone_app" ] || { echo '::error::no iPhone .app inside the archive.'; exit 1; }
           watch_app="$(find "$iphone_app/Watch" -maxdepth 1 -name '*.app' -print -quit)"
           [ -n "$watch_app" ] || { echo '::error::the archive has no embedded Apple Watch app.'; exit 1; }
+          for app in "$iphone_app" "$watch_app"; do
+            [ -d "$app/_CodeSignature" ] || { echo "::error::$app is not signed."; exit 1; }
+            [ -f "$app/embedded.mobileprovision" ] || { echo "::error::$app has no embedded provisioning profile."; exit 1; }
+            identifier="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$app/Info.plist")"
+            revision="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$app/Info.plist")"
+            echo "signed: $identifier build $revision"
+          done
 
       - name: Upload to TestFlight
         env:
-          KEY_ID: ${{ secrets.APP_STORE_CONNECT_KEY_ID }}
-          ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}
-          PRIVATE_KEY_BASE64: ${{ secrets.APP_STORE_CONNECT_PRIVATE_KEY }}
+          KEY_ID: ${{ secrets.APPSTORE_KEY_ID }}
+          ISSUER_ID: ${{ secrets.APPSTORE_ISSUER_ID }}
         run: |
           set -euo pipefail
-          mkdir -p "$RUNNER_TEMP/appstoreconnect"
-          key_path="$RUNNER_TEMP/appstoreconnect/AuthKey_$KEY_ID.p8"
-          echo "$PRIVATE_KEY_BASE64" | base64 --decode > "$key_path"
-          chmod 600 "$key_path"
-
           cat > "$RUNNER_TEMP/ExportOptions.plist" <<PLIST
           <?xml version="1.0" encoding="UTF-8"?>
           <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -425,20 +438,11 @@ jobs:
             <key>teamID</key>
             <string>$TEAM_ID</string>
             <key>signingStyle</key>
-            <string>manual</string>
-            <key>signingCertificate</key>
-            <string>Apple Distribution</string>
+            <string>automatic</string>
             <key>manageAppVersionAndBuildNumber</key>
             <false/>
             <key>uploadSymbols</key>
             <true/>
-            <key>provisioningProfiles</key>
-            <dict>
-              <key>$IOS_BUNDLE_ID</key>
-              <string>$IOS_PROFILE_NAME</string>
-              <key>$WATCH_BUNDLE_ID</key>
-              <string>$WATCH_PROFILE_NAME</string>
-            </dict>
             <key>uploadAPIKey</key>
             <dict>
               <key>keyID</key>
@@ -446,7 +450,7 @@ jobs:
               <key>issuerID</key>
               <string>$ISSUER_ID</string>
               <key>keyPath</key>
-              <string>$key_path</string>
+              <string>$KEY_PATH</string>
             </dict>
           </dict>
           </plist>
@@ -464,15 +468,15 @@ jobs:
             || { echo '::error::the TestFlight upload did not report success.'; exit 1; }
           echo 'Submitted to TestFlight.'
 
-      - name: Remove the temporary keychain
+      - name: Remove the API key from the workspace
         if: always()
         run: |
-          security delete-keychain build.keychain || true
-          rm -rf "$RUNNER_TEMP/appstoreconnect" "$RUNNER_TEMP/distribution.p12" "$RUNNER_TEMP/export"
+          rm -rf appstoreconnect "$RUNNER_TEMP/appstoreconnect" "$RUNNER_TEMP/export"
+          echo 'Removed the local copy of the API key.'
 
   summary:
     name: Summary
-    needs: [validate, package, publish]
+    needs: [validate, package, publish, testflight]
     if: always()
     runs-on: ubuntu-latest
     steps:
@@ -480,6 +484,7 @@ jobs:
           set -euo pipefail
           validate='${{ needs.validate.result }}'
           package='${{ needs.package.result }}'
+          testflight='${{ needs.testflight.result }}'
           configuration='${{ needs.package.outputs.configuration }}'
           version='${{ needs.package.outputs.version }}'
           build='${{ needs.package.outputs.build_number }}'
@@ -495,5 +500,8 @@ jobs:
                 echo "- Version: $version, build $build"
               fi
               echo '- Install note: unsigned, re-sign with your own certificate before putting it on a device.'
+            fi
+            if [ "$testflight" != skipped ]; then
+              echo "- TestFlight: $testflight"
             fi
           } >> "$GITHUB_STEP_SUMMARY"

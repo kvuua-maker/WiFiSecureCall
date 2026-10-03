@@ -34,7 +34,7 @@ The MVP protects signaling and media in transit with system TLS/WSS. It does not
 | `validate` | pull requests, pushes | Unsigned build that compiles the iPhone target and the embedded Apple Watch target |
 | `package` | pushes to `main`, tags, manual dispatch | Builds the app bundle without signing and packs it as `WiFiSecureCall-<configuration>-<build>-unsigned.ipa` |
 | `publish` | after `package` | Attaches the `.ipa` to a GitHub Release: the tag name for `v*` tags, otherwise the rolling `ci-latest` release, replaced on every run |
-| `testflight` | manual dispatch only | Optional signed build and TestFlight submission, needs the Apple credentials listed below |
+| `testflight` | manual dispatch only | Optional signed build and TestFlight submission, needs only the App Store Connect API key listed below |
 
 The default path needs no Apple certificate, no provisioning profile and no App Store Connect key, and no secret at all: the release upload uses the built-in `GITHUB_TOKEN`. Without `IOS_BEARER_TOKEN` and `WATCH_BEARER_TOKEN` the artifact is built in the Debug configuration, because the Release build phases validate those tokens; with them it is built in the Release configuration.
 
@@ -45,7 +45,9 @@ Repository secrets, all optional for the default path:
 | Secret | Used for |
 | --- | --- |
 | `IOS_BEARER_TOKEN`, `WATCH_BEARER_TOKEN` | write `Config/Secrets.xcconfig`, which the Release build phases require, and enable the Release configuration |
-| `APPLE_DISTRIBUTION_CERT_P12` (base64) + `APPLE_DISTRIBUTION_CERT_PASSWORD` | Apple Distribution certificate for the `testflight` job |
-| `APPLE_PROFILE_IOS`, `APPLE_PROFILE_WATCH` (base64 of `WiFiSecureCallAppStoreD24.mobileprovision` and `WiFiSecureCallWatchAppStore.provisionprofile`) | the manual signing the Release target configurations pin |
-| `APP_STORE_CONNECT_KEY_ID`, `APP_STORE_CONNECT_ISSUER_ID`, `APP_STORE_CONNECT_PRIVATE_KEY` (base64 of the `.p8`) | authenticating the TestFlight submission |
+| `APPSTORE_KEY_ID`, `APPSTORE_ISSUER_ID`, `APPSTORE_PRIVATE_KEY` | the App Store Connect API key, the only Apple credential the `testflight` job needs |
 | `GH_PAT` | optional, only to publish the release with a personal token instead of `GITHUB_TOKEN` |
+
+Signing is automatic. The project pins manual signing in its Release configurations, but the `testflight` job overrides that from the command line and passes `-allowProvisioningUpdates` with the API key, so `xcodebuild` creates or refreshes the Apple Distribution certificate and both provisioning profiles itself. Nothing to upload but the key: no `.p12`, no password and no `.mobileprovision`.
+
+`APPSTORE_PRIVATE_KEY` accepts the contents of `AuthKey_<KEY_ID>.p8` pasted as PEM, as base64, or as one line with `\n` escapes, so it does not matter how the secret was filled in. The key must belong to a role with the Developer role in App Store Connect, and it is the only secret that leaves Apple; `xcodebuild` reuses it for the upload.
