@@ -416,9 +416,16 @@ jobs:
           chmod 600 "$KEY_PATH"
 
           # A hard failure on purpose. A key openssl cannot read is one xcodebuild would reject much
-          # later, and its own error is far harder to read than this one.
+          # later, and its own error is far harder to read than this one. Nothing that identifies the
+          # key is printed: only the header, two lengths and what the ASN.1 structure looks like.
           if ! openssl pkey -in "$KEY_PATH" -noout -check >/dev/null 2>"$work/error"; then
-            echo "::error::The API key is not a readable private key. openssl says: $(tr '\n' ' ' < "$work/error")"
+            echo "::error::PEM header: $header"
+            echo "::error::Key body: ${#body} base64 characters."
+            [ $(( ${#body} % 4 )) -eq 0 ] || echo "::error::${#body} is not a multiple of 4, so the body is not valid base64."
+            der="$(printf '%s' "$body" | openssl base64 -d -A 2>/dev/null | wc -c | tr -d ' ')"
+            echo "::error::The body decodes to $der bytes."
+            echo "::error::Structure: $(openssl asn1parse -in "$KEY_PATH" 2>&1 | head -1)"
+            echo "::error::openssl says: $(tr '\n' ' ' < "$work/error")"
             echo '::error::APPSTORE_PRIVATE_KEY must be the AuthKey_<KEY_ID>.p8 downloaded from App Store Connect.'
             exit 1
           fi
