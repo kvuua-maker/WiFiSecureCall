@@ -512,9 +512,11 @@ jobs:
           printf 'IOS_BEARER_TOKEN = %s\nWATCH_BEARER_TOKEN = %s\n' "$IOS_BEARER_TOKEN" "$WATCH_BEARER_TOKEN" > Config/Secrets.xcconfig
           echo 'Config/Secrets.xcconfig written.'
 
-      # The project pins manual signing in its Release configurations, so automatic signing is turned on
-      # from the command line and the pinned profile names are cleared. Xcode then asks App Store Connect
-      # for the certificate and the profiles with this API key and signs both bundles, phone and watch.
+      # Automatic signing is already in effect for Release, through Config/Base.xcconfig. Only the API key
+      # is passed, and -allowProvisioningUpdates lets Xcode create or refresh the Apple Distribution
+      # certificate and both provisioning profiles, so the identity and the profile names are left
+      # unset on purpose. Naming them here is what produced the conflicting provisioning settings:
+      # xcodebuild treated an explicit identity as a manual specification.
       - name: Archive with automatic signing
         env:
           BUILD_NUMBER: ${{ github.run_number }}
@@ -536,8 +538,6 @@ jobs:
             -authenticationKeyIssuerID "$ISSUER_ID" \
             -allowProvisioningUpdates \
             CODE_SIGN_STYLE=Automatic \
-            CODE_SIGN_IDENTITY="Apple Distribution" \
-            PROVISIONING_PROFILE_SPECIFIER="" \
             archive | tee /tmp/archive.log
 
       - name: Verify both apps are signed
