@@ -15,6 +15,15 @@ const keyPath = process.argv[2];
 const keyId = process.argv[3];
 const issuerId = process.argv[4];
 
+// The verdict has to reach the workflow as a status, not only as a paragraph. A probe that exits 0
+// whatever Apple answers turns a rejected key into a green run, which is the one outcome this file
+// exists to prevent. Each outcome gets its own code so the step log says which one it was.
+const EXIT_ACCEPTED = 0;
+const EXIT_UNAUTHORIZED = 1;
+const EXIT_FORBIDDEN = 2;
+const EXIT_INCONCLUSIVE = 3;
+const EXIT_NETWORK = 4;
+
 const report = (line) => process.stdout.write(`${line}\n`);
 
 report('=== key shape, read verbatim from the secret ===');
@@ -96,9 +105,7 @@ report(`payload aud: ${rawPayload.aud}, iss length ${rawPayload.iss?.length ?? 0
 report(`exp minus iat: ${rawPayload.exp - rawPayload.iat} seconds (Apple allows 1200)`);
 report(`token length: ${token.length} characters, not printed`);
 
-const response = await fetch('https://api.appstoreconnect.apple.com/v1/apps?limit=1', {
-  headers: { Authorization: `Bearer ${token}` },
-});
+const response = await askApple(token);
 report('');
 report(`HTTP ${response.status} ${response.statusText}`.trim());
 report(`Apple clock at the time of this request: ${formatAppleClock(response.headers.get('date'))}`);
@@ -126,15 +133,42 @@ report('=== what this result establishes ===');
 if (response.status === 200) {
   report('A library independent of the workflow signed a request Apple accepted, so the three secrets are valid.');
   report('A 401 from ios-build.yml is therefore a defect in its signing code, not in the credentials.');
-} else if (response.status === 401) {
+  process.exit(EXIT_ACCEPTED);
+}
+if (response.status === 401) {
   report('A library independent of the workflow was rejected too, so the credentials are the cause.');
   report('This names no single secret: the issuer may be another team, the key may be revoked or');
   report('not yet active, or the key id may not belong to the uploaded key.');
-} else if (response.status === 403) {
+  report('This probe exits non-zero: Apple refused the request, so the run must not report success.');
+  process.exit(EXIT_UNAUTHORIZED);
+}
+if (response.status === 403) {
   report('The signature was accepted and the request was refused for scope, not for identity.');
   report('Check the role held by this key in Users and Access.');
-} else {
-  report(`Neither accepted nor refused the request (HTTP ${response.status}), so this says nothing about the key.`);
+  report('This probe exits non-zero: the request was refused, so the run must not report success.');
+  process.exit(EXIT_FORBIDDEN);
+}
+report(`Neither accepted nor refused the request (HTTP ${response.status}), so this says nothing about the key.`);
+report('This probe exits non-zero: an unexpected status is not a result, and claiming success would be false.');
+process.exit(EXIT_INCONCLUSIVE);
+
+// Apple answered, so the caller can read a status. A transport failure is not an answer: it is
+// reported as itself and ends the run without a verdict, because a probe that cannot reach Apple has
+// neither confirmed nor refuted the credentials.
+async function askApple(token) {
+  try {
+    return await fetch('https://api.appstoreconnect.apple.com/v1/apps?limit=1', {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+  } catch (error) {
+    report('');
+    report('=== what this result establishes ===');
+    report(`No response from App Store Connect: ${error.message}`);
+    report('Nothing was established about the credentials: Apple was never reached, so no status exists.');
+    report('This probe exits non-zero, and separately from an HTTP status, so a network fault cannot be');
+    report('mistaken for a decision by Apple.');
+    process.exit(EXIT_NETWORK);
+  }
 }
 
 function createHashOf(bytes) {
