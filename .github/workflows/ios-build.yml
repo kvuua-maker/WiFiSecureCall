@@ -1,0 +1,404 @@
+name: iOS Build & TestFlight
+
+# Builds the WiFiSecureCall iPhone app together with its embedded Apple Watch app, and submits the
+# signed build to TestFlight.
+#
+# Secrets, and what each one is actually for:
+#   GH_PAT                        GitHub personal access token. Used only to create the GitHub Release
+#                                 and attach the archive. A GitHub token cannot talk to App Store
+#                                 Connect, so it is never used for the TestFlight upload.
+#   IOS_BEARER_TOKEN              64 hex characters, must equal the value configured on the server.
+#   WATCH_BEARER_TOKEN            A different 64 hex character value.
+#   APPLE_DISTRIBUTION_CERT_P12       base64 of the Apple Distribution .p12 export.
+#   APPLE_DISTRIBUTION_CERT_PASSWORD  password of that .p12.
+#   APPLE_PROFILE_IOS             base64 of WiFiSecureCallAppStoreD24.mobileprovision.
+#   APPLE_PROFILE_WATCH           base64 of WiFiSecureCallWatchAppStore.provisionprofile.
+#   APP_STORE_CONNECT_KEY_ID      App Store Connect API key id, 10 characters.
+#   APP_STORE_CONNECT_ISSUER_ID   Issuer UUID shown on the key page.
+#   APP_STORE_CONNECT_PRIVATE_KEY base64 of AuthKey_<KEY_ID>.p8.
+#
+# Without the six Apple secrets the workflow still compiles both platforms and reports what is
+# missing instead of failing the run, so a fork or a fresh clone stays green.
+
+on:
+  workflow_dispatch:
+    inputs:
+      upload_to_testflight:
+        description: Upload the signed archive to TestFlight
+        type: boolean
+        default: true
+      build_number:
+        description: Override CFBundleVersion, must exceed Config/Base.xcconfig
+        type: string
+        default: ""
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ios-build-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+jobs:
+  validate:
+    name: Compile iPhone and Apple Watch targets
+    # The carrier probe is compiled behind `#if compiler(>=6.4)`, so the build needs the Swift 6.4
+    # toolchain from Xcode 27, which is what the xcode-27 image provides and what CircleCI uses.
+    # If that preview image is unavailable, macos-26 works for everything except the probe code.
+    runs-on: xcode-27
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Report toolchain
+        run: |
+          set -euo pipefail
+          xcodebuild -version
+          xcrun swiftc --version
+          echo "IOS_SDK=$(xcrun --sdk iphoneos --show-sdk-version)"
+          echo "WATCHOS_SDK=$(xcrun --sdk watchos --show-sdk-version)"
+
+      # Debug and unsigned, so no certificate or profile is required. Building the iPhone scheme
+      # compiles and embeds the watchOS app through the embed phase, which is what keeps the two
+      # platforms compiling together on every change.
+      - name: Build both targets without signing
+        run: |
+          set -euo pipefail
+          xcodebuild \
+            -project WiFiSecureCall.xcodeproj \
+            -scheme WiFiSecureCall \
+            -configuration Debug \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath DerivedData \
+            CODE_SIGNING_ALLOWED=NO \
+            build | tee /tmp/compile.log
+          grep -q 'target .*apple-watchos' /tmp/compile.log
+          grep -q 'target arm64-apple-ios' /tmp/compile.log
+          echo 'Both the iPhone and Apple Watch targets compiled.'
+
+  release:
+    name: Signed archive and TestFlight upload
+    if: github.event_name != 'pull_request'
+    needs: validate
+    runs-on: xcode-27
+    timeout-minutes: 60
+    outputs:
+      signed: ${{ steps.signing.outputs.signed }}
+      version: ${{ steps.version.outputs.marketing_version }}
+      build_number: ${{ steps.version.outputs.build_number }}
+    env:
+      PROJECT: WiFiSecureCall.xcodeproj
+      SCHEME: WiFiSecureCall
+      TEAM_ID: 9V5XXDXF3N
+      IOS_BUNDLE_ID: com.vkapps.wifisecurecall
+      WATCH_BUNDLE_ID: com.vkapps.wifisecurecall.watchkitapp
+      IOS_PROFILE_NAME: WiFiSecureCallAppStoreD24
+      WATCH_PROFILE_NAME: WiFiSecureCallWatchAppStore
+      ARCHIVE: ${{ github.workspace }}/archives/WiFiSecureCall.xcarchive
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Report toolchain
+        run: |
+          set -euo pipefail
+          xcodebuild -version
+          xcrun swiftc --version
+          echo "IOS_SDK=$(xcrun --sdk iphoneos --show-sdk-version)"
+          echo "WATCHOS_SDK=$(xcrun --sdk watchos --show-sdk-version)"
+
+      # Release uses CODE_SIGN_STYLE=Manual with the profile names in the job env, so the
+      # distribution certificate and both profiles are needed before archiving.
+      - name: Check the signing material
+        id: signing
+        env:
+          CERT: ${{ secrets.APPLE_DISTRIBUTION_CERT_P12 }}
+          CERT_PASSWORD: ${{ secrets.APPLE_DISTRIBUTION_CERT_PASSWORD }}
+          IOS_PROFILE: ${{ secrets.APPLE_PROFILE_IOS }}
+          WATCH_PROFILE: ${{ secrets.APPLE_PROFILE_WATCH }}
+          KEY_ID: ${{ secrets.APP_STORE_CONNECT_KEY_ID }}
+          ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}
+          PRIVATE_KEY: ${{ secrets.APP_STORE_CONNECT_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          # Plain string instead of an array: the macOS runner shell is bash 3.2, where expanding an
+          # empty array under `set -u` is an error.
+          missing=''
+          [ -n "$CERT" ] || missing="${missing:+$missing,}APPLE_DISTRIBUTION_CERT_P12"
+          [ -n "$CERT_PASSWORD" ] || missing="${missing:+$missing,}APPLE_DISTRIBUTION_CERT_PASSWORD"
+          [ -n "$IOS_PROFILE" ] || missing="${missing:+$missing,}APPLE_PROFILE_IOS"
+          [ -n "$WATCH_PROFILE" ] || missing="${missing:+$missing,}APPLE_PROFILE_WATCH"
+          signed=false
+          uploadable=false
+          if [ -z "$missing" ]; then signed=true; fi
+          if [ -n "$KEY_ID" ] && [ -n "$ISSUER_ID" ] && [ -n "$PRIVATE_KEY" ]; then
+            uploadable=true
+          else
+            missing="${missing:+$missing,}APP_STORE_CONNECT_KEY_ID/APP_STORE_CONNECT_ISSUER_ID/APP_STORE_CONNECT_PRIVATE_KEY"
+          fi
+          echo "signed=$signed" >> "$GITHUB_OUTPUT"
+          echo "uploadable=$uploadable" >> "$GITHUB_OUTPUT"
+          if [ "$signed" != true ] || [ "$uploadable" != true ]; then
+            echo "::notice::Signing material is incomplete, missing: ${missing}"
+            echo "::notice::Add the secrets above to produce a signed archive and upload it to TestFlight."
+          fi
+
+      # The Release build phases validate the built Info.plist against the API and media URLs and
+      # require both bearer tokens, so Config/Secrets.xcconfig has to exist before archiving.
+      # Config/Base.xcconfig includes it optionally. Only the archive needs it, so this runs under the
+      # same condition as the archive step.
+      - name: Materialize Config/Secrets.xcconfig
+        if: ${{ steps.signing.outputs.signed == 'true' }}
+        env:
+          IOS_BEARER_TOKEN: ${{ secrets.IOS_BEARER_TOKEN }}
+          WATCH_BEARER_TOKEN: ${{ secrets.WATCH_BEARER_TOKEN }}
+        run: |
+          set -euo pipefail
+          umask 077
+          for token in "$IOS_BEARER_TOKEN" "$WATCH_BEARER_TOKEN"; do
+            if [ "${#token}" -lt 32 ]; then
+              echo '::error::IOS_BEARER_TOKEN and WATCH_BEARER_TOKEN must each be at least 32 characters.'
+              exit 1
+            fi
+            case "$token" in
+              *[[:space:]]*) echo '::error::Bearer tokens must not contain whitespace.'; exit 1 ;;
+            esac
+          done
+          [ "$IOS_BEARER_TOKEN" != "$WATCH_BEARER_TOKEN" ] || { echo '::error::The two bearer tokens must differ.'; exit 1; }
+          printf 'IOS_BEARER_TOKEN = %s\nWATCH_BEARER_TOKEN = %s\n' "$IOS_BEARER_TOKEN" "$WATCH_BEARER_TOKEN" > Config/Secrets.xcconfig
+          echo 'Config/Secrets.xcconfig written.'
+
+      - name: Import the Apple Distribution certificate
+        if: ${{ steps.signing.outputs.signed == 'true' }}
+        env:
+          CERT_P12_BASE64: ${{ secrets.APPLE_DISTRIBUTION_CERT_P12 }}
+          CERT_PASSWORD: ${{ secrets.APPLE_DISTRIBUTION_CERT_PASSWORD }}
+        run: |
+          set -euo pipefail
+          echo "$CERT_P12_BASE64" | base64 --decode > "$RUNNER_TEMP/distribution.p12"
+          security create-keychain -p "$RUNNER_TEMP/keychain-password" build.keychain
+          security set-keychain-settings -lut 21600 build.keychain
+          security unlock-keychain -p "$RUNNER_TEMP/keychain-password" build.keychain
+          security import "$RUNNER_TEMP/distribution.p12" -P "$CERT_PASSWORD" -A -t cert -f pkcs12 -k build.keychain
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$RUNNER_TEMP/keychain-password" build.keychain
+          security list-keychain -d user -s build.keychain login.keychain-db
+          rm -f "$RUNNER_TEMP/distribution.p12"
+          security find-identity -v -p codesigning | sed 's/^/IDENTITY: /'
+
+      - name: Install the provisioning profiles
+        if: ${{ steps.signing.outputs.signed == 'true' }}
+        env:
+          IOS_PROFILE_BASE64: ${{ secrets.APPLE_PROFILE_IOS }}
+          WATCH_PROFILE_BASE64: ${{ secrets.APPLE_PROFILE_WATCH }}
+        run: |
+          set -euo pipefail
+          echo "$IOS_PROFILE_BASE64" | base64 --decode > "$RUNNER_TEMP/$IOS_PROFILE_NAME.mobileprovision"
+          echo "$WATCH_PROFILE_BASE64" | base64 --decode > "$RUNNER_TEMP/$WATCH_PROFILE_NAME.provisionprofile"
+          for directory in "$HOME/Library/MobileDevice/Provisioning Profiles" "$HOME/Library/Developer/Xcode/UserData/Provisioning Profiles"; do
+            mkdir -p "$directory"
+            cp "$RUNNER_TEMP/$IOS_PROFILE_NAME.mobileprovision" "$directory/"
+            cp "$RUNNER_TEMP/$WATCH_PROFILE_NAME.provisionprofile" "$directory/"
+          done
+          /usr/libexec/PlistBuddy -c 'Print :Name' "$RUNNER_TEMP/$IOS_PROFILE_NAME.mobileprovision" || true
+          /usr/libexec/PlistBuddy -c 'Print :Name' "$RUNNER_TEMP/$WATCH_PROFILE_NAME.provisionprofile" || true
+
+      - name: Resolve the build number
+        id: version
+        env:
+          OVERRIDE: ${{ inputs.build_number }}
+        run: |
+          set -euo pipefail
+          current="$(awk -F' *= *' '/^CURRENT_PROJECT_VERSION/{print $2}' Config/Base.xcconfig | tr -d '[:space:]')"
+          marketing="$(awk -F' *= *' '/^MARKETING_VERSION/{print $2}' Config/Base.xcconfig | tr -d '[:space:]')"
+          if [ -n "${OVERRIDE:-}" ]; then build="$OVERRIDE"; else build="$(( GITHUB_RUN_NUMBER + 100 ))"; fi
+          printf '%s' "$build" | grep -Eq '^[0-9]+$' || { echo "::error::the build number must be numeric, got '$build'."; exit 1; }
+          if [ "$build" -le "$current" ]; then
+            echo "::error::build number $build must be greater than CURRENT_PROJECT_VERSION $current."
+            exit 1
+          fi
+          echo "build_number=$build" >> "$GITHUB_OUTPUT"
+          echo "marketing_version=$marketing" >> "$GITHUB_OUTPUT"
+          echo "CFBundleVersion $build, project default $current, CFBundleShortVersionString $marketing."
+
+      - name: Archive the iPhone and Apple Watch apps
+        if: ${{ steps.signing.outputs.signed == 'true' }}
+        env:
+          BUILD_NUMBER: ${{ steps.version.outputs.build_number }}
+        run: |
+          set -euo pipefail
+          mkdir -p archives
+          xcodebuild \
+            -project "$PROJECT" \
+            -scheme "$SCHEME" \
+            -configuration Release \
+            -destination 'generic/platform=iOS' \
+            -archivePath "$ARCHIVE" \
+            -derivedDataPath DerivedData \
+            CURRENT_PROJECT_VERSION="$BUILD_NUMBER" \
+            archive | tee /tmp/archive.log
+          grep -q 'target .*apple-watchos' /tmp/archive.log
+
+      # One archive carries both deliverables. An archive without the watch app would ship an iPhone
+      # build that silently cannot reach the watch, so this check is not optional.
+      - name: Verify the archive contains both apps
+        if: ${{ steps.signing.outputs.signed == 'true' }}
+        run: |
+          set -euo pipefail
+          iphone_app="$(find "$ARCHIVE/Products/Applications" -maxdepth 1 -name '*.app' -print -quit)"
+          [ -n "$iphone_app" ] || { echo '::error::no iPhone .app inside the archive.'; exit 1; }
+          watch_app="$(find "$iphone_app/Watch" -maxdepth 1 -name '*.app' -print -quit)"
+          [ -n "$watch_app" ] || { echo '::error::the archive has no embedded Apple Watch app.'; exit 1; }
+          echo "iPhone app: $iphone_app"
+          echo "Watch app:  $watch_app"
+          for plist in "$iphone_app/Info.plist" "$watch_app/Info.plist"; do
+            /usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$plist"
+            /usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$plist"
+            /usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$plist"
+          done
+
+      - uses: actions/upload-artifact@v4
+        if: ${{ steps.signing.outputs.signed == 'true' }}
+        with:
+          name: WiFiSecureCall-archive
+          path: archives/WiFiSecureCall.xcarchive
+          retention-days: 14
+          if-no-files-found: error
+
+      # destination: upload submits the signed archive straight to App Store Connect, after which the
+      # build appears in TestFlight. The App Store Connect API key is the only credential that can do
+      # this; a GitHub token cannot.
+      - name: Upload to TestFlight
+        if: ${{ steps.signing.outputs.uploadable == 'true' && inputs.upload_to_testflight != false }}
+        env:
+          KEY_ID: ${{ secrets.APP_STORE_CONNECT_KEY_ID }}
+          ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}
+          PRIVATE_KEY_BASE64: ${{ secrets.APP_STORE_CONNECT_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/appstoreconnect"
+          key_path="$RUNNER_TEMP/appstoreconnect/AuthKey_$KEY_ID.p8"
+          echo "$PRIVATE_KEY_BASE64" | base64 --decode > "$key_path"
+          chmod 600 "$key_path"
+
+          cat > "$RUNNER_TEMP/ExportOptions.plist" <<PLIST
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>destination</key>
+            <string>upload</string>
+            <key>method</key>
+            <string>app-store-connect</string>
+            <key>teamID</key>
+            <string>$TEAM_ID</string>
+            <key>signingStyle</key>
+            <string>manual</string>
+            <key>signingCertificate</key>
+            <string>Apple Distribution</string>
+            <key>manageAppVersionAndBuildNumber</key>
+            <false/>
+            <key>uploadSymbols</key>
+            <true/>
+            <key>provisioningProfiles</key>
+            <dict>
+              <key>$IOS_BUNDLE_ID</key>
+              <string>$IOS_PROFILE_NAME</string>
+              <key>$WATCH_BUNDLE_ID</key>
+              <string>$WATCH_PROFILE_NAME</string>
+            </dict>
+            <key>uploadAPIKey</key>
+            <dict>
+              <key>keyID</key>
+              <string>$KEY_ID</string>
+              <key>issuerID</key>
+              <string>$ISSUER_ID</string>
+              <key>keyPath</key>
+              <string>$key_path</string>
+            </dict>
+          </dict>
+          </plist>
+          PLIST
+          plutil -lint "$RUNNER_TEMP/ExportOptions.plist"
+
+          xcodebuild \
+            -exportArchive \
+            -archivePath "$ARCHIVE" \
+            -exportOptionsPlist "$RUNNER_TEMP/ExportOptions.plist" \
+            -exportPath "$RUNNER_TEMP/export" \
+            | tee /tmp/testflight-upload.log
+
+          grep -qE 'Upload succeeded|Delivered your binary|UPLOAD SUCCEEDED' /tmp/testflight-upload.log \
+            || { echo '::error::the TestFlight upload did not report success.'; exit 1; }
+          echo 'Submitted to TestFlight.'
+
+      - name: Remove the temporary keychain
+        if: always()
+        run: |
+          security delete-keychain build.keychain || true
+          rm -rf "$RUNNER_TEMP/appstoreconnect" "$RUNNER_TEMP/distribution.p12" "$RUNNER_TEMP/export"
+
+  github-release:
+    name: Attach the build to a GitHub release
+    needs: release
+    if: >-
+      needs.release.outputs.signed == 'true'
+      && (github.event_name == 'workflow_dispatch' || github.ref_type == 'tag')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download the archive artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: WiFiSecureCall-archive
+          path: archive
+
+      - name: Create or update the release
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+          TAG: ${{ github.ref_type == 'tag' && github.ref_name || format('build-{0}', github.run_number) }}
+          BUILD_NUMBER: ${{ needs.release.outputs.build_number }}
+        run: |
+          set -euo pipefail
+          if [ -z "${GH_TOKEN:-}" ]; then
+            echo '::notice::GH_PAT is not configured, skipping the GitHub release.'
+            exit 0
+          fi
+          archive="WiFiSecureCall-$TAG.xcarchive.zip"
+          zip -qry "$archive" archive/WiFiSecureCall.xcarchive
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" "$archive" --clobber
+          else
+            gh release create "$TAG" "$archive" \
+              --title "WiFi Secure Call $TAG (build $BUILD_NUMBER)" \
+              --generate-notes
+          fi
+          echo "Release $TAG updated with $archive."
+
+  summary:
+    name: Summary
+    needs: [release, github-release]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - run: |
+          set -euo pipefail
+          signed='${{ needs.release.outputs.signed }}'
+          version='${{ needs.release.outputs.version }}'
+          build='${{ needs.release.outputs.build_number }}'
+          {
+            echo '### WiFi Secure Call build'
+            echo
+            if [ "$signed" = 'true' ]; then
+              echo '- iPhone + Apple Watch archive: produced'
+              if [ -n "$version" ]; then
+                echo "- Version: $version (build $build)"
+              fi
+            else
+              echo '- Signed archive: skipped, the Apple signing secrets are not configured'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
