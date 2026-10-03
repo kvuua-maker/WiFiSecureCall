@@ -420,8 +420,10 @@ jobs:
           # key is printed: only the header, two lengths and what the ASN.1 structure looks like.
           if ! openssl pkey -in "$KEY_PATH" -noout -check >/dev/null 2>"$work/error"; then
             echo "::error::PEM header: $header"
-            echo "::error::Key body: ${#body} base64 characters."
-            [ $(( ${#body} % 4 )) -eq 0 ] || echo "::error::${#body} is not a multiple of 4, so the body is not valid base64."
+            # A PKCS#8 prime256v1 key, which is what App Store Connect issues, has a 184 character body.
+            # Any other length means the secret is not only the key.
+            echo "::error::Key body: ${#body} base64 characters. A prime256v1 PKCS#8 body has 184."
+            [ $(( ${#body} % 4 )) -eq 0 ] || echo "::error::${#body} is not a multiple of 4, so the body is not valid base64: something other than the key was pasted alongside it."
             der="$(printf '%s' "$body" | openssl base64 -d -A 2>/dev/null | wc -c | tr -d ' ')"
             echo "::error::The body decodes to $der bytes."
             echo "::error::Structure: $(openssl asn1parse -in "$KEY_PATH" 2>&1 | head -1)"
