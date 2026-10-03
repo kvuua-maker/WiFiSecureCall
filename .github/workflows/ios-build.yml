@@ -670,12 +670,26 @@ jobs:
       # xcodebuild treated an explicit identity as a manual specification.
       - name: Archive with automatic signing
         env:
-          BUILD_NUMBER: ${{ github.run_number }}
+          OVERRIDE: ${{ inputs.build_number }}
           KEY_ID: ${{ secrets.APPSTORE_KEY_ID }}
           ISSUER_ID: ${{ secrets.APPSTORE_ISSUER_ID }}
         run: |
           set -euo pipefail
           mkdir -p archives
+
+          # The same rule the package job applies, so the archive carries the same CFBundleVersion as
+          # the unsigned bundle this run verified. Computing it from the run number alone ignored an
+          # override, which let the two disagree, and skipped the check that the number is one App
+          # Store Connect will accept: it rejects a build whose CFBundleVersion it has already seen.
+          current="$(awk -F' *= *' '/^CURRENT_PROJECT_VERSION/{print $2}' Config/Base.xcconfig | tr -d '[:space:]')"
+          if [ -n "${OVERRIDE:-}" ]; then build="$OVERRIDE"; else build="$(( GITHUB_RUN_NUMBER + 100 ))"; fi
+          printf '%s' "$build" | grep -Eq '^[0-9]+$' || { echo "::error::the build number must be numeric, got '$build'."; exit 1; }
+          if [ "$build" -le "$current" ]; then
+            echo "::error::build number $build must be greater than CURRENT_PROJECT_VERSION $current."
+            exit 1
+          fi
+          echo "Archiving with CFBundleVersion $build, against a project default of $current."
+
           xcodebuild \
             -project WiFiSecureCall.xcodeproj \
             -scheme WiFiSecureCall \
@@ -683,7 +697,7 @@ jobs:
             -destination 'generic/platform=iOS' \
             -archivePath "$ARCHIVE" \
             -derivedDataPath DerivedData \
-            CURRENT_PROJECT_VERSION="$(( BUILD_NUMBER + 100 ))" \
+            CURRENT_PROJECT_VERSION="$build" \
             -authenticationKeyPath "$KEY_PATH" \
             -authenticationKeyID "$KEY_ID" \
             -authenticationKeyIssuerID "$ISSUER_ID" \
