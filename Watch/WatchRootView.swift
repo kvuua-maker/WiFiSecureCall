@@ -15,7 +15,7 @@ struct WatchRootView: View {
             VStack(spacing: 6) {
                 Text("WiFi Secure Call").font(.headline)
                 Text(status).font(.caption2).multilineTextAlignment(.center)
-                audioPlacement
+                Text(audioPlacement).font(.system(size: 9)).foregroundStyle(.secondary)
                 controls
             }
             .padding(.horizontal, 3)
