@@ -1115,9 +1115,10 @@ jobs:
               node .github/actions/asc-auth-probe/asc-get.mjs "$1" "$2"
           }
 
-          apps="$(get '/v1/apps?limit=200' "$RUNNER_TEMP/asc-apps.json")"
-          echo "GET /v1/apps -> $apps"
-          app_id="$(python3 - "$RUNNER_TEMP/asc-apps.json" <<'PYTHON'
+          # Apple's own words. A status on its own says which request failed, not why, and the reason is the
+          # only sentence that names the mistake.
+          describe() {
+            python3 - "$1" <<'PYTHON'
           import json
           import sys
 
@@ -1125,7 +1126,31 @@ jobs:
               with open(sys.argv[1]) as fh:
                   body = json.load(fh)
           except Exception:
+              print("  the body was not the JSON envelope App Store Connect sends")
               raise SystemExit(0)
+          errors = body.get("errors", [])
+          if not errors:
+              print("  no error text in the body")
+          for error in errors:
+              print(f"  [{error.get('code', '?')}] {error.get('title', '')}")
+              if error.get("detail"):
+                  print(f"    {error['detail']}")
+          PYTHON
+          }
+
+          apps="$(get '/v1/apps?limit=200' "$RUNNER_TEMP/asc-apps.json")"
+          echo "GET /v1/apps -> $apps"
+          if [ "$apps" != 'HTTP 200' ]; then
+            echo '::error::the app list could not be read.'
+            describe "$RUNNER_TEMP/asc-apps.json"
+            exit 1
+          fi
+          app_id="$(python3 - "$RUNNER_TEMP/asc-apps.json" <<'PYTHON'
+          import json
+          import sys
+
+          with open(sys.argv[1]) as fh:
+              body = json.load(fh)
           for entry in body.get("data", []):
               if entry.get("attributes", {}).get("bundleId") == "com.vkapps.wifisecurecall":
                   print(entry["id"])
@@ -1135,8 +1160,44 @@ jobs:
           [ -n "$app_id" ] || { echo '::error::no App Store Connect app record for com.vkapps.wifisecurecall was found.'; exit 1; }
           echo "app record: $app_id"
 
-          builds="$(get "/v1/builds?filter\[app\]=$app_id&include=preReleaseVersion&limit=200" "$RUNNER_TEMP/asc-builds.json")"
-          echo "GET /v1/builds -> $builds"
+          versions="$(get "/v1/preReleaseVersions?filter\[app\]=$app_id&filter\[platform\]=IOS&limit=50" "$RUNNER_TEMP/asc-versions.json")"
+          echo "GET /v1/preReleaseVersions -> $versions"
+          if [ "$versions" != 'HTTP 200' ]; then
+            describe "$RUNNER_TEMP/asc-versions.json"
+          fi
+          version_id="$(python3 - "$RUNNER_TEMP/asc-versions.json" "$VERSION" <<'PYTHON'
+          import json
+          import sys
+
+          try:
+              with open(sys.argv[1]) as fh:
+                  body = json.load(fh)
+          except Exception:
+              raise SystemExit(0)
+          for entry in body.get("data", []):
+              if entry.get("attributes", {}).get("versionString") == sys.argv[2]:
+                  print(entry["id"])
+                  break
+          PYTHON
+          )"
+          if [ -n "$version_id" ]; then
+            echo "preReleaseVersion $VERSION: $version_id"
+          else
+            echo "No preReleaseVersion $VERSION is listed for this app."
+          fi
+
+          if [ -n "$version_id" ]; then
+            path="/v1/builds?filter\[preReleaseVersion\]=$version_id&limit=50"
+          else
+            path="/v1/builds?filter\[app\]=$app_id&limit=50"
+          fi
+          builds="$(get "$path" "$RUNNER_TEMP/asc-builds.json")"
+          echo "GET $path -> $builds"
+          if [ "$builds" != 'HTTP 200' ]; then
+            describe "$RUNNER_TEMP/asc-builds.json"
+            echo '::error::the build list could not be read, so the upload cannot be confirmed.'
+            exit 1
+          fi
 
           python3 - "$RUNNER_TEMP/asc-builds.json" "$VERSION" "$BUILD" <<'PYTHON'
           import json

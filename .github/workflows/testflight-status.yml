@@ -1,0 +1,185 @@
+name: TestFlight status
+
+# Read-only. Reports what App Store Connect holds for this app and never uploads anything, so the
+# state of a build can be read without spending a build number. The upload lives in ios-build.yml.
+#
+# Polls while any build is still PROCESSING, because an accepted upload is listed as PROCESSING first
+# and reaches VALID, or a rejected state, on its own a few minutes later.
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Marketing version to report, must match Config/Base.xcconfig
+        type: string
+        default: "0.1.0"
+      minutes:
+        description: How long to keep polling while a build is PROCESSING
+        type: string
+        default: "12"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: testflight-status-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  status:
+    name: Read the build records
+    runs-on: xcode-27
+    timeout-minutes: 25
+    env:
+      KEY_ID: ${{ secrets.APPSTORE_KEY_ID }}
+      ISSUER_ID: ${{ secrets.APPSTORE_ISSUER_ID }}
+      KEY_PATH: ${{ runner.temp }}/AuthKey_${{ secrets.APPSTORE_KEY_ID }}.p8
+      VERSION: ${{ inputs.version }}
+      MINUTES: ${{ inputs.minutes }}
+    steps:
+      - uses: actions/checkout@v7
+
+      # The key is written the same way ios-build.yml writes it, from the same secret, and only so
+      # that asc-get.mjs can sign. Neither the key nor a token is ever printed.
+      - name: Materialize the App Store Connect API key
+        env:
+          APPSTORE_PRIVATE_KEY: ${{ secrets.APPSTORE_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          umask 077
+          mkdir -p "$(dirname "$KEY_PATH")"
+          {
+            printf '%s\n' '-----BEGIN PRIVATE KEY-----'
+            printf '%s' "$APPSTORE_PRIVATE_KEY"
+            printf '%s\n' '-----END PRIVATE KEY-----'
+          } > "$KEY_PATH"
+          chmod 600 "$KEY_PATH"
+          openssl pkey -in "$KEY_PATH" -noout >/dev/null \
+            || { echo '::error::APPSTORE_PRIVATE_KEY is not a PEM this job can read.'; exit 1; }
+          echo "key written to $KEY_PATH and parsed."
+
+      - name: Report the build records
+        run: |
+          set -euo pipefail
+          get() {
+            APPSTORE_KEY_PATH="$KEY_PATH" APPSTORE_KEY_ID="$KEY_ID" APPSTORE_ISSUER_ID="$ISSUER_ID" \
+              node .github/actions/asc-auth-probe/asc-get.mjs "$1" "$2"
+          }
+
+          apps="$(get '/v1/apps?limit=200' "$RUNNER_TEMP/apps.json")"
+          echo "GET /v1/apps -> $apps"
+          app_id="$(python3 - "$RUNNER_TEMP/apps.json" <<'PYTHON'
+          import json
+          import sys
+
+          with open(sys.argv[1]) as fh:
+              body = json.load(fh)
+          for entry in body.get("data", []):
+              if entry.get("attributes", {}).get("bundleId") == "com.vkapps.wifisecurecall":
+                  print(entry["id"])
+                  break
+          PYTHON
+          )"
+          if [ -z "$app_id" ]; then
+            echo '::error::no App Store Connect app record for com.vkapps.wifisecurecall.'
+            python3 - "$RUNNER_TEMP/apps.json" <<'PYTHON'
+          import json
+          import sys
+
+          with open(sys.argv[1]) as fh:
+              body = json.load(fh)
+          for error in body.get("errors", []):
+              print(f"  [{error.get('code')}] {error.get('title')}: {error.get('detail')}")
+          PYTHON
+            exit 1
+          fi
+          echo "app record: $app_id"
+
+          versions="$(get "/v1/preReleaseVersions?filter\[app\]=$app_id&filter\[platform\]=IOS&limit=50" "$RUNNER_TEMP/versions.json")"
+          echo "GET /v1/preReleaseVersions -> $versions"
+          version_id="$(python3 - "$RUNNER_TEMP/versions.json" "$VERSION" <<'PYTHON'
+          import json
+          import sys
+
+          try:
+              with open(sys.argv[1]) as fh:
+                  body = json.load(fh)
+          except Exception:
+              raise SystemExit(0)
+          for entry in body.get("data", []):
+              if entry.get("attributes", {}).get("versionString") == sys.argv[2]:
+                  print(entry["id"])
+                  break
+          PYTHON
+          )"
+          [ -n "$version_id" ] || { echo "::error::no preReleaseVersion $VERSION is listed for this app."; exit 1; }
+          echo "preReleaseVersion $VERSION: $version_id"
+
+          deadline=$(( $(date +%s) + MINUTES * 60 ))
+          while :; do
+            builds="$(get "/v1/builds?filter\[preReleaseVersion\]=$version_id&limit=50" "$RUNNER_TEMP/builds.json")"
+            echo "GET /v1/builds -> $builds"
+            if [ "$builds" != 'HTTP 200' ]; then
+              python3 - "$RUNNER_TEMP/builds.json" <<'PYTHON'
+          import json
+          import sys
+
+          with open(sys.argv[1]) as fh:
+              body = json.load(fh)
+          for error in body.get("errors", []):
+              print(f"  [{error.get('code')}] {error.get('title')}: {error.get('detail')}")
+          PYTHON
+              exit 1
+            fi
+
+            python3 - "$RUNNER_TEMP/builds.json" <<'PYTHON'
+          import json
+          import sys
+
+          with open(sys.argv[1]) as fh:
+              body = json.load(fh)
+          entries = body.get("data", [])
+          if not entries:
+              print("  no build is listed for this version yet")
+              print("PENDING=yes")
+              raise SystemExit(0)
+          pending = False
+          for entry in sorted(entries, key=lambda e: e.get("attributes", {}).get("version", "")):
+              attributes = entry.get("attributes", {})
+              state = attributes.get("processingState")
+              pending = pending or state == "PROCESSING"
+              print(f"  build {attributes.get('version')}: {state}")
+              for field in ("uploadedDate", "expiringDate", "usesNonExemptEncryption"):
+                  if attributes.get(field) is not None:
+                      print(f"      {field}: {attributes[field]}")
+          print("PENDING=" + ("yes" if pending else "no"))
+          PYTHON
+
+            pending="$(python3 - "$RUNNER_TEMP/builds.json" <<'PYTHON'
+          import json
+          import sys
+
+          with open(sys.argv[1]) as fh:
+              body = json.load(fh)
+          states = [e.get("attributes", {}).get("processingState") for e in body.get("data", [])]
+          print("yes" if not states or "PROCESSING" in states else "no")
+          PYTHON
+          )"
+            [ "$pending" = yes ] || break
+            [ "$(date +%s)" -lt "$deadline" ] || { echo "still PROCESSING when the poll window closed"; break; }
+            echo 'a build is still PROCESSING; waiting 60 seconds.'
+            sleep 60
+          done
+
+      - name: Remove the API key
+        if: always()
+        run: rm -f "$KEY_PATH"
+
+      - name: Record what was read
+        if: always()
+        run: |
+          {
+            echo '### TestFlight'
+            echo
+            echo 'Read from App Store Connect by the TestFlight status workflow. No upload is performed here.'
+          } >> "$GITHUB_STEP_SUMMARY"
