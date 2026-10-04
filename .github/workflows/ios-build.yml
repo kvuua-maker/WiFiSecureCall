@@ -979,7 +979,7 @@ jobs:
           [ -n "$app_id" ] || { echo '::error::no App Store Connect app record for com.vkapps.wifisecurecall was found.'; exit 1; }
           echo "app record: $app_id"
 
-          versions="$(get "/v1/preReleaseVersions?filter\[app\]=$app_id&filter\[platform\]=IOS&limit=50" "$RUNNER_TEMP/asc-versions.json")"
+          versions="$(get "/v1/preReleaseVersions?filter[app]=$app_id&filter[platform]=IOS&limit=50" "$RUNNER_TEMP/asc-versions.json")"
           echo "GET /v1/preReleaseVersions -> $versions"
           if [ "$versions" != 'HTTP 200' ]; then
             describe "$RUNNER_TEMP/asc-versions.json"
@@ -1006,9 +1006,9 @@ jobs:
           fi
 
           if [ -n "$version_id" ]; then
-            path="/v1/builds?filter\[preReleaseVersion\]=$version_id&limit=50"
+            path="/v1/builds?filter[preReleaseVersion]=$version_id&limit=50"
           else
-            path="/v1/builds?filter\[app\]=$app_id&limit=50"
+            path="/v1/builds?filter[app]=$app_id&limit=50"
           fi
           builds="$(get "$path" "$RUNNER_TEMP/asc-builds.json")"
           echo "GET $path -> $builds"

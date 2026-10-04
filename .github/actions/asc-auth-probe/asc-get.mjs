@@ -54,8 +54,17 @@ const raw = Buffer.concat(parts.map((part) => {
 
 const token = `${signingInput}.${b64url(raw)}`;
 
+// Apple's API sits behind a gateway that answers a raw "[" or "]" in the query with a 404 that reads
+// as a missing endpoint rather than a rejected query. Every filter this job sends is written
+// filter[name]=value, which is where those two characters come from, so this is done here once for
+// every caller instead of in each URL that is built by hand. Node leaves brackets alone when it
+// parses a URL, so the encoding has to be explicit. Only the query is touched, and only those two
+// characters, so a request that carries no filter reaches the API exactly as it was written.
+const target = new URL(`https://api.appstoreconnect.apple.com${path}`);
+target.search = target.search.replaceAll('[', '%5B').replaceAll(']', '%5D');
+
 try {
-  const response = await fetch(`https://api.appstoreconnect.apple.com${path}`, {
+  const response = await fetch(target, {
     headers: {
       Authorization: `Bearer ${token}`,
       Accept: 'application/json',
