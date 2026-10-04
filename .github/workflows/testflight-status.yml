@@ -42,24 +42,14 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      # The key is written the same way ios-build.yml writes it, from the same secret, and only so
-      # that asc-get.mjs can sign. Neither the key nor a token is ever printed.
+      # The same script ios-build.yml uses, from the same secret, and only so that asc-get.mjs can sign.
+      # Wrapping the secret in its own markers here was not enough: the stored value already carries the
+      # markers, so the result was two BEGIN lines and a body openssl cannot read. Neither the key nor a
+      # token is ever printed.
       - name: Materialize the App Store Connect API key
         env:
-          APPSTORE_PRIVATE_KEY: ${{ secrets.APPSTORE_PRIVATE_KEY }}
-        run: |
-          set -euo pipefail
-          umask 077
-          mkdir -p "$(dirname "$KEY_PATH")"
-          {
-            printf '%s\n' '-----BEGIN PRIVATE KEY-----'
-            printf '%s' "$APPSTORE_PRIVATE_KEY"
-            printf '%s\n' '-----END PRIVATE KEY-----'
-          } > "$KEY_PATH"
-          chmod 600 "$KEY_PATH"
-          openssl pkey -in "$KEY_PATH" -noout >/dev/null \
-            || { echo '::error::APPSTORE_PRIVATE_KEY is not a PEM this job can read.'; exit 1; }
-          echo "key written to $KEY_PATH and parsed."
+          PRIVATE_KEY: ${{ secrets.APPSTORE_PRIVATE_KEY }}
+        run: bash .github/actions/asc-auth-probe/write-key.sh
 
       - name: Report the build records
         run: |
