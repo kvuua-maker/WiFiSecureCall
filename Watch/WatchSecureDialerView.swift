@@ -35,7 +35,7 @@ struct WatchSecureDialerView: View {
               .accessibilityIdentifier("dialpad.edit-number")
               .accessibilityHint("Ввести або продиктувати номер")
               .disabled(pad.isDialing)
-              Button { _ = pad.append("+") } label: {
+              Button { appendKey("+") } label: {
                   Text("+").frame(minWidth: 44, minHeight: 44).contentShape(Rectangle())
               }
               .buttonStyle(.plain)
@@ -60,7 +60,7 @@ struct WatchSecureDialerView: View {
                     .dialpadKey(height: keyHeight, color: .green)
             }
             .buttonStyle(.plain)
-            .accessibilityIdentifier("dialpad.call-top")
+            .accessibilityIdentifier("dialpad.call")
 #if DEBUG
             .accessibilityValue(String(describing: dynamicTypeSize))
 #endif
@@ -74,7 +74,9 @@ struct WatchSecureDialerView: View {
 
             ForEach(Array(WatchDialpadLayout.rows.indices), id: \.self) { index in
                 HStack(spacing: columnSpacing) {
-                    ForEach(WatchDialpadLayout.rows[index], id: \.self) { key in
+                    // One carrier action above the number pad. Keep zero/delete as real buttons,
+                    // without a second handset or an empty placeholder occupying the bottom row.
+                    ForEach(WatchDialpadLayout.rows[index].filter { $0 != .call }, id: \.self) { key in
                         cell(for: key)
                     }
                 }
@@ -98,24 +100,20 @@ struct WatchSecureDialerView: View {
     private func cell(for key: WatchDialpadLayout.Key) -> some View {
         switch key {
         case .delete:
-            Button { _ = pad.deleteLast() } label: {
+            Button {
+                if pad.deleteLast() { numberDidChange() }
+            } label: {
                 Image(systemName: "delete.left")
                     .dialpadKey(height: keyHeight, color: .gray.opacity(0.28))
             }
-            .accessibilityLabel("Delete")
+            .accessibilityLabel("Видалити останню цифру")
             .accessibilityIdentifier("dialpad.delete")
             .buttonStyle(.plain)
         case .call:
-            Button { placePhoneCall() } label: {
-                Image(systemName: "phone.fill")
-                    .dialpadKey(height: keyHeight, color: .green)
-            }
-            .accessibilityLabel("Call")
-            .accessibilityIdentifier("dialpad.call")
-            .buttonStyle(.plain)
-            .disabled(!pad.isCallable || pad.isDialing)
+            // The legacy layout model includes a handset; production renders it only once, above.
+            EmptyView()
         default:
-            Button { _ = pad.append(key.digit ?? "0") } label: {
+            Button { appendKey(key.digit ?? "0") } label: {
                 Text(String(key.digit ?? "0"))
                     .dialpadKey(height: keyHeight, color: .gray.opacity(0.28))
             }
@@ -134,10 +132,23 @@ private extension View {
 }
 
 private extension WatchSecureDialerView {
+    func appendKey(_ key: Character) {
+        if pad.append(key) { numberDidChange() }
+    }
+
+    func numberDidChange() {
+        // A prior handoff/error describes the prior number, never the newly edited recipient.
+        status = pad.isEmpty ? "" : (pad.isCallable
+            ? "Перевірте номер і натисніть трубку."
+            : "Введіть від 3 до 15 цифр; плюс — лише на початку.")
+    }
+
     func commitNumberInput(_ text: String) {
-        guard !pad.isDialing else { return }
+        // Native watchOS input can reflect the accepted value back into this binding after an
+        // invalid edit. That is not another user edit and must not erase the rejection message.
+        guard !pad.isDialing, text != pad.number else { return }
         if pad.replaceFromSystemInput(text) {
-            status = "Перевірте номер і натисніть трубку."
+            numberDidChange()
         } else {
             status = "Номер не змінено. Диктуйте по одній цифрі; плюс — лише на початку."
         }
@@ -152,9 +163,9 @@ private extension WatchSecureDialerView {
     func placePhoneCall() {
         switch pad.dialDecision {
         case .noNumber:
-            status = "Enter a number first"
+            status = "Спочатку введіть номер."
         case .invalidNumber:
-            status = "Enter 3 to 15 digits"
+            status = "Введіть від 3 до 15 цифр."
         case let .start(url):
             guard pad.beginDial() else { return }
             status = "Передано системному телефону."

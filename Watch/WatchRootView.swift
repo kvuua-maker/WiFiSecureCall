@@ -29,7 +29,9 @@ struct WatchRootView: View {
         }
         .sheet(isPresented: $showCallUser) { CallUserView(store: accountStore) }
         .sheet(isPresented: $showSecureDialer) {
-            WatchSecureDialerView()
+            // Ordinary-number dialing uses the Build 204 system path, without a service account.
+            // App-to-app dialing remains a separate root action, not a competing handset here.
+            WatchSecureDialerView(showsSecureAccountCall: false)
 #if DEBUG
                 // A watchOS sheet starts its own hosting environment; apply the UI-test typography
                 // inside that presentation as well as on the root screen.

@@ -64,8 +64,11 @@ final class WatchDialerUITests: XCTestCase {
         XCTAssertFalse(app.buttons["dialpad.call"].isEnabled)
         snapshot("primary-top")
         if !app.launchArguments.isEmpty {
-            XCTAssertEqual(app.buttons["dialpad.call-top"].value as? String, "xxxLarge", "Large Dynamic Type was not applied")
+            XCTAssertEqual(app.buttons["dialpad.call"].value as? String, "xxxLarge", "Large Dynamic Type was not applied")
         }
+        XCTAssertEqual(app.buttons.matching(identifier: "dialpad.call").count, 1)
+        XCTAssertFalse(app.buttons["dialpad.call-top"].exists)
+        XCTAssertFalse(app.buttons["Call app user"].exists)
         press("plus", atEdge: true)
         var expected = "+"
         for digit in ["1", "2", "3", "4", "5", "6", "7", "8", "9", "0"] {
@@ -121,7 +124,8 @@ final class WatchDialerUITests: XCTestCase {
         XCTAssertEqual(app.staticTexts["dialpad.review-number"].label, "+12025550100")
         XCTAssertEqual(app.staticTexts["dialpad.status"].label, "Перевірте номер і натисніть трубку.")
         XCTAssertFalse(app.staticTexts["Передано системному телефону."].exists)
-        let call = app.buttons["dialpad.call-top"]
+        let call = app.buttons["dialpad.call"]
+        XCTAssertEqual(app.buttons.matching(identifier: "dialpad.call").count, 1)
         reveal(call)
         XCTAssertTrue(call.isEnabled)
         XCTAssertTrue(call.isHittable)
@@ -134,6 +138,39 @@ final class WatchDialerUITests: XCTestCase {
         call.coordinate(withNormalizedOffset: CGVector(dx: 0.15, dy: 0.5)).tap()
         XCTAssertEqual(app.staticTexts["dialpad.status"].label, "Передано системному телефону.")
         snapshot("upper-call-action-handoff-only")
+        // A refused system call must not permanently latch the handset or erase the recipient.
+        XCTAssertTrue(call.isEnabled)
+        press("delete", atEdge: true)
+        expectNumber("+1202555010")
+        XCTAssertEqual(app.staticTexts["dialpad.status"].label, "Перевірте номер і натисніть трубку.")
+        press("0", atEdge: true)
+        expectNumber("+12025550100")
+        press("call", atEdge: true)
+        XCTAssertEqual(app.staticTexts["dialpad.status"].label, "Передано системному телефону.")
+    }
+
+    func testSystemInputRejectsWrongRecipientAndRequiresExplicitCall() {
+        app.buttons["Call number"].tap()
+        let number = app.textFields["dialpad.edit-number"]
+        number.tap()
+        XCTAssertTrue(app.buttons["Done"].waitForExistence(timeout: 8))
+        app.textViews.element(boundBy: 1).typeText("+1 (202) 555-0100")
+        app.buttons["Done"].tap()
+        expectNumber("+12025550100")
+
+        // Type invalid input through watchOS, not directly into the model.
+        number.tap()
+        XCTAssertTrue(app.buttons["Done"].waitForExistence(timeout: 8))
+        app.textViews.element(boundBy: 1).typeText("x")
+        app.buttons["Done"].tap()
+        expectNumber("+12025550100")
+        XCTAssertEqual(app.staticTexts["dialpad.status"].label,
+                       "Номер не змінено. Диктуйте по одній цифрі; плюс — лише на початку.")
+        XCTAssertFalse(app.staticTexts["Передано системному телефону."].exists)
+        press("delete", atEdge: true)
+        expectNumber("+1202555010")
+        XCTAssertEqual(app.staticTexts["dialpad.status"].label, "Перевірте номер і натисніть трубку.")
+        snapshot("invalid-edit-preserves-recipient")
     }
 
     func testSystemInputOffersDictation() {
