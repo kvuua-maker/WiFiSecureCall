@@ -1,3 +1,4 @@
+import CoreGraphics
 import XCTest
 
 /// The dialpad's last row was reported drawn and untappable on a real watch: delete, zero and the call key
@@ -83,9 +84,10 @@ final class WatchDialpadLayoutTests: XCTestCase {
     func testTheCentreOfEachBottomRowKeyReachesThatKey() {
         let subject = layout(for: series5, bottomInset: 44)
         for key in WatchDialpadLayout.bottomRow {
-            let rect = try? XCTUnwrap(subject.frame(for: key))
-            XCTAssertNotNil(rect, "\(key) has no rectangle")
-            guard let rect else { continue }
+            guard let rect = subject.frame(for: key) else {
+                XCTFail("\(key) has no rectangle")
+                continue
+            }
             XCTAssertEqual(
                 subject.key(at: CGPoint(x: rect.midX, y: rect.midY)),
                 key,

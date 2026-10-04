@@ -54,10 +54,13 @@ struct WatchSecureDialerView: View {
                 .lineLimit(1)
                 .minimumScaleFactor(0.7)
 
-            ForEach(Array(WatchDialpadLayout.rows.enumerated()), id: \.offset) { _, row in
+            // Written over indices rather than over `rows.enumerated()`, because a ForEach over an
+            // enumerated sequence hands its element over as one tuple and this content closure wants two
+            // values, which Swift does not destructure.
+            ForEach(Array(WatchDialpadLayout.rows.indices), id: \.self) { index in
                 HStack(spacing: columnSpacing) {
-                    ForEach(row, id: \.self) { key in
-                        key(for: key)
+                    ForEach(WatchDialpadLayout.rows[index], id: \.self) { key in
+                        cell(for: key)
                     }
                 }
             }
@@ -77,7 +80,7 @@ struct WatchSecureDialerView: View {
     }
 
     @ViewBuilder
-    private func key(for key: WatchDialpadLayout.Key) -> some View {
+    private func cell(for key: WatchDialpadLayout.Key) -> some View {
         switch key {
         case .delete:
             Button { _ = pad.deleteLast() } label: {
