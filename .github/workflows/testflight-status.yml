@@ -88,8 +88,25 @@ jobs:
           fi
           echo "app record: $app_id"
 
-          versions="$(get "/v1/preReleaseVersions?filter[app]=$app_id&filter[platform]=IOS&limit=50" "$RUNNER_TEMP/versions.json")"
+          # No platform filter. filter[platform] narrowed this to nothing while 0.1.0 was uploaded and
+          # processed, and a list that comes back empty for a reason that is not written down is the one
+          # thing this run exists to replace with a fact. Every listed version is printed, so the log says
+          # what is on record rather than only what was expected.
+          versions="$(get "/v1/preReleaseVersions?filter[app]=$app_id&limit=200" "$RUNNER_TEMP/versions.json")"
           echo "GET /v1/preReleaseVersions -> $versions"
+          if [ "$versions" != 'HTTP 200' ]; then
+            python3 - "$RUNNER_TEMP/versions.json" <<'PYTHON'
+          import json
+          import sys
+
+          with open(sys.argv[1]) as fh:
+              body = json.load(fh)
+          for error in body.get("errors", []):
+              print(f"  [{error.get('code')}] {error.get('title')}: {error.get('detail')}")
+          PYTHON
+            exit 1
+          fi
+
           version_id="$(python3 - "$RUNNER_TEMP/versions.json" "$VERSION" <<'PYTHON'
           import json
           import sys
@@ -99,19 +116,35 @@ jobs:
                   body = json.load(fh)
           except Exception:
               raise SystemExit(0)
-          for entry in body.get("data", []):
+          listed = body.get("data", [])
+          print(f"  {len(listed)} preReleaseVersion(s) are listed for this app:", file=sys.stderr)
+          for entry in listed:
+              attributes = entry.get("attributes", {})
+              print(
+                  f"    {attributes.get('versionString')} on {attributes.get('platform')}: {entry.get('id')}",
+                  file=sys.stderr,
+              )
+          for entry in listed:
               if entry.get("attributes", {}).get("versionString") == sys.argv[2]:
                   print(entry["id"])
                   break
           PYTHON
           )"
-          [ -n "$version_id" ] || { echo "::error::no preReleaseVersion $VERSION is listed for this app."; exit 1; }
-          echo "preReleaseVersion $VERSION: $version_id"
+          if [ -n "$version_id" ]; then
+            echo "preReleaseVersion $VERSION: $version_id"
+          else
+            echo "No preReleaseVersion $VERSION is listed for this app; reading every build for it instead."
+          fi
 
           deadline=$(( $(date +%s) + MINUTES * 60 ))
           while :; do
-            builds="$(get "/v1/builds?filter[preReleaseVersion]=$version_id&limit=50" "$RUNNER_TEMP/builds.json")"
-            echo "GET /v1/builds -> $builds"
+            if [ -n "$version_id" ]; then
+              path="/v1/builds?filter[preReleaseVersion]=$version_id&limit=200"
+            else
+              path="/v1/builds?filter[app]=$app_id&limit=200"
+            fi
+            builds="$(get "$path" "$RUNNER_TEMP/builds.json")"
+            echo "GET $path -> $builds"
             if [ "$builds" != 'HTTP 200' ]; then
               python3 - "$RUNNER_TEMP/builds.json" <<'PYTHON'
           import json
@@ -175,4 +208,35 @@ jobs:
             echo '### TestFlight'
             echo
             echo 'Read from App Store Connect by the TestFlight status workflow. No upload is performed here.'
+            echo
+            if [ -f "$RUNNER_TEMP/builds.json" ]; then
+              python3 - "$RUNNER_TEMP/builds.json" <<'PYTHON'
+          import json
+          import sys
+
+          try:
+              with open(sys.argv[1]) as fh:
+                  body = json.load(fh)
+          except Exception:
+              print("_The build list could not be parsed._")
+              raise SystemExit(0)
+          entries = sorted(
+              body.get("data", []),
+              key=lambda e: e.get("attributes", {}).get("version", ""),
+          )
+          if not entries:
+              print("_No build is listed._")
+          else:
+              print("| Build | Processing state | Uploaded |")
+              print("| --- | --- | --- |")
+              for entry in entries:
+                  attributes = entry.get("attributes", {})
+                  uploaded = (attributes.get("uploadedDate") or "")[:10]
+                  print(
+                      f"| {attributes.get('version')} | {attributes.get('processingState')} | {uploaded} |"
+                  )
+          PYTHON
+            else
+              echo '_The job did not reach the build list; see the log._'
+            fi
           } >> "$GITHUB_STEP_SUMMARY"
