@@ -1,124 +1,138 @@
 import Foundation
 
-/// Number normalisation for a watch-originated secure call. The watch keeps its own media leg, so the
-/// typed value only has to become an E.164 string the server can resolve to a Wi-Fi identity.
-enum WatchSecureDialerNumber {
-    static func normalized(_ number: String) -> String? {
-        let digits = number.filter { $0.isASCII && $0.isNumber }
-        guard (3...15).contains(digits.count) else { return nil }
-        return "+" + digits
-    }
-}
-
 #if os(watchOS)
 import SwiftUI
 import WatchKit
 
-/// Places a call from the Apple Watch. Capture and playback both run on the watch, so no paired
-/// iPhone has to be running for the audio path.
+/// Places a call from the Apple Watch.
+///
+/// The green key is a handset and it places a phone call, because that is what the shape of the key says
+/// it does and what it was pressed for. It used to carry a Wi-Fi glyph and run an account lookup instead,
+/// which is a different action wearing the same key; that route is still here, on its own labelled
+/// button, where it cannot be mistaken for the call action or take its place.
+///
+/// The layout is a plain `VStack` with no `ScrollView`, which is the layout the Build 20 to 29 system
+/// dialer used while its keys were reliably tappable. Every key also states its own `contentShape`, so
+/// what is tappable is the whole cell rather than the glyph drawn inside it. The account line reports
+/// state and never disables a key: a green key that looks available and does nothing was the reported
+/// failure, so nothing here may gate the call action on presentation state.
 struct WatchSecureDialerView: View {
     @Environment(\.dismiss) private var dismiss
     @StateObject private var store = AccountSessionStore.shared
-    @State private var number = ""
+    @State private var pad = WatchDialpadModel()
     @State private var status = ""
-    @State private var working = false
 
     private let columns = Array(repeating: GridItem(.flexible(), spacing: 3), count: 3)
     private let digits: [Character] = ["1", "2", "3", "4", "5", "6", "7", "8", "9"]
 
     var body: some View {
-        ScrollView {
-            VStack(spacing: 3) {
-                HStack(spacing: 4) {
-                    Button("Close") { dismiss() }
-                        .font(.caption2)
-                        .buttonStyle(.plain)
-                    Spacer(minLength: 2)
-                    Button("+") { append("+") }
-                        .font(.caption)
-                        .buttonStyle(.plain)
-                }
-
-                Text(number.isEmpty ? "Number" : number)
-                    .font(.headline.monospacedDigit())
-                    .lineLimit(1)
-                    .minimumScaleFactor(0.5)
-                    .frame(maxWidth: .infinity)
-
-                Text("Audio plays on this Apple Watch")
-                    .font(.system(size: 9))
-                    .foregroundStyle(.secondary)
-
-                LazyVGrid(columns: columns, spacing: 3) {
-                    ForEach(digits, id: \.self) { digit in
-                        key(String(digit)) { append(digit) }
-                    }
-                    Button {
-                        if !number.isEmpty { number.removeLast() }
-                    } label: {
-                        Image(systemName: "delete.left")
-                    }
-                    .accessibilityLabel("Delete")
-                    .buttonStyle(.plain)
-                    .frame(maxWidth: .infinity, minHeight: 24)
-                    .background(RoundedRectangle(cornerRadius: 8).fill(.gray.opacity(0.28)))
-
-                    key("0") { append("0") }
-
-                    Button { startSecureCall() } label: {
-                        Image(systemName: "wifi.circle.fill")
-                    }
-                    .accessibilityLabel("Call over Wi-Fi")
-                    .buttonStyle(.plain)
-                    .frame(maxWidth: .infinity, minHeight: 24)
-                    .background(RoundedRectangle(cornerRadius: 8).fill(working ? Color.gray : Color.green))
-                }
-
-                Button("Call with cellular") { callOverCellular() }
+        VStack(spacing: 3) {
+            HStack(spacing: 4) {
+                Button("Close") { dismiss() }
                     .font(.caption2)
                     .buttonStyle(.plain)
-
-                if !status.isEmpty {
-                    Text(status)
-                        .font(.system(size: 10))
-                        .foregroundStyle(.secondary)
-                        .multilineTextAlignment(.center)
-                }
+                Spacer(minLength: 2)
+                Button("+") { _ = pad.append("+") }
+                    .font(.caption)
+                    .buttonStyle(.plain)
             }
-            .padding(.horizontal, 3)
+
+            Text(pad.isEmpty ? "Number" : pad.number)
+                .font(.headline.monospacedDigit())
+                .lineLimit(1)
+                .minimumScaleFactor(0.5)
+                .frame(maxWidth: .infinity)
+
+            Text(accountState)
+                .font(.system(size: 9))
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+                .minimumScaleFactor(0.7)
+
+            LazyVGrid(columns: columns, spacing: 3) {
+                ForEach(digits, id: \.self) { digit in
+                    key(String(digit)) { _ = pad.append(digit) }
+                }
+
+                Button { _ = pad.deleteLast() } label: {
+                    Image(systemName: "delete.left")
+                }
+                .accessibilityLabel("Delete")
+                .buttonStyle(.plain)
+                .frame(maxWidth: .infinity, minHeight: 26)
+                .contentShape(Rectangle())
+                .background(RoundedRectangle(cornerRadius: 8).fill(.gray.opacity(0.28)))
+
+                key("0") { _ = pad.append("0") }
+
+                Button { placePhoneCall() } label: {
+                    Image(systemName: "phone.fill")
+                }
+                .accessibilityLabel("Call")
+                .buttonStyle(.plain)
+                .frame(maxWidth: .infinity, minHeight: 26)
+                .contentShape(Rectangle())
+                .background(
+                    RoundedRectangle(cornerRadius: 8)
+                        .fill(pad.callButtonState == .ready ? Color.green : Color.gray)
+                )
+            }
+
+            Button("Call over Wi-Fi account") { startSecureCall() }
+                .font(.caption2)
+                .buttonStyle(.plain)
+
+            if !status.isEmpty {
+                Text(status)
+                    .font(.system(size: 10))
+                    .foregroundStyle(.secondary)
+                    .multilineTextAlignment(.center)
+            }
         }
+        .padding(.horizontal, 3)
     }
 
     private func key(_ label: String, action: @escaping () -> Void) -> some View {
         Button(label) { action() }
             .buttonStyle(.plain)
-            .frame(maxWidth: .infinity, minHeight: 24)
+            .frame(maxWidth: .infinity, minHeight: 26)
+            .contentShape(Rectangle())
             .background(RoundedRectangle(cornerRadius: 8).fill(.gray.opacity(0.28)))
     }
 
-    private func append(_ value: Character) {
-        guard number.count < WatchSystemDialerNumber.maximumCharacterCount else { return }
-        guard value.isASCII, value.isNumber || value == "+" else { return }
-        if value == "+" {
-            guard number.isEmpty else { return }
-            number = "+"
-            return
+    /// Hands the typed number to the system as a phone call.
+    ///
+    /// The claim is taken for the hand-over and released straight after, because the system owns the
+    /// call from that moment and reports nothing back: a latch held open across a hand-off that never
+    /// leaves this app is exactly how a call key stops working.
+    private func placePhoneCall() {
+        switch pad.dialDecision {
+        case .noNumber:
+            status = "Enter a number first"
+        case .invalidNumber:
+            status = "Enter 3 to 15 digits"
+        case let .start(url):
+            guard pad.beginDial() else { return }
+            status = "Opening phone…"
+            WKApplication.shared().openSystemURL(url)
+            pad.endDial()
         }
-        number.append(value)
     }
 
+    /// The Wi-Fi account route, kept because it reaches another Wi-Fi Secure Call user, and kept off the
+    /// call key because it is not a phone call.
     private func startSecureCall() {
-        guard !working else { return }
-        guard let entry = WatchSecureDialerNumber.normalized(number) else {
-            status = "Enter at least 3 digits"
+        guard pad.beginDial() else { return }
+        guard let entry = pad.e164 else {
+            pad.endDial()
+            status = pad.isEmpty ? "Enter a number first" : "Enter 3 to 15 digits"
             return
         }
-        guard let accountID = store.callableAccounts.first(where: { $0.accountID == store.activeAccountID })?.accountID
-                ?? store.callableAccounts.first?.accountID else {
+        guard let accountID = activeAccountID else {
+            pad.endDial()
             status = "Link an account first"
             return
         }
-        working = true
         status = "Resolving…"
         Task { @MainActor in
             do {
@@ -126,20 +140,24 @@ struct WatchSecureDialerView: View {
                 dismiss()
                 await NotificationRuntime.shared.startUserCall(targetUserID: recipient.userID, accountID: accountID)
             } catch is CancellationError {
-                working = false
+                pad.endDial()
             } catch {
-                working = false
+                pad.endDial()
                 status = Self.safeMessage(error)
             }
         }
     }
 
-    private func callOverCellular() {
-        guard let url = WatchSystemDialerNumber.url(for: number), url.scheme == "tel" else {
-            status = "Enter a valid number"
-            return
-        }
-        WKApplication.shared().openSystemURL(url)
+    private var activeAccountID: UUID? {
+        store.callableAccounts.first(where: { $0.accountID == store.activeAccountID })?.accountID
+            ?? store.callableAccounts.first?.accountID
+    }
+
+    /// Reported beside the keypad and read as information only. This line has no way to disable a key.
+    private var accountState: String {
+        let count = store.callableAccounts.count
+        if count == 0 { return "Wi-Fi account: not linked" }
+        return "Wi-Fi account: \(count) linked"
     }
 
     private static func safeMessage(_ error: Error) -> String {
