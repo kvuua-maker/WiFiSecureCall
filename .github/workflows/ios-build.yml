@@ -935,7 +935,15 @@ jobs:
           ISSUER_ID: ${{ secrets.APPSTORE_ISSUER_ID }}
         run: |
           set -euo pipefail
-          status="$(node .github/actions/asc-auth-probe/asc-get.mjs '/v1/bundleIds?limit=200' "$RUNNER_TEMP/bundleIds.json")"
+          # The job already holds the key location and the two identifiers under its own names, which
+          # are the ones every other step here uses. The helper takes them as APPSTORE_*, so they are
+          # mapped at the call rather than renamed everywhere.
+          get() {
+            APPSTORE_KEY_PATH="$KEY_PATH" APPSTORE_KEY_ID="$KEY_ID" APPSTORE_ISSUER_ID="$ISSUER_ID" \
+              node .github/actions/asc-auth-probe/asc-get.mjs "$1" "$2"
+          }
+
+          status="$(get '/v1/bundleIds?limit=200' "$RUNNER_TEMP/bundleIds.json")"
           echo "GET /v1/bundleIds -> $status"
           if [ "$status" != 'HTTP 200' ]; then
             echo '::warning::the App ID list is not readable with this key, so the export will be the first thing to try.'
@@ -1098,7 +1106,10 @@ jobs:
           VERSION: 0.1.0
         run: |
           set -euo pipefail
-          get() { node .github/actions/asc-auth-probe/asc-get.mjs "$1" "$2"; }
+          get() {
+            APPSTORE_KEY_PATH="$KEY_PATH" APPSTORE_KEY_ID="$KEY_ID" APPSTORE_ISSUER_ID="$ISSUER_ID" \
+              node .github/actions/asc-auth-probe/asc-get.mjs "$1" "$2"
+          }
 
           apps="$(get '/v1/apps?limit=200' "$RUNNER_TEMP/asc-apps.json")"
           echo "GET /v1/apps -> $apps"
