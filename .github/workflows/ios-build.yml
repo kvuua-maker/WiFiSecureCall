@@ -926,18 +926,11 @@ jobs:
           printf 'IOS_BEARER_TOKEN = %s\nWATCH_BEARER_TOKEN = %s\n' "$IOS_BEARER_TOKEN" "$WATCH_BEARER_TOKEN" > Config/Secrets.xcconfig
           echo 'Config/Secrets.xcconfig written.'
 
-      # Automatic signing is in effect for Release, through Config/Base.xcconfig, and
-      # -allowProvisioningUpdates lets Xcode create or refresh the certificate and both profiles. The
-      # profile names stay unset: an explicit profile is what read as a manual specification and
-      # produced the conflicting provisioning settings.
-      #
-      # The identity is named, because leaving it unset does not make Xcode choose a distribution
-      # certificate. Run 37197963432 archived Release with CODE_SIGN_STYLE=Automatic and no identity,
-      # and Xcode asked for "iOS App Development" profiles for both bundle ids. A development profile
-      # cannot be generated for a team with no registered devices, so the archive died with "Your team
-      # has no devices from which to generate a provisioning profile" before any export. Naming the
-      # Apple Distribution identity asks for App Store profiles instead, which need no device list.
-      # Only this device archive is affected: the package job signs nothing and never sees the flag.
+      # Automatic signing is already in effect for Release, through Config/Base.xcconfig. Only the API key
+      # is passed, and -allowProvisioningUpdates lets Xcode create or refresh the Apple Distribution
+      # certificate and both provisioning profiles, so the identity and the profile names are left
+      # unset on purpose. Naming them here is what produced the conflicting provisioning settings:
+      # xcodebuild treated an explicit identity as a manual specification.
       - name: Archive with automatic signing
         env:
           OVERRIDE: ${{ inputs.build_number }}
@@ -973,7 +966,6 @@ jobs:
             -authenticationKeyIssuerID "$ISSUER_ID" \
             -allowProvisioningUpdates \
             CODE_SIGN_STYLE=Automatic \
-            CODE_SIGN_IDENTITY="Apple Distribution" \
             archive | tee /tmp/archive.log
 
       - name: Verify both apps are signed
