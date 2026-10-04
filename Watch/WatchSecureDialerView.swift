@@ -11,22 +11,27 @@ import WatchKit
 /// which is a different action wearing the same key; that route is still here, on its own labelled
 /// button, where it cannot be mistaken for the call action or take its place.
 ///
-/// The layout is a plain `VStack` with no `ScrollView`, which is the layout the Build 20 to 29 system
-/// dialer used while its keys were reliably tappable. Every key also states its own `contentShape`, so
-/// what is tappable is the whole cell rather than the glyph drawn inside it. The account line reports
-/// state and never disables a key: a green key that looks available and does nothing was the reported
-/// failure, so nothing here may gate the call action on presentation state.
+/// The keypad is four `HStack`s in a `VStack` and nothing else. It was a `LazyVGrid` inside a
+/// `ScrollView`, and on the watch its last row was drawn and could not be tapped: delete, zero and the
+/// call key were all dead while the three rows above them worked. Neither of those containers decides
+/// where a key is, so neither of them decides whether a tap reaches it any more. Every key also states
+/// its own `contentShape`, so what is tappable is the whole cell and not the symbol drawn inside it, and
+/// `WatchDialpadLayout` is what the tests measure these arrangements against.
+///
+/// The account line reports state and never disables a key: a key that looks available and does nothing
+/// was the reported failure, so presentation state is kept out of the action.
 struct WatchSecureDialerView: View {
     @Environment(\.dismiss) private var dismiss
     @StateObject private var store = AccountSessionStore.shared
     @State private var pad = WatchDialpadModel()
     @State private var status = ""
 
-    private let columns = Array(repeating: GridItem(.flexible(), spacing: 3), count: 3)
-    private let digits: [Character] = ["1", "2", "3", "4", "5", "6", "7", "8", "9"]
+    private let columnSpacing: CGFloat = 3
+    private let rowSpacing: CGFloat = 3
+    private let keyHeight: CGFloat = 26
 
     var body: some View {
-        VStack(spacing: 3) {
+        VStack(spacing: rowSpacing) {
             HStack(spacing: 4) {
                 Button("Close") { dismiss() }
                     .font(.caption2)
@@ -49,33 +54,12 @@ struct WatchSecureDialerView: View {
                 .lineLimit(1)
                 .minimumScaleFactor(0.7)
 
-            LazyVGrid(columns: columns, spacing: 3) {
-                ForEach(digits, id: \.self) { digit in
-                    key(String(digit)) { _ = pad.append(digit) }
+            ForEach(Array(WatchDialpadLayout.rows.enumerated()), id: \.offset) { _, row in
+                HStack(spacing: columnSpacing) {
+                    ForEach(row, id: \.self) { key in
+                        key(for: key)
+                    }
                 }
-
-                Button { _ = pad.deleteLast() } label: {
-                    Image(systemName: "delete.left")
-                }
-                .accessibilityLabel("Delete")
-                .buttonStyle(.plain)
-                .frame(maxWidth: .infinity, minHeight: 26)
-                .contentShape(Rectangle())
-                .background(RoundedRectangle(cornerRadius: 8).fill(.gray.opacity(0.28)))
-
-                key("0") { _ = pad.append("0") }
-
-                Button { placePhoneCall() } label: {
-                    Image(systemName: "phone.fill")
-                }
-                .accessibilityLabel("Call")
-                .buttonStyle(.plain)
-                .frame(maxWidth: .infinity, minHeight: 26)
-                .contentShape(Rectangle())
-                .background(
-                    RoundedRectangle(cornerRadius: 8)
-                        .fill(pad.callButtonState == .ready ? Color.green : Color.gray)
-                )
             }
 
             Button("Call over Wi-Fi account") { startSecureCall() }
@@ -92,20 +76,63 @@ struct WatchSecureDialerView: View {
         .padding(.horizontal, 3)
     }
 
-    private func key(_ label: String, action: @escaping () -> Void) -> some View {
-        Button(label) { action() }
+    @ViewBuilder
+    private func key(for key: WatchDialpadLayout.Key) -> some View {
+        switch key {
+        case .delete:
+            Button { _ = pad.deleteLast() } label: {
+                Image(systemName: "delete.left")
+            }
+            .accessibilityLabel("Delete")
             .buttonStyle(.plain)
-            .frame(maxWidth: .infinity, minHeight: 26)
-            .contentShape(Rectangle())
-            .background(RoundedRectangle(cornerRadius: 8).fill(.gray.opacity(0.28)))
+            .cell(keyHeight: keyHeight)
+        case .call:
+            Button { placePhoneCall() } label: {
+                Image(systemName: "phone.fill")
+            }
+            .accessibilityLabel("Call")
+            .buttonStyle(.plain)
+            .cell(keyHeight: keyHeight)
+            .background(
+                RoundedRectangle(cornerRadius: 8)
+                    .fill(pad.callButtonState == .ready ? Color.green : Color.gray)
+            )
+        default:
+            Button(String(key.digit ?? "0")) { _ = pad.append(key.digit ?? "0") }
+                .buttonStyle(.plain)
+                .cell(keyHeight: keyHeight)
+                .background(RoundedRectangle(cornerRadius: 8).fill(.gray.opacity(0.28)))
+        }
     }
+}
 
+/// The one place a key's hit target is defined.
+///
+/// `contentShape` is what makes the whole cell tappable rather than the glyph or the digit inside it, and
+/// it is applied to every key through here so that no key can be given a label without it.
+private struct WatchDialpadCell: ViewModifier {
+    let keyHeight: CGFloat
+
+    func body(content: Content) -> some View {
+        content
+            .frame(maxWidth: .infinity, minHeight: keyHeight)
+            .contentShape(Rectangle())
+    }
+}
+
+private extension View {
+    func cell(keyHeight: CGFloat) -> some View {
+        modifier(WatchDialpadCell(keyHeight: keyHeight))
+    }
+}
+
+private extension WatchSecureDialerView {
     /// Hands the typed number to the system as a phone call.
     ///
-    /// The claim is taken for the hand-over and released straight after, because the system owns the
-    /// call from that moment and reports nothing back: a latch held open across a hand-off that never
-    /// leaves this app is exactly how a call key stops working.
-    private func placePhoneCall() {
+    /// The claim is taken for the hand-over and released straight after, because the system owns the call
+    /// from that moment and reports nothing back: a latch held open across a hand-off that never leaves
+    /// this app is exactly how a call key stops working.
+    func placePhoneCall() {
         switch pad.dialDecision {
         case .noNumber:
             status = "Enter a number first"
@@ -121,7 +148,7 @@ struct WatchSecureDialerView: View {
 
     /// The Wi-Fi account route, kept because it reaches another Wi-Fi Secure Call user, and kept off the
     /// call key because it is not a phone call.
-    private func startSecureCall() {
+    func startSecureCall() {
         guard pad.beginDial() else { return }
         guard let entry = pad.e164 else {
             pad.endDial()
@@ -148,19 +175,19 @@ struct WatchSecureDialerView: View {
         }
     }
 
-    private var activeAccountID: UUID? {
+    var activeAccountID: UUID? {
         store.callableAccounts.first(where: { $0.accountID == store.activeAccountID })?.accountID
             ?? store.callableAccounts.first?.accountID
     }
 
     /// Reported beside the keypad and read as information only. This line has no way to disable a key.
-    private var accountState: String {
+    var accountState: String {
         let count = store.callableAccounts.count
         if count == 0 { return "Wi-Fi account: not linked" }
         return "Wi-Fi account: \(count) linked"
     }
 
-    private static func safeMessage(_ error: Error) -> String {
+    static func safeMessage(_ error: Error) -> String {
         guard let apiError = error as? AccountAPIError else { return "Call failed" }
         switch apiError {
         case let .status(_, response):

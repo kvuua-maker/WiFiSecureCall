@@ -918,6 +918,56 @@ jobs:
             || { echo '::error::the export did not report success.'; exit 1; }
           echo 'The export reported success.'
 
+      # Sign in with Apple on the watch was reported as not working at all, and the source
+      # .entitlements file cannot answer whether that is why: it says what was asked for, not what was
+      # granted. What decides it is the entitlement set the exported bundle actually carries, and the
+      # entitlements the profile that signed it actually allows. So both are read back here, from the
+      # signed artefacts, and the watch's own bundle is asked rather than the phone's, because the watch
+      # has its own App ID and its own profile and can be granted the capability without the phone.
+      - name: Read the entitlements the export actually granted
+        run: |
+          set -euo pipefail
+          export_root="$RUNNER_TEMP/export"
+          iphone_app="$(find "$export_root/Payload" -maxdepth 1 -type d -name '*.app' ! -name '*Watch*' -print -quit)"
+          [ -n "$iphone_app" ] || { echo '::error::the export produced no iPhone .app to read.'; exit 1; }
+          watch_app="$(find "$iphone_app/Watch" -maxdepth 1 -type d -name '*.app' -print -quit)"
+          [ -n "$watch_app" ] || { echo '::error::the export has no embedded Apple Watch app.'; exit 1; }
+
+          report() {
+            local label="$1" app="$2" required="$3"
+            local signed profile
+            signed="$(codesign -d --entitlements - --xml "$app" 2>/dev/null || true)"
+            [ -n "$signed" ] || { echo "::error::$label has no readable signature entitlements."; exit 1; }
+            echo "$signed" > "$RUNNER_TEMP/entitlements-$label.plist"
+
+            profile="$(find "$app" -name embedded.mobileprovision -print -quit)"
+            if [ -n "$profile" ]; then
+              security cms -D -i "$profile" > "$RUNNER_TEMP/profile-$label.plist" 2>/dev/null \
+                || echo "::warning::$label profile could not be decoded; only the signed entitlements will be read."
+            fi
+
+            echo "== $label: $app"
+            echo "-- signed entitlements"
+            /usr/libexec/PlistBuddy -c Print "$RUNNER_TEMP/entitlements-$label.plist" 2>/dev/null \
+              || echo '   (none beyond the code signature)'
+            if [ -n "$profile" ] && [ -f "$RUNNER_TEMP/profile-$label.plist" ]; then
+              echo "-- entitlements the profile allows"
+              /usr/libexec/PlistBuddy -c 'Print :Entitlements' "$RUNNER_TEMP/profile-$label.plist" 2>/dev/null \
+                || echo '   (profile carries no entitlement list)'
+            else
+              echo "-- no embedded profile (App Store distribution); the signed entitlements above are what runs"
+            fi
+
+            /usr/libexec/PlistBuddy -c "Print :$required" "$RUNNER_TEMP/entitlements-$label.plist" >/dev/null 2>&1 \
+              || { echo "::error::$label is missing $required in the signed bundle, which is why the capability cannot run."; exit 1; }
+            echo "$label carries $required in the signed bundle."
+          }
+
+          report iphone "$iphone_app" com.apple.developer.applesignin
+          report watch "$watch_app" com.apple.developer.applesignin
+
+          echo 'The Sign in with Apple entitlement is present in both signed bundles.'
+
       # A delivered binary is not yet a build. This asks App Store Connect for the record it created,
       # by the version and build number the archive carried, and prints the state Apple puts on it. Only
       # that record distinguishes an upload that was processed from one that was rejected after transfer.

@@ -8,6 +8,20 @@ final class WatchAppleAuthenticationCoordinator: NSObject, ObservableObject, ASA
     @Published private(set) var message = ""
     @Published private(set) var lastSignedInAccountID: UUID?
 
+    /// What the flow is doing, in the order it does it, so that a tap that never becomes a system sheet is
+    /// distinguishable from a sheet that is refused. Sign in with Apple was reported as doing nothing at
+    /// all on a watch, and a single "nothing" cannot say which of those two happened.
+    enum Stage: Equatable {
+        case idle
+        case tapped
+        case sheetPresented
+        case credentialReceived
+        case signedIn
+        case failed(String)
+    }
+
+    @Published private(set) var stage: Stage = .idle
+
     private let store: AccountSessionStore
     private let client: AccountAPIClient
     private let pushRegistration: AccountPushRegistrationCoordinator
@@ -42,14 +56,20 @@ final class WatchAppleAuthenticationCoordinator: NSObject, ObservableObject, ASA
             let controller = ASAuthorizationController(authorizationRequests: [request])
             controller.delegate = self
             self.attempt = attempt
+            // The controller is held for the length of the flow. A controller that is not retained is
+            // released while the system sheet is still up, and the delegate callbacks it owes never arrive,
+            // which is a sign-in that stops without a word.
             authorizationController = controller
             isAuthenticating = true
-            message = ""
+            message = "Waiting for Apple…"
+            stage = .tapped
             controller.performRequests()
+            stage = .sheetPresented
         } catch {
             clearAttempt()
             isAuthenticating = false
             message = "Apple sign-in unavailable"
+            stage = .failed("request could not be created")
         }
     }
 
@@ -57,12 +77,14 @@ final class WatchAppleAuthenticationCoordinator: NSObject, ObservableObject, ASA
         controller: ASAuthorizationController,
         didCompleteWithAuthorization authorization: ASAuthorization
     ) {
+        stage = .credentialReceived
         guard controller === authorizationController,
               let attempt,
               let credential = authorization.credential as? ASAuthorizationAppleIDCredential else {
             clearAttempt()
             isAuthenticating = false
             message = "Apple credential unavailable"
+            stage = .failed("no Apple ID credential in the response")
             return
         }
 
@@ -86,7 +108,36 @@ final class WatchAppleAuthenticationCoordinator: NSObject, ObservableObject, ASA
         guard controller === authorizationController else { return }
         clearAttempt()
         isAuthenticating = false
-        message = "Apple sign-in cancelled or unavailable"
+        message = Self.message(for: error)
+        stage = .failed(message)
+    }
+
+    /// Each refusal is reported as what it was rather than as one catch-all string.
+    ///
+    /// Nothing here prints the identity token, the authorization code, the Apple ID, the user identifier
+    /// or any other credential: only the category of the failure is named.
+    private static func message(for error: Error) -> String {
+        let nsError = error as NSError
+        guard nsError.domain == ASAuthorizationError.errorDomain,
+              let code = ASAuthorizationError.Code(rawValue: nsError.code) else {
+            return "Apple sign-in could not be verified"
+        }
+        switch code {
+        case .canceled:
+            return "Apple sign-in cancelled"
+        case .notHandled:
+            // Apple requires a passcode on Apple Watch for Sign in with Apple, and an unhandled request is
+            // what a watch without one produces.
+            return "Apple sign-in not handled. Check the Apple Watch has a passcode and an Apple ID signed in."
+        case .invalidResponse:
+            return "Apple returned an invalid response"
+        case .failed:
+            return "Apple sign-in failed. Check the watch passcode and the Sign in with Apple entitlement."
+        case .unknown:
+            return "Apple sign-in could not be verified"
+        @unknown default:
+            return "Apple sign-in could not be verified"
+        }
     }
 
     private func complete(input: AppleNativeCredentialInput, attempt: AppleSignInAttempt) async {
@@ -104,12 +155,15 @@ final class WatchAppleAuthenticationCoordinator: NSObject, ObservableObject, ASA
             await pushRegistration.registerKnownTokens(for: response.account.accountID)
             lastSignedInAccountID = response.account.accountID
             message = "Signed in with Apple"
+            stage = .signedIn
         } catch let error as AppleCredentialValidationError {
             message = error == .stateMismatch
                 ? "Apple sign-in state verification failed"
                 : "Apple credential unavailable"
+            stage = .failed("server rejected the Apple credential")
         } catch {
             message = "Apple sign-in could not be verified"
+            stage = .failed("the server could not be reached or refused the credential")
         }
     }
 
@@ -223,10 +277,20 @@ struct WatchAccountLinkView: View {
                         Text("Add account").font(.caption)
                     }
 
+                    // The stage is on screen while the flow runs, and stays on screen after it stops. Sign
+                    // in with Apple was reported as doing nothing at all, and this is what turns that
+                    // report into a question with an answer: a stage stuck at tapped never became a sheet,
+                    // a stage stuck at sheetPresented never came back.
                     WatchNativeAppleIDButton { appleAuthentication.start() }
                         .frame(height: 34)
                         .allowsHitTesting(!appleAuthentication.isAuthenticating)
                         .opacity(appleAuthentication.isAuthenticating ? 0.6 : 1)
+
+                    Text(stageLabel)
+                        .font(.system(size: 9))
+                        .foregroundStyle(.secondary)
+                        .lineLimit(2)
+                        .minimumScaleFactor(0.7)
 
                     Button("Link with iPhone") { startAdding() }
                 }
@@ -252,6 +316,18 @@ struct WatchAccountLinkView: View {
 
     private var selectedAccount: AccountSummary? {
         store.accounts.first { $0.accountID == selectedAccountID }
+    }
+
+    /// The stage, named for a person reading it on a watch.
+    private var stageLabel: String {
+        switch appleAuthentication.stage {
+        case .idle: return ""
+        case .tapped: return "Sign in with Apple: tapped, no sheet yet"
+        case .sheetPresented: return "Sign in with Apple: waiting for Apple"
+        case .credentialReceived: return "Sign in with Apple: checking with server"
+        case .signedIn: return "Sign in with Apple: signed in"
+        case let .failed(reason): return "Sign in with Apple: " + reason
+        }
     }
 
     private func needsRelinking(_ accountID: UUID) -> Bool {
