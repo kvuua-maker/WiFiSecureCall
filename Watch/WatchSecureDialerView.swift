@@ -89,6 +89,7 @@ struct WatchSecureDialerView: View {
             .accessibilityLabel("Delete")
             .buttonStyle(.plain)
             .cell(keyHeight: keyHeight)
+            .background(RoundedRectangle(cornerRadius: 8).fill(.gray.opacity(0.28)))
         case .call:
             Button { placePhoneCall() } label: {
                 Image(systemName: "phone.fill")
