@@ -1,0 +1,139 @@
+import XCTest
+
+/// Runs against the real watchOS view hierarchy, not the dialpad model or computed rectangles.
+@MainActor
+final class WatchDialerUITests: XCTestCase {
+    private let app = XCUIApplication(bundleIdentifier: "com.vkapps.wifisecurecall.watchkitapp")
+
+    override func setUpWithError() throws {
+        continueAfterFailure = false
+        addUIInterruptionMonitor(withDescription: "Notification permission") { alert in
+            if alert.buttons["OK"].exists { alert.buttons["OK"].tap(); return true }
+            if alert.buttons["Allow"].isHittable { alert.buttons["Allow"].tap(); return true }
+            alert.swipeUp()
+            if alert.buttons["Allow"].exists { alert.buttons["Allow"].tap(); return true }
+            return false
+        }
+        app.launch()
+        let board = XCUIApplication(bundleIdentifier: "com.apple.Carousel")
+        if board.alerts.firstMatch.waitForExistence(timeout: 2) {
+            if board.buttons["OK"].exists {
+                board.buttons["OK"].tap()
+            } else {
+                board.alerts.firstMatch.swipeUp()
+                if board.buttons["Allow"].exists { board.buttons["Allow"].tap() }
+            }
+            app.activate()
+        }
+    }
+
+    private func reveal(_ element: XCUIElement, in scroll: XCUIElement? = nil) {
+        XCTAssertTrue(element.waitForExistence(timeout: 3))
+        for _ in 0..<12 {
+            let rect = element.frame
+            if rect.midY >= 55 && rect.midY <= app.frame.height - 25 && element.isHittable { return }
+            // A short drag with a hold avoids flick inertia overshooting a small Watch row.
+            let start = app.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.60))
+            let end = start.withOffset(CGVector(dx: 0, dy: rect.midY < 55 ? 45 : -45))
+            start.press(forDuration: 0.1, thenDragTo: end, withVelocity: .slow, thenHoldForDuration: 0.4)
+        }
+        XCTAssertTrue(element.isHittable)
+    }
+
+    private func snapshot(_ name: String) {
+        let attachment = XCTAttachment(screenshot: XCUIScreen.main.screenshot())
+        attachment.name = (app.launchArguments.isEmpty ? "standard-" : "large-") + name
+        attachment.lifetime = .keepAlways; add(attachment)
+    }
+
+    private func press(_ key: String, atEdge: Bool = false) {
+        let button = app.buttons["dialpad.\(key)"]
+        reveal(button)
+        if atEdge {
+            button.coordinate(withNormalizedOffset: CGVector(dx: 0.08, dy: 0.5)).tap()
+        } else { button.tap() }
+    }
+
+    private func expectNumber(_ value: String) {
+        XCTAssertEqual(app.staticTexts["dialpad.number"].label, value)
+    }
+
+    func testPrimaryDialerAllKeysAndVisibleEdges() {
+        app.buttons["Call number"].tap()
+        XCTAssertTrue(app.buttons["dialpad.1"].waitForExistence(timeout: 3))
+        XCTAssertFalse(app.buttons["dialpad.call"].isEnabled)
+        snapshot("primary-top")
+        if !app.launchArguments.isEmpty {
+            XCTAssertEqual(app.staticTexts["dialpad.number"].value as? String, "xxxLarge", "Large Dynamic Type was not applied")
+        }
+        press("plus", atEdge: true)
+        var expected = "+"
+        for digit in ["1", "2", "3", "4", "5", "6", "7", "8", "9", "0"] {
+            press(digit, atEdge: true)
+            expected += digit
+            expectNumber(expected)
+        }
+        snapshot("primary-bottom-keys")
+        press("delete", atEdge: true)
+        expectNumber("+123456789")
+        press("0", atEdge: true)
+        expectNumber("+1234567890")
+        press("0", atEdge: true)
+        expectNumber("+12345678900")
+        press("delete", atEdge: true)
+        press("delete", atEdge: true)
+        expectNumber("+123456789")
+        print("WATCH_FIXED_DIALPAD\n\(app.debugDescription)")
+        app.buttons.matching(identifier: "close-sheet").firstMatch.tap()
+        app.buttons["Call number"].tap()
+        expectNumber("Number")
+        press("0", atEdge: true)
+        expectNumber("0")
+        XCTAssertFalse(app.buttons["dialpad.call"].isEnabled)
+    }
+
+    func testCarrierHandsetInvokesSystemHandoffWithoutAccount() {
+        // Reserved fictional NANPA number; no real recipient and no carrier service in Simulator.
+        let cellular = app.buttons["Cellular call"]
+        reveal(cellular, in: app.scrollViews.firstMatch)
+        cellular.tap()
+        for digit in ["1", "2", "0", "2", "5", "5", "5", "0", "1", "0", "0"] { press(digit) }
+        XCTAssertTrue(app.buttons["dialpad.call"].isEnabled)
+        press("call", atEdge: true)
+        XCTAssertTrue(app.staticTexts["dialpad.status"].waitForExistence(timeout: 3))
+        XCTAssertEqual(app.staticTexts["dialpad.status"].label, "Opening phone…")
+        snapshot("carrier-handset-handoff-only")
+        // This verifies the action was invoked, NOT ringing, connection or two-way telephone audio.
+    }
+
+    func testAppleSignInButtonReachesAuthorizationCoordinator() {
+        let account = app.buttons["Link Account"]
+        reveal(account, in: app.scrollViews.firstMatch)
+        account.tap()
+        print("WATCH_ACCOUNT_BEFORE\n\(app.debugDescription)")
+        snapshot("apple-account-page")
+        // watchOS exposes this WKInterfaceObject's label, but not its identifier, to XCUIAutomation.
+        let apple = app.buttons["Sign in with Apple"]
+        XCTAssertTrue(apple.waitForExistence(timeout: 3))
+        reveal(apple, in: app.scrollViews.firstMatch)
+        snapshot("apple-signin-before")
+        apple.tap()
+        let changed = app.staticTexts.matching(NSPredicate(format: "label CONTAINS[c] 'Apple sign-in' OR label CONTAINS[c] 'Waiting for Apple'")).firstMatch
+        XCTAssertTrue(changed.waitForExistence(timeout: 10), "Apple button did not invoke the coordinator")
+        let board = XCUIApplication(bundleIdentifier: "com.apple.Carousel")
+        if board.alerts.firstMatch.waitForExistence(timeout: 20) {
+            print("WATCH_APPLE_SYSTEM_RESULT\n\(board.alerts.firstMatch.debugDescription)")
+            snapshot("apple-system-result")
+            if board.buttons["OK"].exists { board.buttons["OK"].tap() }
+        }
+        print("WATCH_APPLE_RUNTIME_RESULT\n\(app.debugDescription)")
+        snapshot("apple-signin-result")
+        // Credential delivery and persisted authorized session require an actual Apple account.
+    }
+
+    func testLargeTextPrimaryDialerAllKeysAndVisibleEdges() {
+        app.launchArguments = ["--uitest-large-text"]
+        app.launch()
+        testPrimaryDialerAllKeysAndVisibleEdges()
+    }
+}

@@ -4,59 +4,41 @@ import Foundation
 import SwiftUI
 import WatchKit
 
-/// Places a call from the Apple Watch.
-///
-/// The green key is a handset and it places a phone call, because that is what the shape of the key says
-/// it does and what it was pressed for. It used to carry a Wi-Fi glyph and run an account lookup instead,
-/// which is a different action wearing the same key; that route is still here, on its own labelled
-/// button, where it cannot be mistaken for the call action or take its place.
-///
-/// The keypad is four `HStack`s in a `VStack` and nothing else. It was a `LazyVGrid` inside a
-/// `ScrollView`, and on the watch its last row was drawn and could not be tapped: delete, zero and the
-/// call key were all dead while the three rows above them worked. Neither of those containers decides
-/// where a key is, so neither of them decides whether a tap reaches it any more. Every key also states
-/// its own `contentShape`, so what is tappable is the whole cell and not the symbol drawn inside it, and
-/// `WatchDialpadLayout` is what the tests measure these arrangements against.
-///
-/// The account line reports state and never disables a key: a key that looks available and does nothing
-/// was the reported failure, so presentation state is kept out of the action.
+/// Carrier dialing uses the system's public tel: route; app-to-app calling is a separate action.
+/// The background, dimensions and hit shape belong to the Button's LABEL. Applying them outside a
+/// plain Button draws a large cell but leaves taps outside its glyph unhandled on watchOS.
 struct WatchSecureDialerView: View {
     @Environment(\.dismiss) private var dismiss
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
     @StateObject private var store = AccountSessionStore.shared
     @State private var pad = WatchDialpadModel()
     @State private var status = ""
+    var showsSecureAccountCall = true
 
     private let columnSpacing: CGFloat = 3
     private let rowSpacing: CGFloat = 3
-    private let keyHeight: CGFloat = 26
+    private let keyHeight: CGFloat = 44
 
     var body: some View {
-        VStack(spacing: rowSpacing) {
+        ScrollView {
+          VStack(spacing: rowSpacing) {
             HStack(spacing: 4) {
-                Button("Close") { dismiss() }
-                    .font(.caption2)
-                    .buttonStyle(.plain)
-                Spacer(minLength: 2)
-                Button("+") { _ = pad.append("+") }
-                    .font(.caption)
-                    .buttonStyle(.plain)
-            }
-
-            Text(pad.isEmpty ? "Number" : pad.number)
+              Text(pad.isEmpty ? "Number" : pad.number)
                 .font(.headline.monospacedDigit())
                 .lineLimit(1)
                 .minimumScaleFactor(0.5)
                 .frame(maxWidth: .infinity)
+                .accessibilityIdentifier("dialpad.number")
+#if DEBUG
+                .accessibilityValue(String(describing: dynamicTypeSize))
+#endif
+              Button { _ = pad.append("+") } label: {
+                  Text("+").frame(minWidth: 44, minHeight: 44).contentShape(Rectangle())
+              }
+              .buttonStyle(.plain)
+              .accessibilityIdentifier("dialpad.plus")
+            }
 
-            Text(accountState)
-                .font(.system(size: 9))
-                .foregroundStyle(.secondary)
-                .lineLimit(1)
-                .minimumScaleFactor(0.7)
-
-            // Written over indices rather than over `rows.enumerated()`, because a ForEach over an
-            // enumerated sequence hands its element over as one tuple and this content closure wants two
-            // values, which Swift does not destructure.
             ForEach(Array(WatchDialpadLayout.rows.indices), id: \.self) { index in
                 HStack(spacing: columnSpacing) {
                     ForEach(WatchDialpadLayout.rows[index], id: \.self) { key in
@@ -65,18 +47,26 @@ struct WatchSecureDialerView: View {
                 }
             }
 
-            Button("Call over Wi-Fi account") { startSecureCall() }
-                .font(.caption2)
-                .buttonStyle(.plain)
+            if showsSecureAccountCall {
+                Text(accountState).font(.caption2).foregroundStyle(.secondary)
+                Button("Call app user") { startSecureCall() }
+                    .font(.caption2)
+                    .disabled(!pad.isCallable || pad.isDialing)
+            }
 
             if !status.isEmpty {
                 Text(status)
                     .font(.system(size: 10))
                     .foregroundStyle(.secondary)
                     .multilineTextAlignment(.center)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .accessibilityIdentifier("dialpad.status")
             }
+          }
+          .padding(.horizontal, 4)
+          .padding(.bottom, 8)
         }
-        .padding(.horizontal, 3)
+        .accessibilityIdentifier("dialpad.scroll")
     }
 
     @ViewBuilder
@@ -85,48 +75,36 @@ struct WatchSecureDialerView: View {
         case .delete:
             Button { _ = pad.deleteLast() } label: {
                 Image(systemName: "delete.left")
+                    .dialpadKey(height: keyHeight, color: .gray.opacity(0.28))
             }
             .accessibilityLabel("Delete")
+            .accessibilityIdentifier("dialpad.delete")
             .buttonStyle(.plain)
-            .cell(keyHeight: keyHeight)
-            .background(RoundedRectangle(cornerRadius: 8).fill(.gray.opacity(0.28)))
         case .call:
             Button { placePhoneCall() } label: {
                 Image(systemName: "phone.fill")
+                    .dialpadKey(height: keyHeight, color: .green)
             }
             .accessibilityLabel("Call")
+            .accessibilityIdentifier("dialpad.call")
             .buttonStyle(.plain)
-            .cell(keyHeight: keyHeight)
-            .background(
-                RoundedRectangle(cornerRadius: 8)
-                    .fill(pad.callButtonState == .ready ? Color.green : Color.gray)
-            )
+            .disabled(!pad.isCallable || pad.isDialing)
         default:
-            Button(String(key.digit ?? "0")) { _ = pad.append(key.digit ?? "0") }
-                .buttonStyle(.plain)
-                .cell(keyHeight: keyHeight)
-                .background(RoundedRectangle(cornerRadius: 8).fill(.gray.opacity(0.28)))
+            Button { _ = pad.append(key.digit ?? "0") } label: {
+                Text(String(key.digit ?? "0"))
+                    .dialpadKey(height: keyHeight, color: .gray.opacity(0.28))
+            }
+            .buttonStyle(.plain)
+            .accessibilityIdentifier("dialpad.\(key.digit ?? "0")")
         }
     }
 }
 
-/// The one place a key's hit target is defined.
-///
-/// `contentShape` is what makes the whole cell tappable rather than the glyph or the digit inside it, and
-/// it is applied to every key through here so that no key can be given a label without it.
-private struct WatchDialpadCell: ViewModifier {
-    let keyHeight: CGFloat
-
-    func body(content: Content) -> some View {
-        content
-            .frame(maxWidth: .infinity, minHeight: keyHeight)
-            .contentShape(Rectangle())
-    }
-}
-
 private extension View {
-    func cell(keyHeight: CGFloat) -> some View {
-        modifier(WatchDialpadCell(keyHeight: keyHeight))
+    func dialpadKey(height: CGFloat, color: Color) -> some View {
+        self.frame(maxWidth: .infinity, minHeight: height)
+            .background(RoundedRectangle(cornerRadius: 8).fill(color))
+            .contentShape(Rectangle())
     }
 }
 

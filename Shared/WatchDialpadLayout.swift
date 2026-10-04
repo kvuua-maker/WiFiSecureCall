@@ -1,18 +1,10 @@
 import CoreGraphics
 import Foundation
 
-/// The rows the watch dialpad is built from, and the rectangles those rows occupy.
-///
-/// The keys are described here instead of being written out as a grid literal in the view, so that the
-/// arrangement these tests check is the arrangement the view builds. The defect that brought this type
-/// into being was a dialpad whose last row was drawn and could not be tapped: visible, laid out, and not
-/// reachable. Which keys end up where, and whether a point lands on one, are properties of rectangles, so
-/// they are stated as rectangles and asserted on any platform without a watch and without a tap.
-///
-/// There is no lazy container and no scroll view in the geometry. A `LazyVGrid` realizes rows as they
-/// come into view and a `ScrollView` decides how much of its content is on screen, and a key whose
-/// rectangle depends on that is a key whose reachability is not a property of this type. The four rows are
-/// plain `HStack`s in the view and four rectangles here.
+/// Shared key ordering plus a pure geometry model for unit tests.
+/// Only `rows` is used to construct the production SwiftUI dialpad. These calculated rectangles do not
+/// measure SwiftUI's actual layout or hit testing, and cannot establish that a visible key is tappable.
+/// WatchUITests exercises real touch events, scrolling, and resulting number changes in Simulator.
 struct WatchDialpadLayout: Equatable {
     enum Key: String, Equatable, CaseIterable {
         case one, two, three

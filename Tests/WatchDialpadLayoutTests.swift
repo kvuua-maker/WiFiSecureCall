@@ -1,23 +1,16 @@
 import CoreGraphics
 import XCTest
 
-/// The dialpad's last row was reported drawn and untappable on a real watch: delete, zero and the call key
-/// were all dead while the three rows above them worked.
-///
-/// These tests are about reachability rather than about behaviour. What a key does is asserted against
-/// `WatchDialpadModel`, and what a key *is* is asserted here: that it has a rectangle, that the rectangle
-/// is on screen and out of the inset the system reserves at the bottom, that no key overlaps another, and
-/// that the centre of each of the three bottom keys lands on that key and on nothing else. A point inside
-/// the screen that belongs to no key is the signature of the defect, and `key(at:)` returning nil there is
-/// what these tests forbid.
+/// Pure geometry tests; these do not measure SwiftUI's actual hit regions or prove that a tap works.
+/// WatchUITests verifies the production dialpad with real synthesized touch events and scrolling.
 final class WatchDialpadLayoutTests: XCTestCase {
 
-    /// The 45 mm Apple Watch Series 5, which is the device the reports come from.
-    private let series5 = CGSize(width: 396, height: 484)
+    /// Apple Watch Series 5 44 mm, in layout points rather than physical pixels.
+    private let series5 = CGSize(width: 184, height: 224)
 
-    /// The 41 mm case, the smallest screen the app supports, because a layout that only fits the large one
+    /// The 40 mm case, the smallest screen the app supports, because a layout that only fits the large one
     /// is not a layout.
-    private let series5Small = CGSize(width: 352, height: 430)
+    private let series5Small = CGSize(width: 162, height: 197)
 
     private func layout(for size: CGSize, bottomInset: CGFloat = 0) -> WatchDialpadLayout {
         WatchDialpadLayout(size: size, bottomInset: bottomInset)
@@ -108,8 +101,8 @@ final class WatchDialpadLayoutTests: XCTestCase {
     }
 
     func testNoTwoKeysOverlapAnywhere() {
-        XCTAssertEqual(layout(for: series5).overlappingKeyPairs(), [])
-        XCTAssertEqual(layout(for: series5Small).overlappingKeyPairs(), [])
+        XCTAssertTrue(layout(for: series5).overlappingKeyPairs().isEmpty)
+        XCTAssertTrue(layout(for: series5Small).overlappingKeyPairs().isEmpty)
     }
 
     func testEveryPointOnEveryKeyBelongsToThatKey() {
@@ -141,31 +134,34 @@ final class WatchDialpadLayoutTests: XCTestCase {
         XCTAssertFalse(covered.contains(.one), "the rows that worked must not be reported as covered")
     }
 
-    /// And the check that keeps that overlay honest: a key's own background is not an overlay, so the
-    /// common mistake of treating one as the other does not report every key as covered.
-    func testKeysAreNotCoveredByTheirOwnBackground() {
+    /// An independently supplied overlay matching one key covers only that key.
+    /// A visual background is not supplied to the overlay detector.
+    func testAnOverlayMatchingOneKeyCoversOnlyThatKey() {
         let subject = layout(for: series5)
         for key in WatchDialpadLayout.Key.allCases {
             guard let rect = subject.frame(for: key) else { continue }
-            XCTAssertEqual(subject.keys(coveredBy: [rect]), [], "\(key) covers only itself")
+            XCTAssertEqual(subject.keys(coveredBy: [rect]), [key], "the overlay covers only \(key)")
         }
     }
 
     func testAnOverlayThatMissesTheKeypadCoversNothing() {
         let subject = layout(for: series5)
-        let above = CGRect(x: 0, y: 0, width: series5.width, height: 10)
+        let above = CGRect(x: 0, y: -20, width: series5.width, height: 10)
         XCTAssertEqual(subject.keys(coveredBy: [above]), [])
     }
 
     // MARK: - The arrangement is sized, not guessed
 
     func testTheGridFillsTheWidthItIsGiven() {
-        let subject = layout(for: series5, columnSpacing: 3)
+        let subject = WatchDialpadLayout(size: series5, columnSpacing: 3)
         let lastColumn = try? XCTUnwrap(subject.frame(for: .call))
         XCTAssertNotNil(lastColumn)
         guard let rect = subject.frame(for: .call) else { return }
         XCTAssertEqual(rect.maxX, series5.width, accuracy: 0.5, "the right column reaches the edge")
-        XCTAssertEqual(rect.minX, 0, accuracy: 0.5, "the left column starts at the edge")
+        let firstColumn = try? XCTUnwrap(subject.frame(for: .delete))
+        XCTAssertNotNil(firstColumn)
+        guard let firstColumn else { return }
+        XCTAssertEqual(firstColumn.minX, 0, accuracy: 0.5, "the left column starts at the edge")
     }
 
     func testAGridWithNoWidthHasNoReachableKeys() {
@@ -185,8 +181,9 @@ final class WatchDialpadLayoutTests: XCTestCase {
         guard let top, let middle, let bottom else { return }
         XCTAssertLessThan(top.minY, middle.minY)
         XCTAssertLessThan(middle.minY, bottom.minY)
-        XCTAssertEqual(top.minY, middle.minY, "each row starts at the same height")
-        XCTAssertEqual(middle.minY, bottom.minY)
+        XCTAssertEqual(top.minY, subject.frame(for: .three)?.minY)
+        XCTAssertEqual(middle.minY, subject.frame(for: .six)?.minY)
+        XCTAssertEqual(bottom.minY, subject.frame(for: .call)?.minY)
     }
 
     func testKeysLineUpInColumns() {

@@ -28,7 +28,16 @@ struct WatchRootView: View {
             }
         }
         .sheet(isPresented: $showCallUser) { CallUserView(store: accountStore) }
-        .sheet(isPresented: $showSecureDialer) { WatchSecureDialerView() }
+        .sheet(isPresented: $showSecureDialer) {
+            WatchSecureDialerView()
+#if DEBUG
+                // A watchOS sheet starts its own hosting environment; apply the UI-test typography
+                // inside that presentation as well as on the root screen.
+                .transformEnvironment(\.dynamicTypeSize) { size in
+                    if ProcessInfo.processInfo.arguments.contains("--uitest-large-text") { size = .xxxLarge }
+                }
+#endif
+        }
         .sheet(isPresented: $showSystemDialer) { WatchSystemDialerView() }
         .sheet(isPresented: $showCarrierCallingProbe) { WatchCarrierCallingDiagnosticView() }
     }
@@ -91,10 +100,8 @@ struct WatchRootView: View {
     }
 
     private func beginSecureCall() {
-        guard !accountStore.callableAccounts.isEmpty else {
-            showAccount = true
-            return
-        }
+        // A carrier telephone call does not require an account in our service.
+        // Authentication is checked separately by the app-to-app action.
         showSecureDialer = true
     }
 

@@ -14,7 +14,7 @@ final class WatchAppleAuthenticationCoordinator: NSObject, ObservableObject, ASA
     enum Stage: Equatable {
         case idle
         case tapped
-        case sheetPresented
+        case requestSubmitted
         case credentialReceived
         case signedIn
         case failed(String)
@@ -64,7 +64,8 @@ final class WatchAppleAuthenticationCoordinator: NSObject, ObservableObject, ASA
             message = "Waiting for Apple…"
             stage = .tapped
             controller.performRequests()
-            stage = .sheetPresented
+            // performRequests does not confirm that the system sheet was actually presented.
+            stage = .requestSubmitted
         } catch {
             clearAttempt()
             isAuthenticating = false
@@ -77,9 +78,9 @@ final class WatchAppleAuthenticationCoordinator: NSObject, ObservableObject, ASA
         controller: ASAuthorizationController,
         didCompleteWithAuthorization authorization: ASAuthorization
     ) {
+        guard controller === authorizationController else { return }
         stage = .credentialReceived
-        guard controller === authorizationController,
-              let attempt,
+        guard let attempt,
               let credential = authorization.credential as? ASAuthorizationAppleIDCredential else {
             clearAttempt()
             isAuthenticating = false
@@ -108,7 +109,10 @@ final class WatchAppleAuthenticationCoordinator: NSObject, ObservableObject, ASA
         guard controller === authorizationController else { return }
         clearAttempt()
         isAuthenticating = false
-        message = Self.message(for: error)
+        let nsError = error as NSError
+        let safeCode = nsError.domain == ASAuthorizationError.errorDomain
+            ? " (ASAuthorizationError \(nsError.code))" : ""
+        message = Self.message(for: error) + safeCode
         stage = .failed(message)
     }
 
@@ -126,9 +130,7 @@ final class WatchAppleAuthenticationCoordinator: NSObject, ObservableObject, ASA
         case .canceled:
             return "Apple sign-in cancelled"
         case .notHandled:
-            // Apple requires a passcode on Apple Watch for Sign in with Apple, and an unhandled request is
-            // what a watch without one produces.
-            return "Apple sign-in not handled. Check the Apple Watch has a passcode and an Apple ID signed in."
+            return "Apple sign-in request was not handled. Check your Apple Account and watch passcode."
         case .invalidResponse:
             return "Apple returned an invalid response"
         case .failed:
@@ -197,11 +199,14 @@ private struct WatchNativeAppleIDButton: WKInterfaceObjectRepresentable {
     func makeCoordinator() -> Coordinator { Coordinator(action: action) }
 
     func makeWKInterfaceObject(context: Context) -> WKInterfaceAuthorizationAppleIDButton {
-        WKInterfaceAuthorizationAppleIDButton(
+        let button = WKInterfaceAuthorizationAppleIDButton(
             style: .default,
             target: context.coordinator,
             action: #selector(Coordinator.activate)
         )
+        button.setAccessibilityLabel("Sign in with Apple")
+        button.setAccessibilityIdentifier("account.apple-sign-in")
+        return button
     }
 
     func updateWKInterfaceObject(
@@ -277,12 +282,10 @@ struct WatchAccountLinkView: View {
                         Text("Add account").font(.caption)
                     }
 
-                    // The stage is on screen while the flow runs, and stays on screen after it stops. Sign
-                    // in with Apple was reported as doing nothing at all, and this is what turns that
-                    // report into a question with an answer: a stage stuck at tapped never became a sheet,
-                    // a stage stuck at sheetPresented never came back.
+                    // Show the request/result, without claiming a system sheet or a completed login
+                    // merely because the button handler ran.
                     WatchNativeAppleIDButton { appleAuthentication.start() }
-                        .frame(height: 34)
+                        .frame(minHeight: 45)
                         .allowsHitTesting(!appleAuthentication.isAuthenticating)
                         .opacity(appleAuthentication.isAuthenticating ? 0.6 : 1)
 
@@ -323,7 +326,7 @@ struct WatchAccountLinkView: View {
         switch appleAuthentication.stage {
         case .idle: return ""
         case .tapped: return "Sign in with Apple: tapped, no sheet yet"
-        case .sheetPresented: return "Sign in with Apple: waiting for Apple"
+        case .requestSubmitted: return "Sign in with Apple: waiting for Apple"
         case .credentialReceived: return "Sign in with Apple: checking with server"
         case .signedIn: return "Sign in with Apple: signed in"
         case let .failed(reason): return "Sign in with Apple: " + reason
