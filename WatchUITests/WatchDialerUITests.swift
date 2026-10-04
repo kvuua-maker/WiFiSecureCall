@@ -55,7 +55,7 @@ final class WatchDialerUITests: XCTestCase {
     }
 
     private func expectNumber(_ value: String) {
-        XCTAssertEqual(app.staticTexts["dialpad.number"].label, value)
+        XCTAssertEqual(app.textFields["dialpad.edit-number"].value as? String, value)
     }
 
     func testPrimaryDialerAllKeysAndVisibleEdges() {
@@ -64,7 +64,7 @@ final class WatchDialerUITests: XCTestCase {
         XCTAssertFalse(app.buttons["dialpad.call"].isEnabled)
         snapshot("primary-top")
         if !app.launchArguments.isEmpty {
-            XCTAssertEqual(app.staticTexts["dialpad.number"].value as? String, "xxxLarge", "Large Dynamic Type was not applied")
+            XCTAssertEqual(app.buttons["dialpad.call-top"].value as? String, "xxxLarge", "Large Dynamic Type was not applied")
         }
         press("plus", atEdge: true)
         var expected = "+"
@@ -86,7 +86,7 @@ final class WatchDialerUITests: XCTestCase {
         print("WATCH_FIXED_DIALPAD\n\(app.debugDescription)")
         app.buttons.matching(identifier: "close-sheet").firstMatch.tap()
         app.buttons["Call number"].tap()
-        expectNumber("Number")
+        expectNumber("Ввести номер")
         press("0", atEdge: true)
         expectNumber("0")
         XCTAssertFalse(app.buttons["dialpad.call"].isEnabled)
@@ -101,9 +101,52 @@ final class WatchDialerUITests: XCTestCase {
         XCTAssertTrue(app.buttons["dialpad.call"].isEnabled)
         press("call", atEdge: true)
         XCTAssertTrue(app.staticTexts["dialpad.status"].waitForExistence(timeout: 3))
-        XCTAssertEqual(app.staticTexts["dialpad.status"].label, "Opening phone…")
+        XCTAssertEqual(app.staticTexts["dialpad.status"].label, "Передано системному телефону.")
         snapshot("carrier-handset-handoff-only")
         // This verifies the action was invoked, NOT ringing, connection or two-way telephone audio.
+    }
+
+    func testNumberRowOpensSystemInputAndDoesNotDialAutomatically() {
+        app.buttons["Call number"].tap()
+        let number = app.textFields["dialpad.edit-number"]
+        XCTAssertTrue(number.waitForExistence(timeout: 3))
+        number.tap()
+        XCTAssertTrue(app.buttons["Done"].waitForExistence(timeout: 8))
+        snapshot("system-number-input")
+        let editor = app.textViews.element(boundBy: 1)
+        XCTAssertTrue(editor.exists)
+        editor.typeText("+1 202 555 0100") // Reserved fictitious number, entered through real system UI.
+        app.buttons["Done"].tap()
+        expectNumber("+12025550100")
+        XCTAssertEqual(app.staticTexts["dialpad.review-number"].label, "+12025550100")
+        XCTAssertEqual(app.staticTexts["dialpad.status"].label, "Перевірте номер і натисніть трубку.")
+        XCTAssertFalse(app.staticTexts["Передано системному телефону."].exists)
+        let call = app.buttons["dialpad.call-top"]
+        reveal(call)
+        XCTAssertTrue(call.isEnabled)
+        XCTAssertTrue(call.isHittable)
+        snapshot("review-number-before-call")
+        // Cancelled system input retains the number and still does not place a call.
+        number.tap()
+        XCTAssertTrue(app.buttons["Cancel"].waitForExistence(timeout: 3))
+        app.buttons["Cancel"].tap()
+        expectNumber("+12025550100")
+        call.coordinate(withNormalizedOffset: CGVector(dx: 0.15, dy: 0.5)).tap()
+        XCTAssertEqual(app.staticTexts["dialpad.status"].label, "Передано системному телефону.")
+        snapshot("upper-call-action-handoff-only")
+    }
+
+    func testSystemInputOffersDictation() {
+        app.buttons["Call number"].tap()
+        app.textFields["dialpad.edit-number"].tap()
+        XCTAssertTrue(app.buttons["Change input method"].waitForExistence(timeout: 5))
+        app.buttons["Change input method"].tap()
+        print("WATCH_INPUT_METHODS\n\(app.debugDescription)")
+        snapshot("system-input-methods")
+        XCTAssertTrue(app.buttons["Dictation"].waitForExistence(timeout: 3))
+        app.buttons["Dictation"].tap()
+        snapshot("system-dictation")
+        XCTAssertFalse(app.staticTexts["Передано системному телефону."].exists)
     }
 
     func testAppleSignInButtonReachesAuthorizationCoordinator() {

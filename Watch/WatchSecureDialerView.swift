@@ -23,20 +23,53 @@ struct WatchSecureDialerView: View {
         ScrollView {
           VStack(spacing: rowSpacing) {
             HStack(spacing: 4) {
-              Text(pad.isEmpty ? "Number" : pad.number)
+              TextField("Ввести номер", text: Binding(
+                  get: { pad.number },
+                  set: { commitNumberInput($0) }
+              ))
                 .font(.headline.monospacedDigit())
-                .lineLimit(1)
-                .minimumScaleFactor(0.5)
-                .frame(maxWidth: .infinity)
-                .accessibilityIdentifier("dialpad.number")
-#if DEBUG
-                .accessibilityValue(String(describing: dynamicTypeSize))
-#endif
+                .lineLimit(2)
+                .minimumScaleFactor(0.65)
+                .frame(maxWidth: .infinity, minHeight: 44)
+                .contentShape(Rectangle())
+              .accessibilityIdentifier("dialpad.edit-number")
+              .accessibilityHint("Ввести або продиктувати номер")
+              .disabled(pad.isDialing)
               Button { _ = pad.append("+") } label: {
                   Text("+").frame(minWidth: 44, minHeight: 44).contentShape(Rectangle())
               }
               .buttonStyle(.plain)
               .accessibilityIdentifier("dialpad.plus")
+            }
+
+            if !pad.isEmpty {
+                // watchOS truncates the native TextField's label. Review the complete recipient here.
+                Text(pad.number)
+                    .font(.system(.body, design: .monospaced))
+                    .lineLimit(2)
+                    .minimumScaleFactor(0.65)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .frame(maxWidth: .infinity)
+                    .accessibilityIdentifier("dialpad.review-number")
+            }
+
+            // Always reachable near the top, independently of the keypad's bottom row.
+            Button { placePhoneCall() } label: {
+                Label("Зателефонувати", systemImage: "phone.fill")
+                    .font(.caption)
+                    .dialpadKey(height: keyHeight, color: .green)
+            }
+            .buttonStyle(.plain)
+            .accessibilityIdentifier("dialpad.call-top")
+#if DEBUG
+            .accessibilityValue(String(describing: dynamicTypeSize))
+#endif
+            .disabled(!pad.isCallable || pad.isDialing)
+
+            if !status.isEmpty {
+                Text(status).font(.caption2).foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .accessibilityIdentifier("dialpad.status")
             }
 
             ForEach(Array(WatchDialpadLayout.rows.indices), id: \.self) { index in
@@ -54,14 +87,6 @@ struct WatchSecureDialerView: View {
                     .disabled(!pad.isCallable || pad.isDialing)
             }
 
-            if !status.isEmpty {
-                Text(status)
-                    .font(.system(size: 10))
-                    .foregroundStyle(.secondary)
-                    .multilineTextAlignment(.center)
-                    .fixedSize(horizontal: false, vertical: true)
-                    .accessibilityIdentifier("dialpad.status")
-            }
           }
           .padding(.horizontal, 4)
           .padding(.bottom, 8)
@@ -109,6 +134,16 @@ private extension View {
 }
 
 private extension WatchSecureDialerView {
+    func commitNumberInput(_ text: String) {
+        guard !pad.isDialing else { return }
+        if pad.replaceFromSystemInput(text) {
+            status = "Перевірте номер і натисніть трубку."
+        } else {
+            status = "Номер не змінено. Диктуйте по одній цифрі; плюс — лише на початку."
+        }
+        // The native TextField edits the number only. No onSubmit/onChange starts a call.
+    }
+
     /// Hands the typed number to the system as a phone call.
     ///
     /// The claim is taken for the hand-over and released straight after, because the system owns the call
@@ -122,7 +157,7 @@ private extension WatchSecureDialerView {
             status = "Enter 3 to 15 digits"
         case let .start(url):
             guard pad.beginDial() else { return }
-            status = "Opening phone…"
+            status = "Передано системному телефону."
             WKApplication.shared().openSystemURL(url)
             pad.endDial()
         }

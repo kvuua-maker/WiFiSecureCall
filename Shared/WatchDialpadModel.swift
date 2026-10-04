@@ -104,6 +104,38 @@ struct WatchDialpadModel: Equatable {
         number = ""
     }
 
+    /// Commits plain text returned by the system input UI. Cancellation is handled by the caller.
+    /// Unknown words or a misplaced plus reject the whole edit, never silently change the recipient.
+    @discardableResult
+    mutating func replaceFromSystemInput(_ text: String) -> Bool {
+        let digitWords: [String: String] = [
+            "плюс": "+", "plus": "+", "нуль": "0", "ноль": "0", "zero": "0",
+            "один": "1", "одна": "1", "одне": "1", "one": "1",
+            "два": "2", "дві": "2", "two": "2", "три": "3", "three": "3",
+            "чотири": "4", "four": "4", "п'ять": "5", "five": "5",
+            "шість": "6", "six": "6", "сім": "7", "seven": "7",
+            "вісім": "8", "eight": "8", "дев'ять": "9", "nine": "9"
+        ]
+        let normalized = text.lowercased()
+            .replacingOccurrences(of: "’", with: "'")
+            .replacingOccurrences(of: "ʼ", with: "'")
+            .replacingOccurrences(of: "+", with: " + ")
+        let tokens = normalized.split { $0.isWhitespace || "-().,".contains($0) }
+        var candidate = ""
+        for token in tokens {
+            let value = digitWords[String(token)] ?? String(token)
+            for character in value {
+                if character == "+", candidate.isEmpty { candidate.append(character) }
+                else if character.isASCII && character.isNumber { candidate.append(character) }
+                else { return false }
+            }
+        }
+        guard candidate.count <= maximumCharacterCount,
+              candidate.filter({ $0.isNumber }).count <= 15 else { return false }
+        number = candidate
+        return true
+    }
+
     /// Claims the one dial request this press is allowed to make.
     ///
     /// The first caller is told yes and every caller until `endDial()` is told no, so a double tap, a

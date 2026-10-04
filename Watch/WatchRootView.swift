@@ -56,12 +56,11 @@ struct WatchRootView: View {
         }
     }
 
-    /// The watch captures and renders both directions of the call itself; no paired iPhone process
-    /// takes part in the media path.
+    /// App-to-app media runs on Watch. A carrier phone call's route is owned by watchOS/carrier.
     private var audioPlacement: String {
         switch session.state {
         case .idle, .ended, .failed:
-            return "Microphone and speaker stay on this Apple Watch"
+            return "Phone calls use the system phone service"
         case .outgoingRinging, .incomingRinging, .connecting, .active, .reconnecting, .ending:
             return session.isMuted ? "Muted on Apple Watch" : "Call audio on Apple Watch"
         }

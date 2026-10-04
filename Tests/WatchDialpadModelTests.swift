@@ -5,6 +5,38 @@ import XCTest
 /// network and no sleeps.
 final class WatchDialpadModelTests: XCTestCase {
 
+    func testSystemInputNormalizesPlusWhitespaceAndDigitDictationWithoutDialing() {
+        var pad = WatchDialpadModel()
+        XCTAssertTrue(pad.replaceFromSystemInput(" плюс три вісім нуль один два три чотири п’ять шість сім вісім девʼять "))
+        XCTAssertEqual(pad.number, "+380123456789")
+        XCTAssertFalse(pad.isDialing)
+        XCTAssertTrue(pad.replaceFromSystemInput(" +1\u{00a0}(202) 555-0100 "))
+        XCTAssertEqual(pad.number, "+12025550100")
+        XCTAssertEqual(pad.dialURL, URL(string: "tel:+12025550100"))
+        XCTAssertFalse(pad.isDialing)
+    }
+
+    func testSystemInputRejectsAmbiguousOrOverlongTextWithoutChangingRecipient() {
+        var pad = WatchDialpadModel()
+        XCTAssertTrue(pad.replaceFromSystemInput("+1 202 555 0100"))
+        for invalid in ["++123", "12+34", "тридцять вісім", "call 123", "1234567890123456", "мінус один два три"] {
+            XCTAssertFalse(pad.replaceFromSystemInput(invalid), invalid)
+            XCTAssertEqual(pad.number, "+12025550100")
+            XCTAssertFalse(pad.isDialing)
+        }
+    }
+
+    func testSystemInputKeepsLeadingZeroAndSupportsSubsequentKeypadEditing() {
+        var pad = WatchDialpadModel()
+        XCTAssertTrue(pad.replaceFromSystemInput("нуль нуль один два три"))
+        XCTAssertEqual(pad.number, "00123")
+        XCTAssertTrue(pad.deleteLast())
+        XCTAssertTrue(pad.append("0"))
+        XCTAssertEqual(pad.number, "00120")
+        XCTAssertTrue(pad.replaceFromSystemInput(""))
+        XCTAssertFalse(pad.isCallable)
+    }
+
     // MARK: - Typing
 
     func testAppendDigit() {
