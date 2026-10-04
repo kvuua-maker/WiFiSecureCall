@@ -1091,9 +1091,13 @@ jobs:
             -allowProvisioningUpdates \
             | tee /tmp/testflight-upload.log
 
-          grep -qE 'Upload succeeded|Delivered your binary|UPLOAD SUCCEEDED' /tmp/testflight-upload.log \
-            || { echo '::error::the TestFlight upload did not report success.'; exit 1; }
-          echo 'Submitted to TestFlight.'
+          # Xcode 27.0 words a successful export "** EXPORT SUCCEEDED **", on the line after
+          # "Uploaded <name>". Earlier releases printed "Upload succeeded", and altool printed
+          # "UPLOAD SUCCEEDED". Run 37201153081 delivered the binary and then failed only this
+          # check, because none of the older phrasings appeared in its log.
+          grep -qE 'EXPORT SUCCEEDED|Upload succeeded|Delivered your binary|UPLOAD SUCCEEDED' /tmp/testflight-upload.log \
+            || { echo '::error::the export did not report success.'; exit 1; }
+          echo 'The export reported success.'
 
       # A delivered binary is not yet a build. This asks App Store Connect for the record it created,
       # by the version and build number the archive carried, and prints the state Apple puts on it. Only
@@ -1131,7 +1135,7 @@ jobs:
           [ -n "$app_id" ] || { echo '::error::no App Store Connect app record for com.vkapps.wifisecurecall was found.'; exit 1; }
           echo "app record: $app_id"
 
-          builds="$(get "/v1/builds?filter\[app\]=$app_id&limit=200" "$RUNNER_TEMP/asc-builds.json")"
+          builds="$(get "/v1/builds?filter\[app\]=$app_id&include=preReleaseVersion&limit=200" "$RUNNER_TEMP/asc-builds.json")"
           echo "GET /v1/builds -> $builds"
 
           python3 - "$RUNNER_TEMP/asc-builds.json" "$VERSION" "$BUILD" <<'PYTHON'
@@ -1142,24 +1146,30 @@ jobs:
               body = json.load(fh)
           version, build = sys.argv[2], sys.argv[3]
 
-          matching = [e for e in body.get("data", [])
-                      if e.get("attributes", {}).get("version") == build]
-          if not matching:
-              known = sorted({e.get("attributes", {}).get("version", "?") for e in body.get("data", [])},
-                             key=lambda v: (len(v), v))
-              print(f"No build {version} ({build}) is listed. Build numbers present: {known}")
-              print("An accepted upload is listed as PROCESSING first and reaches VALID or a rejected state on its own.")
+          versions = {i.get("id"): i.get("attributes", {}).get("versionString")
+                      for i in body.get("included", []) if i.get("type") == "preReleaseVersions"}
+          entries = body.get("data", [])
+
+          # Every build of this app is listed, not only the one this run sent, so the record left by an
+          # earlier run is visible too. A number is spent once Apple accepts it, so the builds already
+          # here are the ones that were really delivered.
+          if not entries:
+              print(f"No builds are listed for this app. Version {version} build {build} was not recorded.")
               raise SystemExit(0)
 
-          for entry in matching:
+          for entry in sorted(entries, key=lambda e: e.get("attributes", {}).get("version", "")):
               attributes = entry.get("attributes", {})
-              print(f"build {attributes.get('version')} of {attributes.get('version')}:")
-              for field in ("processingState", "uploadedDate", "expiringDate", "usesNonExemptEncryption"):
-                  if field in attributes:
-                      print(f"  {field}: {attributes[field]}")
-              for included in body.get("included", []):
-                  if included.get("type") == "preReleaseVersions":
-                      print(f"  preReleaseVersion: {included.get('attributes', {}).get('versionString')}")
+              number = attributes.get("version")
+              state = attributes.get("processingState")
+              marker = " <- this run" if number == build else ""
+              print(f"build {number} of {version}: {state}{marker}")
+              for field in ("uploadedDate", "expiringDate", "usesNonExemptEncryption"):
+                  if attributes.get(field) is not None:
+                      print(f"    {field}: {attributes[field]}")
+              print(f"    preReleaseVersion: {versions.get(entry.get('relationships', {}).get('preReleaseVersion', {}).get('data', {}).get('id'))}")
+
+          if not any(e.get("attributes", {}).get("version") == build for e in entries):
+              print(f"This run sent build {build}, which is not listed. See the export log for what Apple answered.")
           PYTHON
 
       - name: Remove the API key from the workspace
