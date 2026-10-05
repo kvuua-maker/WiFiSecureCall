@@ -22,6 +22,7 @@ final class WatchCallPreparer: ObservableObject {
 
     @Published private(set) var preparation = WatchCallPreparation()
     @Published private(set) var isWarmingUp = false
+    let handoff = WatchCallHandoffCoordinator()
 
     private let monitor: SystemDialNetworkMonitor
     private let networkProbe: WatchNetworkProbe
@@ -52,6 +53,7 @@ final class WatchCallPreparer: ObservableObject {
     /// on the watch face. Nothing learned before this point is reused: the radios may have been torn down,
     /// and a dial claim left open by the suspension is released so the next tap can act.
     func applicationDidBecomeActive() {
+        handoff.applicationDidBecomeActive()
         preparation.invalidateForWake()
         activateCompanion()
         observePath()
@@ -60,9 +62,11 @@ final class WatchCallPreparer: ObservableObject {
 
     /// Called as the app leaves the foreground, which is when the radios may start going away and is also
     /// what a hand-off to the system phone app causes. The path is dropped now rather than on the next return,
-    /// so nothing can act on what was true while this app was visible; the warm-up in flight is left to finish,
-    /// because its result is about the network and not about visibility.
+    /// so nothing can act on what was true while this app was visible. Cancel the warm-up and invalidate
+    /// its generation before a late response can publish into the next foreground attempt.
     func applicationWillResignActive() {
+        handoff.applicationWillResignActive()
+        cancelWarmUp()
         preparation.discardPathObservation()
     }
 
@@ -72,17 +76,22 @@ final class WatchCallPreparer: ObservableObject {
     /// `WatchCallPreparation.warmUpBudget`: a second tap while a warm-up is running joins that warm-up
     /// instead of starting a second one.
     func prepareForHandOff() async -> WatchCallHandoffEvidence {
-        await warmUp()
+        observePath()
+        if preparation.decision() != .handOff { await warmUp() }
         observePath()
         return preparation.handOffEvidence()
     }
 
-    /// Claims the one dial this attempt may make. Released by `finishAttempt` once the hand-off is made, and
-    /// by the next wake in case a suspension stranded it, so no tap sequence can leave the key unable to act.
-    func beginAttempt() -> Bool { preparation.openAttempt() }
-    func finishAttempt() { preparation.closeAttempt() }
+    /// Invalidate before cancellation, so even a non-cooperative late response cannot publish state.
+    func cancelWarmUp() {
+        warmUpGeneration += 1
+        warmUpTask?.cancel()
+        warmUpTask = nil
+        isWarmingUp = false
+    }
 
     private func warmUp() async {
+        guard !Task.isCancelled, handoff.isApplicationActive else { return }
         // A warm-up already running is joined rather than doubled: its result is written into the same state
         // and there is no second network to bring up.
         if let warmUpTask {
@@ -93,17 +102,18 @@ final class WatchCallPreparer: ObservableObject {
         let generation = warmUpGeneration
         let task = Task { @MainActor [weak self] in
             guard let self else { return }
-            await self.runWarmUp()
+            await self.runWarmUp(generation: generation)
         }
         warmUpTask = task
         await task.value
         if warmUpGeneration == generation { warmUpTask = nil }
     }
 
-    private func runWarmUp() async {
+    private func runWarmUp(generation: Int) async {
+        guard generation == warmUpGeneration, !Task.isCancelled else { return }
         isWarmingUp = true
         preparation.noteWarmUpStarted()
-        defer { isWarmingUp = false }
+        defer { if generation == warmUpGeneration { isWarmingUp = false } }
         observePath()
         // Asked for whether or not the path monitor says the watch is up. On watchOS a path that is still
         // coming up is exactly the case this request is meant to finish, so an `unsatisfied` reading is a
@@ -115,6 +125,8 @@ final class WatchCallPreparer: ObservableObject {
             baseURL: NotificationRuntime.shared.api.config.apiBaseURL,
             budget: WatchCallPreparation.warmUpBudget
         )
+        guard generation == warmUpGeneration, !Task.isCancelled,
+              handoff.isApplicationActive else { return }
         switch outcome {
         case .succeeded: preparation.validated(at: Date())
         case .failed: preparation.validationFailed()
@@ -171,6 +183,13 @@ struct WatchNetworkProbe: Sendable {
     /// of a working path; anything else is reported as what it is, without being retried behind the owner's
     /// back.
     func probe(baseURL: URL, budget: TimeInterval) async -> Outcome {
+#if DEBUG
+        // Deterministic UI cancellation window, absent from the Release build.
+        if ProcessInfo.processInfo.arguments.contains("--uitest-delayed-carrier-preparation") {
+            try? await Task.sleep(nanoseconds: 2_000_000_000)
+            return .failed("uitest_preparation")
+        }
+#endif
         var request = URLRequest(url: baseURL.appendingPathComponent("health"))
         request.httpMethod = "GET"
         request.timeoutInterval = max(0.25, min(budget, WatchCallPreparation.warmUpBudget))

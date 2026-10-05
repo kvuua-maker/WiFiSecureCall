@@ -1,4 +1,5 @@
 import Foundation
+import Combine
 
 /// What the watch knows about its own path to the network at one moment.
 ///
@@ -221,5 +222,110 @@ extension WatchCallHandoffEvidence {
         case .withProvenPath: return nil
         case let .withoutProvenPath(blocker): return "Мережа Watch не підтверджена: \(blocker.displayText)"
         }
+    }
+}
+
+/// Owns the asynchronous attempt, not the SwiftUI screen's transient value. A handoff is committed
+/// once on the main actor; neither a cancelled preparation nor an old screen can unlock a newer one.
+@MainActor
+final class WatchCallHandoffCoordinator: ObservableObject {
+    enum Phase: Equatable { case idle, preparing, handedOff }
+    @Published private(set) var phase: Phase = .idle
+    /// Action invocations only, never evidence of a connected call or audio.
+    @Published private(set) var handoffCount = 0
+    private(set) var isApplicationActive = true
+    var isBusy: Bool { phase != .idle }
+
+    private struct Attempt { let id: UUID; let owner: UUID }
+    private var attempt: Attempt?
+    private var visibleOwner: UUID?
+    private var preparationTask: Task<Void, Never>?
+    private var transitionTask: Task<Void, Never>?
+    private var cancelPreparation: (() -> Void)?
+    private let transitionDelay: TimeInterval
+    private let sleep: (TimeInterval) async throws -> Void
+
+    init(transitionDelay: TimeInterval = 3,
+         sleep: @escaping (TimeInterval) async throws -> Void = {
+             try await Task.sleep(nanoseconds: UInt64($0 * 1_000_000_000))
+         }) {
+        self.transitionDelay = transitionDelay
+        self.sleep = sleep
+    }
+
+    func screenDidAppear(owner: UUID) {
+        if phase == .preparing, attempt?.owner != owner { clearAttempt(cancelNetwork: true) }
+        visibleOwner = owner
+    }
+
+    func screenDidDisappear(owner: UUID) {
+        guard visibleOwner == owner else { return }
+        visibleOwner = nil
+        if phase == .preparing, attempt?.owner == owner { clearAttempt(cancelNetwork: true) }
+        // A system handoff may itself hide the screen. Keep its guard until the app returns.
+    }
+
+    func applicationWillResignActive() {
+        isApplicationActive = false
+        if phase == .preparing { clearAttempt(cancelNetwork: true) }
+        transitionTask?.cancel()
+        transitionTask = nil
+    }
+
+    func applicationDidBecomeActive() {
+        let returning = !isApplicationActive
+        isApplicationActive = true
+        if returning, phase == .handedOff { clearAttempt(cancelNetwork: false) }
+        // Duplicate active notifications must not release an in-flight handoff.
+    }
+
+    @discardableResult
+    func begin(owner: UUID,
+               prepare: @escaping () async -> WatchCallHandoffEvidence,
+               cancelPreparation: @escaping () -> Void,
+               handoff: @escaping (WatchCallHandoffEvidence) -> Void) -> Bool {
+        guard isApplicationActive, visibleOwner == owner, attempt == nil else { return false }
+        let current = Attempt(id: UUID(), owner: owner)
+        attempt = current
+        self.cancelPreparation = cancelPreparation
+        phase = .preparing
+        preparationTask = Task { @MainActor [weak self] in
+            let evidence = await prepare()
+            guard let self, !Task.isCancelled, self.attempt?.id == current.id,
+                  self.visibleOwner == owner, self.isApplicationActive,
+                  self.phase == .preparing else { return }
+            self.preparationTask = nil
+            self.cancelPreparation = nil
+            self.phase = .handedOff
+            self.handoffCount += 1
+            self.armTransitionFallback(for: current.id)
+            // No await between the final identity check, committing the guard, and openSystemURL.
+            handoff(evidence)
+        }
+        return true
+    }
+
+    private func armTransitionFallback(for id: UUID) {
+        // openSystemURL has no completion/error callback. If the OS refuses it without leaving this
+        // app (also normal in Simulator), allow a deliberate retry after a bounded debounce.
+        transitionTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            do { try await self.sleep(self.transitionDelay) } catch { return }
+            guard !Task.isCancelled, self.attempt?.id == id,
+                  self.phase == .handedOff, self.isApplicationActive else { return }
+            self.clearAttempt(cancelNetwork: false)
+        }
+    }
+
+    private func clearAttempt(cancelNetwork: Bool) {
+        let cancel = cancelPreparation
+        attempt = nil
+        cancelPreparation = nil
+        preparationTask?.cancel()
+        preparationTask = nil
+        transitionTask?.cancel()
+        transitionTask = nil
+        phase = .idle
+        if cancelNetwork { cancel?() }
     }
 }

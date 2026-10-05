@@ -71,6 +71,64 @@ final class WatchDialerUITests: XCTestCase {
         XCTAssertEqual(XCTWaiter().wait(for: [expectation], timeout: timeout), .completed, "status never became: \(text)")
     }
 
+    private func expectCallEnabled() {
+        let ready = XCTNSPredicateExpectation(predicate: NSPredicate(format: "enabled == true"),
+                                              object: app.buttons["dialpad.call"])
+        XCTAssertEqual(XCTWaiter().wait(for: [ready], timeout: 6), .completed,
+                       "A refused handoff or system return must release the handset")
+    }
+
+    private func enterFictionalNumber() {
+        app.textFields["dialpad.edit-number"].tap()
+        XCTAssertTrue(app.buttons["Done"].waitForExistence(timeout: 8))
+        app.textViews.element(boundBy: 1).typeText("+1 202 555 0100")
+        app.buttons["Done"].tap()
+        expectNumber("+12025550100")
+    }
+
+    func testDismissDuringPreparationThenReturnAndRetryHasOneHandoff() {
+        app.launchArguments = ["--uitest-delayed-carrier-preparation"]
+        app.launch()
+        app.buttons["Call number"].tap()
+        enterFictionalNumber()
+        reveal(app.buttons["dialpad.call"])
+        app.buttons["dialpad.call"].tap()
+        app.buttons.matching(identifier: "close-sheet").firstMatch.tap()
+        XCTAssertTrue(app.buttons["Call number"].waitForExistence(timeout: 3))
+        app.buttons["Call number"].tap()
+        enterFictionalNumber()
+        // System entry took longer than the old probe: its late result must not dial the old number.
+        XCTAssertEqual(app.staticTexts["dialpad.status"].value as? String, "0")
+        XCTAssertEqual(app.staticTexts["dialpad.status"].label, "Перевірте номер і натисніть трубку.")
+        reveal(app.buttons["dialpad.call"])
+        app.buttons["dialpad.call"].tap()
+        expectStatus(awaitingOwnerConfirmationText)
+        XCTAssertEqual(app.staticTexts["dialpad.status"].value as? String, "1")
+        expectCallEnabled()
+        snapshot("cancel-return-single-handoff")
+    }
+
+    func testRapidDoubleTapAndRefusedHandoffRetry() {
+        app.launchArguments = ["--uitest-delayed-carrier-preparation"]
+        app.launch()
+        app.buttons["Call number"].tap()
+        enterFictionalNumber()
+        let call = app.buttons["dialpad.call"]
+        reveal(call)
+        call.doubleTap()
+        expectStatus(awaitingOwnerConfirmationText)
+        XCTAssertEqual(app.staticTexts["dialpad.status"].value as? String, "1")
+        XCTAssertFalse(call.isEnabled, "Post-handoff guard must remain held until system transition")
+        expectCallEnabled()
+        // Status remains unchanged, so use the action count to prove a second real handoff.
+        call.tap()
+        let second = XCTNSPredicateExpectation(predicate: NSPredicate(format: "value == %@", "2"),
+                                               object: app.staticTexts["dialpad.status"])
+        XCTAssertEqual(XCTWaiter().wait(for: [second], timeout: 8), .completed)
+        expectCallEnabled()
+        snapshot("double-tap-then-explicit-retry")
+    }
+
     func testPrimaryDialerAllKeysAndVisibleEdges() {
         app.buttons["Call number"].tap()
         XCTAssertTrue(app.buttons["dialpad.1"].waitForExistence(timeout: 3))
@@ -151,7 +209,7 @@ final class WatchDialerUITests: XCTestCase {
         expectStatus(awaitingOwnerConfirmationText)
         snapshot("upper-call-action-handoff-only")
         // A refused system call must not permanently latch the handset or erase the recipient.
-        XCTAssertTrue(call.isEnabled)
+        expectCallEnabled()
         press("delete", atEdge: true)
         expectNumber("+1202555010")
         XCTAssertEqual(app.staticTexts["dialpad.status"].label, "Перевірте номер і натисніть трубку.")
@@ -160,6 +218,7 @@ final class WatchDialerUITests: XCTestCase {
         press("call", atEdge: true)
         expectStatus(awaitingOwnerConfirmationText)
         // The second attempt after a refused hand-off must reach the system too, not stop at a held latch.
+        expectCallEnabled()
         press("delete", atEdge: true)
         press("0", atEdge: true)
         expectNumber("+12025550100")

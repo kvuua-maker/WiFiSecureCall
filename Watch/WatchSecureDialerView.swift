@@ -18,6 +18,8 @@ struct WatchSecureDialerView: View {
     @StateObject private var store = AccountSessionStore.shared
     @ObservedObject private var carrierCall = WatchCarrierCallObserver.shared
     @ObservedObject private var preparer = WatchCallPreparer.shared
+    @ObservedObject private var handoff = WatchCallPreparer.shared.handoff
+    @State private var dialerOwnerID = UUID()
     @State private var pad = WatchDialpadModel()
     @State private var status = ""
     var showsSecureAccountCall = true
@@ -41,12 +43,13 @@ struct WatchSecureDialerView: View {
                 .contentShape(Rectangle())
               .accessibilityIdentifier("dialpad.edit-number")
               .accessibilityHint("Ввести або продиктувати номер")
-              .disabled(pad.isDialing)
+              .disabled(isDialing)
               Button { appendKey("+") } label: {
                   Text("+").frame(minWidth: 44, minHeight: 44).contentShape(Rectangle())
               }
               .buttonStyle(.plain)
               .accessibilityIdentifier("dialpad.plus")
+              .disabled(isDialing)
             }
 
             if !pad.isEmpty {
@@ -71,12 +74,15 @@ struct WatchSecureDialerView: View {
 #if DEBUG
             .accessibilityValue(String(describing: dynamicTypeSize))
 #endif
-            .disabled(!pad.isCallable || pad.isDialing)
+            .disabled(!pad.isCallable || isDialing)
 
             if !visibleStatus.isEmpty {
                 Text(visibleStatus).font(.caption2).foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
                     .accessibilityIdentifier("dialpad.status")
+#if DEBUG
+                    .accessibilityValue(String(handoff.handoffCount))
+#endif
             }
 
             // Only the case where it changes what a failure means: the number went to the system on a path
@@ -95,13 +101,14 @@ struct WatchSecureDialerView: View {
                         cell(for: key)
                     }
                 }
+                .disabled(isDialing)
             }
 
             if showsSecureAccountCall {
                 Text(accountState).font(.caption2).foregroundStyle(.secondary)
                 Button("Call app user") { startSecureCall() }
                     .font(.caption2)
-                    .disabled(!pad.isCallable || pad.isDialing)
+                    .disabled(!pad.isCallable || isDialing)
             }
 
           }
@@ -109,6 +116,8 @@ struct WatchSecureDialerView: View {
           .padding(.bottom, 8)
         }
         .accessibilityIdentifier("dialpad.scroll")
+        .onAppear { handoff.screenDidAppear(owner: dialerOwnerID) }
+        .onDisappear { handoff.screenDidDisappear(owner: dialerOwnerID) }
     }
 
     @ViewBuilder
@@ -147,6 +156,7 @@ private extension View {
 }
 
 private extension WatchSecureDialerView {
+    var isDialing: Bool { pad.isDialing || handoff.isBusy }
     /// What the screen says about the attempt, newest first.
     ///
     /// Once a number has been handed over the verdict replaces the editing hint. A line about the number
@@ -157,6 +167,7 @@ private extension WatchSecureDialerView {
     }
 
     func appendKey(_ key: Character) {
+        guard !isDialing else { return }
         if pad.append(key) { numberDidChange() }
     }
 
@@ -171,7 +182,7 @@ private extension WatchSecureDialerView {
     func commitNumberInput(_ text: String) {
         // Native watchOS input can reflect the accepted value back into this binding after an
         // invalid edit. That is not another user edit and must not erase the rejection message.
-        guard !pad.isDialing, text != pad.number else { return }
+        guard !isDialing, text != pad.number else { return }
         if pad.replaceFromSystemInput(text) {
             numberDidChange()
         } else {
@@ -188,10 +199,8 @@ private extension WatchSecureDialerView {
     /// has not finished bringing up. So the network is asked for first, bounded so the key cannot hang, and
     /// the number is handed over either way — the system phone app may have a path this app cannot see.
     ///
-    /// The dial claim is taken before the warm-up, so a second tap during it joins the same attempt instead
-    /// of opening another, and released before the hand-off is made. Holding it across the hand-off is what
-    /// a suspension strands: watchOS can suspend the app inside that statement and never come back to
-    /// release it, which is exactly how a call key stops working for every later tap.
+    /// The coordinator owns the task and keeps the claim across system handoff. Dismissal cancels
+    /// preparation; returning from the system releases the claim without relying on this closure resuming.
     func placePhoneCall() {
         switch pad.dialDecision {
         case .noNumber:
@@ -199,14 +208,10 @@ private extension WatchSecureDialerView {
         case .invalidNumber:
             status = "Введіть від 3 до 15 цифр."
         case let .start(url):
-            guard pad.beginDial() else { return }
-            // Two claims for one dial: the keypad's own, and the app-wide one. If the second is already
-            // held, the first is released here rather than left disabling the screen it belongs to.
-            guard preparer.beginAttempt() else { pad.endDial(); return }
-            Task { @MainActor in
-                let evidence = await preparer.prepareForHandOff()
-                pad.endDial()
-                preparer.finishAttempt()
+            guard !pad.isDialing else { return }
+            handoff.begin(owner: dialerOwnerID,
+                          prepare: { await preparer.prepareForHandOff() },
+                          cancelPreparation: { preparer.cancelWarmUp() }) { evidence in
                 carrierCall.requestHandoff()
                 carrierCall.noteHandoffEvidence(evidence)
                 WKApplication.shared().openSystemURL(url)

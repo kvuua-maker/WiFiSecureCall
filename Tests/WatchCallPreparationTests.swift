@@ -1,5 +1,188 @@
 import XCTest
 
+/// Exercises the same task owner and commit point used by the production Watch dialer. Gates
+/// deliberately ignore cancellation: correctness must not depend on URLSession responding promptly.
+@MainActor
+final class WatchCallHandoffCoordinatorTests: XCTestCase {
+    private let evidence = WatchCallHandoffEvidence.withoutProvenPath(.validationFailed)
+
+    private final class Gate {
+        private var waiters: [CheckedContinuation<Void, Never>] = []
+        var count: Int { waiters.count }
+        func wait() async { await withCheckedContinuation { waiters.append($0) } }
+        func release() { waiters.removeFirst().resume() }
+    }
+
+    private func eventually(_ condition: () -> Bool, file: StaticString = #filePath, line: UInt = #line) async {
+        for _ in 0..<1000 {
+            if condition() { return }
+            await Task.yield()
+        }
+        XCTFail("Main-actor task did not reach the expected state", file: file, line: line)
+    }
+
+    private func drain() async { for _ in 0..<20 { await Task.yield() } }
+
+    func testClosingDuringPreparationCancelsAndRejectsLateResponse() async {
+        let gate = Gate(), owner = UUID()
+        let coordinator = WatchCallHandoffCoordinator()
+        var cancelled = 0, opened = 0
+        coordinator.screenDidAppear(owner: owner)
+        XCTAssertTrue(coordinator.begin(owner: owner, prepare: {
+            await gate.wait(); return self.evidence
+        }, cancelPreparation: { cancelled += 1 }, handoff: { _ in opened += 1 }))
+        await eventually { gate.count == 1 }
+        coordinator.screenDidDisappear(owner: owner)
+        XCTAssertEqual(cancelled, 1)
+        XCTAssertEqual(coordinator.phase, .idle)
+        gate.release()
+        await drain()
+        XCTAssertEqual(opened, 0)
+        XCTAssertEqual(coordinator.handoffCount, 0)
+    }
+
+    func testReturnAndRetryCannotBeCompletedOrUnlockedByOldRequest() async {
+        let old = Gate(), new = Gate(), delay = Gate()
+        let coordinator = WatchCallHandoffCoordinator(sleep: { _ in await delay.wait() })
+        let oldOwner = UUID(), newOwner = UUID()
+        var opened: [String] = []
+        coordinator.screenDidAppear(owner: oldOwner)
+        coordinator.begin(owner: oldOwner, prepare: {
+            await old.wait(); return self.evidence
+        }, cancelPreparation: {}, handoff: { _ in opened.append("old") })
+        await eventually { old.count == 1 }
+        coordinator.screenDidDisappear(owner: oldOwner)
+        coordinator.screenDidAppear(owner: newOwner)
+        XCTAssertTrue(coordinator.begin(owner: newOwner, prepare: {
+            await new.wait(); return self.evidence
+        }, cancelPreparation: {}, handoff: { _ in opened.append("new") }))
+        await eventually { new.count == 1 }
+        old.release()
+        coordinator.screenDidDisappear(owner: oldOwner) // delayed callback from dismissed view
+        await drain()
+        XCTAssertEqual(coordinator.phase, .preparing)
+        XCTAssertTrue(opened.isEmpty)
+        new.release()
+        await eventually { delay.count == 1 }
+        XCTAssertEqual(opened, ["new"])
+        XCTAssertEqual(coordinator.handoffCount, 1)
+        delay.release()
+        await eventually { !coordinator.isBusy }
+    }
+
+    func testRapidDoubleTapHasOnePreparationAndOneHandoffAndKeepsGuard() async {
+        let preparation = Gate(), delay = Gate(), owner = UUID()
+        let coordinator = WatchCallHandoffCoordinator(sleep: { _ in await delay.wait() })
+        var opened = 0, prepared = 0
+        coordinator.screenDidAppear(owner: owner)
+        func tap() -> Bool {
+            coordinator.begin(owner: owner, prepare: {
+                prepared += 1; await preparation.wait(); return self.evidence
+            }, cancelPreparation: {}, handoff: { _ in opened += 1 })
+        }
+        XCTAssertTrue(tap())
+        XCTAssertFalse(tap())
+        await eventually { preparation.count == 1 }
+        preparation.release()
+        await eventually { delay.count == 1 }
+        XCTAssertEqual(opened, 1)
+        XCTAssertEqual(prepared, 1)
+        XCTAssertFalse(tap(), "Guard must remain held after openSystemURL, before system transition")
+        coordinator.applicationDidBecomeActive() // duplicate callback, not a return
+        XCTAssertFalse(tap())
+        delay.release()
+        await eventually { !coordinator.isBusy }
+    }
+
+    func testSystemReturnReleasesHandoffEvenIfScreenWasDismissed() async {
+        let delay = Gate(), owner = UUID()
+        let coordinator = WatchCallHandoffCoordinator(sleep: { _ in await delay.wait() })
+        coordinator.screenDidAppear(owner: owner)
+        coordinator.begin(owner: owner, prepare: { self.evidence }, cancelPreparation: {}, handoff: { _ in })
+        await eventually { delay.count == 1 }
+        coordinator.screenDidDisappear(owner: owner)
+        XCTAssertTrue(coordinator.isBusy)
+        coordinator.applicationWillResignActive()
+        XCTAssertTrue(coordinator.isBusy)
+        coordinator.applicationDidBecomeActive()
+        XCTAssertFalse(coordinator.isBusy)
+        coordinator.screenDidAppear(owner: owner)
+        let next = Gate()
+        XCTAssertTrue(coordinator.begin(owner: owner, prepare: {
+            await next.wait(); return self.evidence
+        }, cancelPreparation: {}, handoff: { _ in XCTFail("Cancelled retry dialled") }))
+        await eventually { next.count == 1 }
+        delay.release() // cancelled old fallback cannot unlock this new preparation
+        await drain()
+        XCTAssertEqual(coordinator.phase, .preparing)
+        coordinator.screenDidDisappear(owner: owner)
+        next.release()
+        await drain()
+    }
+
+    func testBackgroundDuringPreparationCancelsAndAllowsFreshRetry() async {
+        let gate = Gate(), owner = UUID()
+        let coordinator = WatchCallHandoffCoordinator()
+        var cancelled = 0
+        coordinator.screenDidAppear(owner: owner)
+        coordinator.begin(owner: owner, prepare: {
+            await gate.wait(); return self.evidence
+        }, cancelPreparation: { cancelled += 1 }, handoff: { _ in XCTFail("Background attempt dialled") })
+        await eventually { gate.count == 1 }
+        coordinator.applicationWillResignActive()
+        XCTAssertEqual(cancelled, 1)
+        XCTAssertFalse(coordinator.begin(owner: owner, prepare: { self.evidence },
+                                          cancelPreparation: {}, handoff: { _ in XCTFail() }))
+        coordinator.applicationDidBecomeActive()
+        gate.release()
+        await drain()
+        XCTAssertEqual(coordinator.handoffCount, 0)
+        XCTAssertFalse(coordinator.isBusy)
+        let retry = expectation(description: "fresh retry handed off")
+        XCTAssertTrue(coordinator.begin(owner: owner, prepare: { self.evidence },
+                                         cancelPreparation: {}, handoff: { _ in retry.fulfill() }))
+        await fulfillment(of: [retry], timeout: 1)
+        coordinator.applicationWillResignActive()
+        coordinator.applicationDidBecomeActive()
+    }
+
+    func testRefusedSystemTransitionHasBoundedUnlockAndCanRetry() async {
+        let delay = Gate(), owner = UUID()
+        let coordinator = WatchCallHandoffCoordinator(sleep: { seconds in
+            XCTAssertEqual(seconds, 3); await delay.wait()
+        })
+        coordinator.screenDidAppear(owner: owner)
+        var opened = 0
+        for expected in 1...2 {
+            XCTAssertTrue(coordinator.begin(owner: owner, prepare: { self.evidence }, cancelPreparation: {}, handoff: {
+                XCTAssertEqual($0, self.evidence, "Failed health check must not block the system route")
+                opened += 1
+            }))
+            await eventually { delay.count == 1 }
+            XCTAssertEqual(opened, expected)
+            XCTAssertTrue(coordinator.isBusy)
+            delay.release()
+            await eventually { !coordinator.isBusy }
+        }
+        XCTAssertEqual(coordinator.handoffCount, 2)
+    }
+
+    func testReentrantSystemLifecycleCannotStrandButton() async {
+        let coordinator = WatchCallHandoffCoordinator(), owner = UUID()
+        coordinator.screenDidAppear(owner: owner)
+        let opened = expectation(description: "system action")
+        coordinator.begin(owner: owner, prepare: { self.evidence }, cancelPreparation: {}, handoff: { _ in
+            XCTAssertTrue(coordinator.isBusy, "Guard must be committed before invoking the system")
+            coordinator.applicationWillResignActive()
+            coordinator.applicationDidBecomeActive()
+            opened.fulfill()
+        })
+        await fulfillment(of: [opened], timeout: 1)
+        XCTAssertFalse(coordinator.isBusy)
+        XCTAssertEqual(coordinator.handoffCount, 1)
+    }
+}
+
 /// The watch keeps its radios switched off while the iPhone is not nearby, and nothing learned before a
 /// sleep survives one. These are the rules that decide how much of the watch's own network is brought up
 /// before a number is handed to the system, and they are values so they can be checked without a watch.
