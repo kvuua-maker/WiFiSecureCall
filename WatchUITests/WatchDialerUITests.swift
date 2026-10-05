@@ -60,6 +60,17 @@ final class WatchDialerUITests: XCTestCase {
         XCTAssertEqual(app.textFields["dialpad.edit-number"].value as? String, value)
     }
 
+    /// Waits for the status line to reach a given text.
+    ///
+    /// Existence is not enough any more: the call key now brings the watch's own network up before the number
+    /// reaches the system, so the hand-off text arrives up to one warm-up budget after the line appears. A
+    /// read on appearance would assert against whatever the preparation happened to be showing.
+    private func expectStatus(_ text: String, timeout: TimeInterval = 15) {
+        let status = app.staticTexts["dialpad.status"]
+        let expectation = XCTNSPredicateExpectation(predicate: NSPredicate(format: "label == %@", text), object: status)
+        XCTAssertEqual(XCTWaiter().wait(for: [expectation], timeout: timeout), .completed, "status never became: \(text)")
+    }
+
     func testPrimaryDialerAllKeysAndVisibleEdges() {
         app.buttons["Call number"].tap()
         XCTAssertTrue(app.buttons["dialpad.1"].waitForExistence(timeout: 3))
@@ -105,8 +116,7 @@ final class WatchDialerUITests: XCTestCase {
         for digit in ["1", "2", "0", "2", "5", "5", "5", "0", "1", "0", "0"] { press(digit) }
         XCTAssertTrue(app.buttons["dialpad.call"].isEnabled)
         press("call", atEdge: true)
-        XCTAssertTrue(app.staticTexts["dialpad.status"].waitForExistence(timeout: 3))
-        XCTAssertEqual(app.staticTexts["dialpad.status"].label, awaitingOwnerConfirmationText)
+        expectStatus(awaitingOwnerConfirmationText)
         snapshot("carrier-handset-handoff-only")
         // This verifies the action was invoked, NOT ringing, connection or two-way telephone audio.
     }
@@ -138,7 +148,7 @@ final class WatchDialerUITests: XCTestCase {
         app.buttons["Cancel"].tap()
         expectNumber("+12025550100")
         call.coordinate(withNormalizedOffset: CGVector(dx: 0.15, dy: 0.5)).tap()
-        XCTAssertEqual(app.staticTexts["dialpad.status"].label, awaitingOwnerConfirmationText)
+        expectStatus(awaitingOwnerConfirmationText)
         snapshot("upper-call-action-handoff-only")
         // A refused system call must not permanently latch the handset or erase the recipient.
         XCTAssertTrue(call.isEnabled)
@@ -148,7 +158,13 @@ final class WatchDialerUITests: XCTestCase {
         press("0", atEdge: true)
         expectNumber("+12025550100")
         press("call", atEdge: true)
-        XCTAssertEqual(app.staticTexts["dialpad.status"].label, awaitingOwnerConfirmationText)
+        expectStatus(awaitingOwnerConfirmationText)
+        // The second attempt after a refused hand-off must reach the system too, not stop at a held latch.
+        press("delete", atEdge: true)
+        press("0", atEdge: true)
+        expectNumber("+12025550100")
+        press("call", atEdge: true)
+        expectStatus(awaitingOwnerConfirmationText)
     }
 
     func testSystemInputRejectsWrongRecipientAndRequiresExplicitCall() {

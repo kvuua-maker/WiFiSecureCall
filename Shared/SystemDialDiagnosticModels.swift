@@ -275,6 +275,7 @@ final class SystemDialNetworkMonitor: @unchecked Sendable {
     private let monitor: NWPathMonitor
     private let queue = DispatchQueue(label: "com.vkapps.wifisecurecall.systemDial.network")
     private var snapshot = SystemDialNetworkSnapshot.unknown
+    private var updatedAt: Date?
 
     init(monitor: NWPathMonitor = NWPathMonitor()) {
         self.monitor = monitor
@@ -286,8 +287,15 @@ final class SystemDialNetworkMonitor: @unchecked Sendable {
 
     var current: SystemDialNetworkSnapshot { lock.withLock { snapshot } }
 
+    /// The path and when it was last observed.
+    ///
+    /// The timestamp is what makes a path believable: a watch that reported Wi-Fi an hour ago may be nowhere
+    /// near it, and `NWPathMonitor` will not have said so yet, so anything acting on the network has to know
+    /// how old the observation is. `updatedAt` is nil until the first callback arrives.
+    var observed: (snapshot: SystemDialNetworkSnapshot, updatedAt: Date?) { lock.withLock { (snapshot, updatedAt) } }
+
     private func setSnapshot(_ value: SystemDialNetworkSnapshot) {
-        lock.withLock { snapshot = value }
+        lock.withLock { snapshot = value; updatedAt = Date() }
     }
 
     private static func snapshot(from path: NWPath) -> SystemDialNetworkSnapshot {

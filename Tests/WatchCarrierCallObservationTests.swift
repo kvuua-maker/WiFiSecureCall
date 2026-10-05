@@ -234,117 +234,35 @@ final class WatchCarrierCallObservationTests: XCTestCase {
         XCTAssertTrue(WatchCarrierCallVerdict.awaitingOwnerConfirmation.displayText.contains("Виклик"))
     }
 
-    // MARK: - What the watch could establish about this route
+    // MARK: - What the hand-off itself was given, so a later failure can be read
 
-    func testEveryRequirementIsListedExactlyOnce() {
-        let rows = WatchCarrierCallRequirements.evaluate(
-            network: SystemDialNetworkSnapshot(status: "satisfied", interfaces: ["wifi"]),
-            paired: true,
-            verdict: .awaitingOwnerConfirmation
-        )
-        XCTAssertEqual(rows.map(\.id), WatchCarrierCallRequirementID.allCases)
-        XCTAssertEqual(Set(rows.map(\.id)).count, rows.count)
+    func testAHandOffRemembersThePathItWasGiven() {
+        var report = WatchCarrierCallReport()
+        report.requestHandoff(at: start)
+        report.noteHandoffEvidence(.withoutProvenPath(.pathUnsatisfied))
+        XCTAssertEqual(report.handoffEvidence, .withoutProvenPath(.pathUnsatisfied))
     }
 
-    func testAWatchOnWiFiSatisfiesTheRoutesItCanActuallySee() {
-        let rows = WatchCarrierCallRequirements.evaluate(
-            network: SystemDialNetworkSnapshot(status: "satisfied", interfaces: ["wifi"]),
-            paired: true,
-            verdict: .awaitingOwnerConfirmation
-        )
-        XCTAssertEqual(rows.first { $0.id == .watchHasNetwork }?.state, .satisfied)
-        XCTAssertEqual(rows.first { $0.id == .watchHasWiFiPath }?.state, .satisfied)
-        XCTAssertEqual(rows.first { $0.id == .watchPairedToIPhone }?.state, .satisfied)
+    func testAProvenPathCarriesNoCaution() {
+        var report = WatchCarrierCallReport()
+        report.requestHandoff(at: start)
+        report.noteHandoffEvidence(.withProvenPath(validatedAt: start))
+        XCTAssertNil(report.handoffEvidence?.caution)
     }
 
-    func testAWatchWithoutANetworkCannotBeToldToCall() {
-        for network in [
-            SystemDialNetworkSnapshot(status: "unsatisfied", interfaces: []),
-            SystemDialNetworkSnapshot(status: "requiresConnection", interfaces: ["wifi"])
-        ] {
-            let rows = WatchCarrierCallRequirements.evaluate(network: network, paired: true, verdict: .awaitingOwnerConfirmation)
-            XCTAssertEqual(rows.first { $0.id == .watchHasNetwork }?.state, .unmet, "\(network)")
-            XCTAssertEqual(rows.first { $0.id == .watchHasWiFiPath }?.state, .unmet, "\(network)")
-        }
+    func testASecondHandoffDoesNotInheritTheFirstPathsEvidence() {
+        var report = WatchCarrierCallReport()
+        report.requestHandoff(at: start)
+        report.noteHandoffEvidence(.withoutProvenPath(.validationFailed))
+        report.requestHandoff(at: start.addingTimeInterval(60))
+        XCTAssertNil(report.handoffEvidence, "A proof belongs to the number it was made for.")
     }
 
-    func testACellularOnlyWatchSaysSoRatherThanClaimingWiFi() {
-        let rows = WatchCarrierCallRequirements.evaluate(
-            network: SystemDialNetworkSnapshot(status: "satisfied", interfaces: ["cellular"]),
-            paired: true,
-            verdict: .awaitingOwnerConfirmation
-        )
-        XCTAssertEqual(rows.first { $0.id == .watchHasNetwork }?.state, .satisfied)
-        XCTAssertEqual(rows.first { $0.id == .watchHasWiFiPath }?.state, .unmet)
-    }
-
-    func testAnUnpairedWatchIsReportedAsSuch() {
-        let rows = WatchCarrierCallRequirements.evaluate(
-            network: SystemDialNetworkSnapshot(status: "satisfied", interfaces: ["wifi"]),
-            paired: false,
-            verdict: .awaitingOwnerConfirmation
-        )
-        XCTAssertEqual(rows.first { $0.id == .watchPairedToIPhone }?.state, .unmet)
-    }
-
-    func testUnknownPairingIsNotTheSameAsUnpaired() {
-        let rows = WatchCarrierCallRequirements.evaluate(
-            network: SystemDialNetworkSnapshot(status: "satisfied", interfaces: ["wifi"]),
-            paired: nil,
-            verdict: .awaitingOwnerConfirmation
-        )
-        XCTAssertEqual(rows.first { $0.id == .watchPairedToIPhone }?.state, .notDetectable)
-    }
-
-    func testTheCarriersHalfOfThisRouteIsNeverClaimedAsSatisfied() {
-        let rows = WatchCarrierCallRequirements.evaluate(
-            network: SystemDialNetworkSnapshot(status: "satisfied", interfaces: ["wifi"]),
-            paired: true,
-            verdict: .connected
-        )
-        for id in [WatchCarrierCallRequirementID.carrierOffersWiFiCalling, .allowCallsOnOtherDevices, .iPhoneHasUsedThisWiFi] {
-            XCTAssertEqual(rows.first { $0.id == id }?.state, .notDetectable, "\(id)")
-        }
-    }
-
-    func testConfirmationFollowsWhatTheSystemReported() {
-        func state(_ verdict: WatchCarrierCallVerdict) -> WatchCarrierCallRequirementState? {
-            WatchCarrierCallRequirements.evaluate(
-                network: SystemDialNetworkSnapshot(status: "satisfied", interfaces: ["wifi"]),
-                paired: true,
-                verdict: verdict
-            ).first { $0.id == .ownerConfirmsOnWatch }?.state
-        }
-        XCTAssertEqual(state(.notRequested), .notDetectable)
-        XCTAssertEqual(state(.awaitingOwnerConfirmation), .unmet)
-        XCTAssertEqual(state(.observedOutgoing), .satisfied)
-        XCTAssertEqual(state(.connected), .satisfied)
-        XCTAssertEqual(state(.endedBeforeConnecting), .satisfied)
-        XCTAssertEqual(state(.notObserved), .notDetectable)
-    }
-
-    func testTheOwnerStepsAppearInTheRequirementsAndNotOnlyInProse() {
-        let rows = WatchCarrierCallRequirements.evaluate(
-            network: SystemDialNetworkSnapshot(status: "satisfied", interfaces: ["wifi"]),
-            paired: true,
-            verdict: .awaitingOwnerConfirmation
-        )
-        let text = rows.map(WatchCarrierCallRequirements.displayText(for:)).joined(separator: "\n")
-        XCTAssertTrue(text.contains("Виклики по Wi-Fi на цьому iPhone"), text)
-        XCTAssertTrue(text.contains("Додати виклики по Wi-Fi для інших пристроїв"), text)
-        XCTAssertTrue(text.contains("Wi-Fi мережа, до якої iPhone вже підключався"), text)
-    }
-
-    func testEveryRequirementRowRenders() {
-        let rows = WatchCarrierCallRequirements.evaluate(
-            network: SystemDialNetworkSnapshot(status: "satisfied", interfaces: ["wifi"]),
-            paired: true,
-            verdict: .notObserved
-        )
-        for row in rows {
-            let text = WatchCarrierCallRequirements.displayText(for: row)
-            XCTAssertFalse(text.isEmpty, "\(row.id)")
-            XCTAssertTrue(text.hasPrefix("OK ") || text.hasPrefix("НІ ") || text.hasPrefix("— "), "\(row.id) → \(text)")
-        }
+    func testDiscardingAlsoForgetsThePathEvidence() {
+        var report = WatchCarrierCallReport()
+        report.requestHandoff(at: start)
+        report.noteHandoffEvidence(.withoutProvenPath(.pathUnsatisfied))
+        report.discard()
+        XCTAssertEqual(report, WatchCarrierCallReport())
     }
 }

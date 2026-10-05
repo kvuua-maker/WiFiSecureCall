@@ -91,6 +91,13 @@ struct WatchCarrierCallReport: Codable, Equatable, Sendable {
     private(set) var returnedToAppAt: Date?
     private(set) var ignoredOwnProviderCallCount = 0
     private(set) var ignoredForeignCallCount = 0
+    private(set) var handoffEvidence: WatchCallHandoffEvidence?
+
+    /// Records what the watch's own network was worth at the moment the number left, so that a call that
+    /// then failed can be read against the path it was handed over on.
+    mutating func noteHandoffEvidence(_ evidence: WatchCallHandoffEvidence) {
+        handoffEvidence = evidence
+    }
 
     /// Starts a new hand-off and forgets the previous one, so a verdict can never describe a number the
     /// owner is no longer calling.
@@ -104,6 +111,7 @@ struct WatchCarrierCallReport: Codable, Equatable, Sendable {
         returnedToAppAt = nil
         ignoredOwnProviderCallCount = 0
         ignoredForeignCallCount = 0
+        handoffEvidence = nil
     }
 
     /// Forgets a hand-off because the number changed. A verdict describes one number, and keeping it on

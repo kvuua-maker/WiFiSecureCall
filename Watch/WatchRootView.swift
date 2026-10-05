@@ -96,7 +96,15 @@ struct WatchRootView: View {
         case .ending:
             ProgressView()
         case .ended, .failed:
-            Button("Done") { session.reset() }
+            // The app-to-app call is finished, but its terminal state is not a reason to make the owner
+            // press Done before they can dial an ordinary number: the carrier route does not use it, and a
+            // keypad that cannot be reached is a failed dial with no message.
+            VStack(spacing: 4) {
+                Button("Call number") { beginSecureCall() }
+                    .font(.body.weight(.semibold))
+                Button("Done") { session.reset() }
+                    .font(.caption)
+            }
         }
     }
 

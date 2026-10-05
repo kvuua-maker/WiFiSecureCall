@@ -2,7 +2,6 @@ import Foundation
 
 #if os(watchOS)
 import CallKit
-import WatchConnectivity
 
 /// The calls this app created itself through its own `CXProvider`, so they can never be mistaken for the
 /// carrier call the dialpad asked the system to place.
@@ -44,23 +43,18 @@ final class WatchCarrierCallObserver: NSObject, ObservableObject, CXCallObserver
     static let shared = WatchCarrierCallObserver()
 
     @Published private(set) var report = WatchCarrierCallReport()
-    @Published private(set) var isPairedWithIPhone: Bool?
 
     private let observer = CXCallObserver()
     private var isListening = false
-    private var session: WCSession?
 
     private override init() { super.init() }
 
     /// Starts listening once for the whole app. The report itself stays empty until a hand-off, so calls
     /// that have nothing to do with this screen cannot fill it.
     func start() {
-        session = WCSession.isSupported() ? .default : nil
         guard !isListening else { return }
         observer.setDelegate(self, queue: .main)
         isListening = true
-        // WCSession.isPaired is iOS-only; watchOS has no equivalent pairing query.
-        isPairedWithIPhone = nil
     }
 
     /// Records the moment a number was handed to the system, before the hand-off itself, so a report that
@@ -74,13 +68,17 @@ final class WatchCarrierCallObserver: NSObject, ObservableObject, CXCallObserver
         report.discard()
     }
 
+    /// Records what the watch's own network was worth when the number was handed over, so a call that then
+    /// fails can be read against the path it was given rather than blamed on the app or the carrier blindly.
+    func noteHandoffEvidence(_ evidence: WatchCallHandoffEvidence) {
+        report.noteHandoffEvidence(evidence)
+    }
+
     /// Called when the owner comes back from the system Phone app. Whatever happened during the call has
     /// already happened; this is the first moment the app can look for it.
     func applicationDidBecomeActive() {
         ingestCurrentCalls()
         report.noteReturnedToApp()
-        // Do not substitute reachability or app installation for pairing evidence.
-        isPairedWithIPhone = nil
     }
 
     nonisolated func callObserver(_ callObserver: CXCallObserver, callChanged call: CXCall) {

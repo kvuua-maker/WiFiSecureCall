@@ -15,6 +15,8 @@ final class WatchNotificationController: NSObject, WKApplicationDelegate, UNUser
         NotificationRuntime.shared.configureCallKitFactory { WatchCallKitAdapter() }
         // Listening for the whole app lifetime is what lets the dialpad tell a carrier call from silence.
         WatchCarrierCallObserver.shared.start()
+        // One real request at launch, so the watch's own network is already up when the first tap arrives.
+        WatchCallPreparer.shared.start()
         let center = UNUserNotificationCenter.current(); center.delegate = self
         center.setNotificationCategories([UNNotificationCategory(identifier: "INCOMING_CALL", actions: [
             UNNotificationAction(identifier: "ACCEPT", title: "Accept", options: .foreground),
@@ -29,7 +31,14 @@ final class WatchNotificationController: NSObject, WKApplicationDelegate, UNUser
 
     func applicationDidBecomeActive() {
         WatchCarrierCallObserver.shared.applicationDidBecomeActive()
+        // Screen on, app resumed and radio possibly rebuilt are three different events; only the return to
+        // the foreground makes an earlier network observation reusable, and it does not make it trustworthy.
+        WatchCallPreparer.shared.applicationDidBecomeActive()
         Task { await refreshNotificationAuthorization() }
+    }
+
+    func applicationWillResignActive() {
+        WatchCallPreparer.shared.applicationWillResignActive()
     }
 
     nonisolated func didReceiveRemoteNotification(_ userInfo: [AnyHashable: Any], fetchCompletionHandler completionHandler: @escaping (WKBackgroundFetchResult) -> Void) {
