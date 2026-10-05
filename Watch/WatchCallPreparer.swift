@@ -45,7 +45,7 @@ final class WatchCallPreparer: ObservableObject {
         hasStarted = true
         activateCompanion()
         observePath()
-        warmUp()
+        Task { await warmUp() }
     }
 
     /// Called when the owner comes back to the app, from the system phone app, from a sleep or from a tap
@@ -55,7 +55,7 @@ final class WatchCallPreparer: ObservableObject {
         preparation.invalidateForWake()
         activateCompanion()
         observePath()
-        warmUp()
+        Task { await warmUp() }
     }
 
     /// Called as the app leaves the foreground, which is when the radios may start going away and is also
@@ -91,7 +91,10 @@ final class WatchCallPreparer: ObservableObject {
         }
         warmUpGeneration += 1
         let generation = warmUpGeneration
-        let task = Task { @MainActor [weak self] in await self?.runWarmUp() }
+        let task = Task { @MainActor [weak self] in
+            guard let self else { return }
+            await self.runWarmUp()
+        }
         warmUpTask = task
         await task.value
         if warmUpGeneration == generation { warmUpTask = nil }

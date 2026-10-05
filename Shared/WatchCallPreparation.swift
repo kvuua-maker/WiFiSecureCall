@@ -12,7 +12,7 @@ enum WatchCallPathState: String, Equatable, Sendable {
 
 /// Why a path has not been proven usable. Every case is a fact the app established, never a guess about
 /// the carrier, which no watchOS API reports.
-enum WatchCallPreparationBlocker: String, Equatable, Sendable {
+enum WatchCallPreparationBlocker: String, Codable, Equatable, Sendable {
     case pathNotObserved
     case pathUnsatisfied
     case pathStale
@@ -192,7 +192,7 @@ struct WatchCallPreparation: Equatable, Sendable {
 
 /// Whether the number was handed over on a path the watch had proven, so that a later failure can be
 /// attributed to the carrier's service rather than to this app never trying.
-enum WatchCallHandoffEvidence: Equatable, Sendable {
+enum WatchCallHandoffEvidence: Codable, Equatable, Sendable {
     case withProvenPath(validatedAt: Date)
     case withoutProvenPath(WatchCallPreparationBlocker)
 }
