@@ -59,7 +59,8 @@ final class WatchCarrierCallObserver: NSObject, ObservableObject, CXCallObserver
         guard !isListening else { return }
         observer.setDelegate(self, queue: .main)
         isListening = true
-        isPairedWithIPhone = session?.isPaired
+        // WCSession.isPaired is iOS-only; watchOS has no equivalent pairing query.
+        isPairedWithIPhone = nil
     }
 
     /// Records the moment a number was handed to the system, before the hand-off itself, so a report that
@@ -78,7 +79,8 @@ final class WatchCarrierCallObserver: NSObject, ObservableObject, CXCallObserver
     func applicationDidBecomeActive() {
         ingestCurrentCalls()
         report.noteReturnedToApp()
-        isPairedWithIPhone = session?.isPaired
+        // Do not substitute reachability or app installation for pairing evidence.
+        isPairedWithIPhone = nil
     }
 
     nonisolated func callObserver(_ callObserver: CXCallObserver, callChanged call: CXCall) {
@@ -95,7 +97,7 @@ final class WatchCarrierCallObserver: NSObject, ObservableObject, CXCallObserver
             isOutgoing: call.isOutgoing,
             hasConnected: call.hasConnected,
             hasEnded: call.hasEnded,
-            onHold: call.onHold
+            onHold: call.isOnHold
         ))
     }
 
