@@ -4,6 +4,8 @@ import XCTest
 @MainActor
 final class WatchDialerUITests: XCTestCase {
     private let app = XCUIApplication(bundleIdentifier: "com.vkapps.wifisecurecall.watchkitapp")
+    // A handoff is awaiting owner confirmation, never evidence of a connected call or audio.
+    private let awaitingOwnerConfirmationText = "Номер передано Телефону. Натисніть «Виклик» на екрані — до цього дзвінок ще не йде."
 
     override func setUpWithError() throws {
         continueAfterFailure = false
@@ -104,7 +106,7 @@ final class WatchDialerUITests: XCTestCase {
         XCTAssertTrue(app.buttons["dialpad.call"].isEnabled)
         press("call", atEdge: true)
         XCTAssertTrue(app.staticTexts["dialpad.status"].waitForExistence(timeout: 3))
-        XCTAssertEqual(app.staticTexts["dialpad.status"].label, "Передано системному телефону.")
+        XCTAssertEqual(app.staticTexts["dialpad.status"].label, awaitingOwnerConfirmationText)
         snapshot("carrier-handset-handoff-only")
         // This verifies the action was invoked, NOT ringing, connection or two-way telephone audio.
     }
@@ -123,7 +125,7 @@ final class WatchDialerUITests: XCTestCase {
         expectNumber("+12025550100")
         XCTAssertEqual(app.staticTexts["dialpad.review-number"].label, "+12025550100")
         XCTAssertEqual(app.staticTexts["dialpad.status"].label, "Перевірте номер і натисніть трубку.")
-        XCTAssertFalse(app.staticTexts["Передано системному телефону."].exists)
+        XCTAssertFalse(app.staticTexts[awaitingOwnerConfirmationText].exists)
         let call = app.buttons["dialpad.call"]
         XCTAssertEqual(app.buttons.matching(identifier: "dialpad.call").count, 1)
         reveal(call)
@@ -136,7 +138,7 @@ final class WatchDialerUITests: XCTestCase {
         app.buttons["Cancel"].tap()
         expectNumber("+12025550100")
         call.coordinate(withNormalizedOffset: CGVector(dx: 0.15, dy: 0.5)).tap()
-        XCTAssertEqual(app.staticTexts["dialpad.status"].label, "Передано системному телефону.")
+        XCTAssertEqual(app.staticTexts["dialpad.status"].label, awaitingOwnerConfirmationText)
         snapshot("upper-call-action-handoff-only")
         // A refused system call must not permanently latch the handset or erase the recipient.
         XCTAssertTrue(call.isEnabled)
@@ -146,7 +148,7 @@ final class WatchDialerUITests: XCTestCase {
         press("0", atEdge: true)
         expectNumber("+12025550100")
         press("call", atEdge: true)
-        XCTAssertEqual(app.staticTexts["dialpad.status"].label, "Передано системному телефону.")
+        XCTAssertEqual(app.staticTexts["dialpad.status"].label, awaitingOwnerConfirmationText)
     }
 
     func testSystemInputRejectsWrongRecipientAndRequiresExplicitCall() {
@@ -166,7 +168,7 @@ final class WatchDialerUITests: XCTestCase {
         expectNumber("+12025550100")
         XCTAssertEqual(app.staticTexts["dialpad.status"].label,
                        "Номер не змінено. Диктуйте по одній цифрі; плюс — лише на початку.")
-        XCTAssertFalse(app.staticTexts["Передано системному телефону."].exists)
+        XCTAssertFalse(app.staticTexts[awaitingOwnerConfirmationText].exists)
         press("delete", atEdge: true)
         expectNumber("+1202555010")
         XCTAssertEqual(app.staticTexts["dialpad.status"].label, "Перевірте номер і натисніть трубку.")
@@ -183,7 +185,7 @@ final class WatchDialerUITests: XCTestCase {
         XCTAssertTrue(app.buttons["Dictation"].waitForExistence(timeout: 3))
         app.buttons["Dictation"].tap()
         snapshot("system-dictation")
-        XCTAssertFalse(app.staticTexts["Передано системному телефону."].exists)
+        XCTAssertFalse(app.staticTexts[awaitingOwnerConfirmationText].exists)
     }
 
     func testAppleSignInButtonReachesAuthorizationCoordinator() {

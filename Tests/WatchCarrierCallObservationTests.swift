@@ -104,9 +104,10 @@ final class WatchCarrierCallObservationTests: XCTestCase {
     func testACallThatEndsBeforeConnectingIsNotAConnectedCall() {
         var report = WatchCarrierCallReport()
         report.requestHandoff(at: start)
-        report.apply(snapshot(connected: true, ended: true), isOwnProviderCall: false, at: start.addingTimeInterval(6))
+        report.apply(snapshot(connected: false, ended: true), isOwnProviderCall: false, at: start.addingTimeInterval(6))
         XCTAssertEqual(report.verdict, .endedBeforeConnecting)
         XCTAssertFalse(report.verdict.isConnectedEvidence)
+        XCTAssertNil(report.observedConnectedAt)
         XCTAssertNil(report.talkDuration)
         XCTAssertEqual(report.verdict.severity, .warning)
     }
@@ -124,10 +125,12 @@ final class WatchCarrierCallObservationTests: XCTestCase {
     func testAConnectReportedAfterTheEndIsStillAConnectTheSystemReported() {
         var report = WatchCarrierCallReport()
         report.requestHandoff(at: start)
-        report.apply(snapshot(connected: true, ended: true), isOwnProviderCall: false, at: start.addingTimeInterval(6))
+        report.apply(snapshot(connected: false, ended: true), isOwnProviderCall: false, at: start.addingTimeInterval(6))
         XCTAssertEqual(report.verdict, .endedBeforeConnecting)
+        XCTAssertNil(report.observedConnectedAt)
         report.apply(snapshot(connected: true, ended: true), isOwnProviderCall: false, at: start.addingTimeInterval(7))
         XCTAssertEqual(report.verdict, .endedAfterConnecting)
+        XCTAssertEqual(report.observedConnectedAt, start.addingTimeInterval(7))
         XCTAssertEqual(report.observedEndedAt, start.addingTimeInterval(6), "The end stays where the system first reported it.")
     }
 
