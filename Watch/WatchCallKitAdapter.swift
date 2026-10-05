@@ -32,6 +32,7 @@ final class WatchCallKitAdapter: NSObject, CallKitHandling, CXProviderDelegate {
 
     func startOutgoing(id: UUID) async throws {
         provider.configuration = Self.configuration(); currentCallUUID = id
+        WatchOwnProviderCallLedger.shared.register(id)
         onLifecycleDiagnostic?("start_transaction_submitted", id)
         do {
             try await controller.request(CXTransaction(action: CXStartCallAction(call: id, handle: CXHandle(type: .generic, value: "Wi-Fi call"))))
@@ -47,6 +48,7 @@ final class WatchCallKitAdapter: NSObject, CallKitHandling, CXProviderDelegate {
                 if let error { continuation.resume(throwing: error) } else { continuation.resume(returning: ()) }
             }
         }
+        WatchOwnProviderCallLedger.shared.register(id)
         currentCallUUID = id
     }
     func requestAnswer(id: UUID) async throws { try await controller.request(CXTransaction(action: CXAnswerCallAction(call: id))) }
@@ -76,10 +78,10 @@ final class WatchCallKitAdapter: NSObject, CallKitHandling, CXProviderDelegate {
     private static func cxReason(_ reason: CallEndReason) -> CXCallEndedReason {
         switch reason { case .remoteEnded: return .remoteEnded; case .failed: return .failed; case .unanswered: return .unanswered; case .declined: return .declinedElsewhere; case .localEnded: return .remoteEnded }
     }
-    private func clear(_ id: UUID) { if currentCallUUID == id { currentCallUUID = nil }; if pendingAudioCallUUID == id { pendingAudioCallUUID = nil }; if activatedAudioCallUUID == id { activatedAudioCallUUID = nil }; appRequestedEndCallUUIDs.remove(id) }
+    private func clear(_ id: UUID) { if currentCallUUID == id { currentCallUUID = nil }; if pendingAudioCallUUID == id { pendingAudioCallUUID = nil }; if activatedAudioCallUUID == id { activatedAudioCallUUID = nil }; appRequestedEndCallUUIDs.remove(id); WatchOwnProviderCallLedger.shared.forget(id) }
     private func perform(_ action: CXCallAction, stage: String, operation: @escaping (UUID, Date) async throws -> Void) async { do { try await operation(action.callUUID, action.timeoutDate); guard !action.isComplete else { return }; action.fulfill(); if stage == "start" { onLifecycleDiagnostic?("start_action_fulfilled", action.callUUID) } } catch { if !action.isComplete { action.fail() }; onActionFailed?(action.callUUID, stage, error) } }
 
-    nonisolated func providerDidReset(_ provider: CXProvider) { Task { @MainActor in let id = currentCallUUID ?? activatedAudioCallUUID ?? pendingAudioCallUUID; onLifecycleDiagnostic?("provider_reset", id); currentCallUUID = nil; pendingAudioCallUUID = nil; activatedAudioCallUUID = nil; appRequestedEndCallUUIDs.removeAll(keepingCapacity: true); onProviderReset?(id) } }
+    nonisolated func providerDidReset(_ provider: CXProvider) { Task { @MainActor in let id = currentCallUUID ?? activatedAudioCallUUID ?? pendingAudioCallUUID; onLifecycleDiagnostic?("provider_reset", id); currentCallUUID = nil; pendingAudioCallUUID = nil; activatedAudioCallUUID = nil; appRequestedEndCallUUIDs.removeAll(keepingCapacity: true); if let id { WatchOwnProviderCallLedger.shared.forget(id) }; onProviderReset?(id) } }
     nonisolated func provider(_ provider: CXProvider, perform action: CXStartCallAction) { Task { @MainActor in await self.perform(action, stage: "start") { [self] id, deadline in self.onLifecycleDiagnostic?("provider_perform_start_received", id); try self.onPrepareAudio?(); guard let handler = self.onStartRequested else { throw CallKitCoordinatorError.missingCoordinator }; self.pendingAudioCallUUID = id; self.currentCallUUID = id; try await handler(id, deadline) } } }
     nonisolated func provider(_ provider: CXProvider, perform action: CXAnswerCallAction) { Task { @MainActor in await self.perform(action, stage: "answer") { [self] id, deadline in try self.onPrepareAudio?(); guard let handler = self.onAnswerRequested else { throw CallKitCoordinatorError.missingCoordinator }; self.pendingAudioCallUUID = id; self.currentCallUUID = id; try await handler(id, deadline) } } }
     nonisolated func provider(_ provider: CXProvider, perform action: CXEndCallAction) { Task { @MainActor in

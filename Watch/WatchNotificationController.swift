@@ -13,6 +13,8 @@ final class WatchNotificationController: NSObject, WKApplicationDelegate, UNUser
 
     func applicationDidFinishLaunching() {
         NotificationRuntime.shared.configureCallKitFactory { WatchCallKitAdapter() }
+        // Listening for the whole app lifetime is what lets the dialpad tell a carrier call from silence.
+        WatchCarrierCallObserver.shared.start()
         let center = UNUserNotificationCenter.current(); center.delegate = self
         center.setNotificationCategories([UNNotificationCategory(identifier: "INCOMING_CALL", actions: [
             UNNotificationAction(identifier: "ACCEPT", title: "Accept", options: .foreground),
@@ -26,6 +28,7 @@ final class WatchNotificationController: NSObject, WKApplicationDelegate, UNUser
     }
 
     func applicationDidBecomeActive() {
+        WatchCarrierCallObserver.shared.applicationDidBecomeActive()
         Task { await refreshNotificationAuthorization() }
     }
 

@@ -7,10 +7,16 @@ import WatchKit
 /// Carrier dialing uses the system's public tel: route; app-to-app calling is a separate action.
 /// The background, dimensions and hit shape belong to the Button's LABEL. Applying them outside a
 /// plain Button draws a large cell but leaves taps outside its glyph unhandled on watchOS.
+///
+/// The tel: route is the only public way to ask watchOS for a carrier call, and it cannot place one on
+/// its own: Apple documents that the number goes to the system Phone app, "at which point the user can
+/// choose whether to continue". So this screen says which of those steps has been reached, and it takes
+/// its only claim of success from the system reporting the call connected.
 struct WatchSecureDialerView: View {
     @Environment(\.dismiss) private var dismiss
     @Environment(\.dynamicTypeSize) private var dynamicTypeSize
     @StateObject private var store = AccountSessionStore.shared
+    @ObservedObject private var carrierCall = WatchCarrierCallObserver.shared
     @State private var pad = WatchDialpadModel()
     @State private var status = ""
     var showsSecureAccountCall = true
@@ -66,8 +72,8 @@ struct WatchSecureDialerView: View {
 #endif
             .disabled(!pad.isCallable || pad.isDialing)
 
-            if !status.isEmpty {
-                Text(status).font(.caption2).foregroundStyle(.secondary)
+            if !visibleStatus.isEmpty {
+                Text(visibleStatus).font(.caption2).foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
                     .accessibilityIdentifier("dialpad.status")
             }
@@ -87,6 +93,16 @@ struct WatchSecureDialerView: View {
                 Button("Call app user") { startSecureCall() }
                     .font(.caption2)
                     .disabled(!pad.isCallable || pad.isDialing)
+            }
+
+            // Only after a hand-off, and below the keypad, so the keys this screen was rebuilt around keep
+            // the geometry they were tested with until a call has actually been requested.
+            ForEach(requirements) { requirement in
+                Text(WatchCarrierCallRequirements.displayText(for: requirement))
+                    .font(.system(size: 9))
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .accessibilityIdentifier("dialpad.requirement")
             }
 
           }
@@ -132,12 +148,35 @@ private extension View {
 }
 
 private extension WatchSecureDialerView {
+    /// What the screen says about the attempt, newest first.
+    ///
+    /// Once a number has been handed over the verdict replaces the editing hint. A line about the number
+    /// being editable is not what the owner needs to read after asking for a call.
+    private var visibleStatus: String {
+        carrierCall.report.isHandedOff ? carrierCall.report.verdict.displayText : status
+    }
+
+    /// What the watch could establish about this route, read at the moment it is shown.
+    ///
+    /// The carrier's half of the route is listed as `notDetectable` rather than guessed, because nothing
+    /// on watchOS reports whether the carrier offers Wi-Fi calling or whether the iPhone has
+    /// `Add Wi-Fi Calling For Other Devices` switched on.
+    private var requirements: [WatchCarrierCallRequirement] {
+        guard carrierCall.report.isHandedOff else { return [] }
+        return WatchCarrierCallRequirements.evaluate(
+            network: SystemDialNetworkMonitor.shared.current,
+            paired: carrierCall.isPairedWithIPhone,
+            verdict: carrierCall.report.verdict
+        )
+    }
+
     func appendKey(_ key: Character) {
         if pad.append(key) { numberDidChange() }
     }
 
     func numberDidChange() {
         // A prior handoff/error describes the prior number, never the newly edited recipient.
+        carrierCall.discardAttempt()
         status = pad.isEmpty ? "" : (pad.isCallable
             ? "Перевірте номер і натисніть трубку."
             : "Введіть від 3 до 15 цифр; плюс — лише на початку.")
@@ -157,9 +196,11 @@ private extension WatchSecureDialerView {
 
     /// Hands the typed number to the system as a phone call.
     ///
-    /// The claim is taken for the hand-over and released straight after, because the system owns the call
-    /// from that moment and reports nothing back: a latch held open across a hand-off that never leaves
-    /// this app is exactly how a call key stops working.
+    /// The system owns the call from the moment the URL is opened and reports nothing back through this
+    /// call site: watchOS shows the Phone app, where the owner confirms, and the carrier then carries the
+    /// call. So the claim made here is the hand-off, `WatchCarrierCallObserver` takes over from that point,
+    /// and the latch is released straight after so a hand-off that never leaves this app cannot leave the
+    /// key dead.
     func placePhoneCall() {
         switch pad.dialDecision {
         case .noNumber:
@@ -168,7 +209,7 @@ private extension WatchSecureDialerView {
             status = "Введіть від 3 до 15 цифр."
         case let .start(url):
             guard pad.beginDial() else { return }
-            status = "Передано системному телефону."
+            carrierCall.requestHandoff()
             WKApplication.shared().openSystemURL(url)
             pad.endDial()
         }
