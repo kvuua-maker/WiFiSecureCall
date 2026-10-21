@@ -1,3 +1,4 @@
+import AVFoundation
 import CallKit
 import Foundation
 import SwiftUI
@@ -245,16 +246,14 @@ final class SIPCallSession: NSObject, ObservableObject {
         }
     }
 
-    private func endCall(callKitUUID: UUID) async {
+    private func endCall(callKitUUID localUUID: UUID) async {
         if let callID = mediaTokenCallID {
             client?.hangUp(callID: callID)
         }
         stopMedia()
         durationTask?.cancel()
         durationTask = nil
-        if let callKitUUID {
-            callKit?.reportEnded(id: callKitUUID, reason: .localEnded)
-        }
+        callKit?.reportEnded(id: localUUID, reason: .localEnded)
         state = .ended(mediaTokenCallID ?? "")
         mediaTokenCallID = nil
         callKitUUID = nil

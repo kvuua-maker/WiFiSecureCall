@@ -64,7 +64,7 @@ final class RTPMediaSession: @unchecked Sendable {
         }
         guard bound == 0 else {
             let code = errno
-            close(fd)
+            Darwin.close(fd)
             throw RTPError.socket(code)
         }
 
@@ -81,14 +81,14 @@ final class RTPMediaSession: @unchecked Sendable {
         }
         guard named == 0 else {
             let code = errno
-            close(fd)
+            Darwin.close(fd)
             throw RTPError.socket(code)
         }
 
         let address = Self.ipv4String(assigned.sin_addr)
         let port = Int(UInt16(bigEndian: assigned.sin_port))
         guard !address.isEmpty, port > 0 else {
-            close(fd)
+            Darwin.close(fd)
             throw RTPError.noLocalAddress
         }
 
