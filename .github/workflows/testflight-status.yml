@@ -25,7 +25,7 @@ jobs:
           PRIVATE_KEY: ${{ secrets.APPSTORE_PRIVATE_KEY }}
         run: |
           set -euo pipefail
-          for name in APPSTORE_KEY_ID APPSTORE_ISSUER_ID APPSTORE_PRIVATE_KEY; do
+          for name in KEY_ID ISSUER_ID PRIVATE_KEY; do
             eval "value=\${$name:-}"
             [ -n "$value" ] || { echo "::error::$name is not set."; exit 1; }
           done
