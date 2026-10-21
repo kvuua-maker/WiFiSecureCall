@@ -535,18 +535,28 @@ jobs:
       # certificate and both provisioning profiles, so the identity and the profile names are left
       # unset on purpose. Naming them here is what produced the conflicting provisioning settings:
       # xcodebuild treated an explicit identity as a manual specification.
-      # The identity and the team are stated explicitly. Left to itself, an archive
-      # with automatic signing asks Apple for an "iOS App Development" profile,
-      # which needs a registered device; a team with no devices on file cannot
-      # mint one and the archive fails. A distribution identity asks for an App
-      # Store profile instead, which needs no device.
-      - name: Archive with automatic signing
+      # Signing is entirely explicit here: style, identity, team and one profile
+      # per SDK. Automatic signing resolved to a development profile for this
+      # project and then refused a distribution identity as a conflict; stating
+      # every value removes that decision from Xcode. The watch app builds for the
+      # watchOS SDK, so it takes its own profile through the SDK-conditional form.
+      - name: Archive with manual signing
         env:
           BUILD_NUMBER: ${{ github.run_number }}
           KEY_ID: ${{ secrets.APPSTORE_KEY_ID }}
           ISSUER_ID: ${{ secrets.APPSTORE_ISSUER_ID }}
+          IOS_PROFILE: ${{ secrets.PROVISIONING_PROFILE_SPECIFIER }}
+          WATCH_PROFILE: ${{ secrets.WATCH_PROVISIONING_PROFILE_SPECIFIER }}
         run: |
           set -euo pipefail
+          missing=''
+          [ -n "${IOS_PROFILE:-}" ] || missing="${missing:+$missing, }PROVISIONING_PROFILE_SPECIFIER"
+          [ -n "${WATCH_PROFILE:-}" ] || missing="${missing:+$missing, }WATCH_PROVISIONING_PROFILE_SPECIFIER"
+          if [ -n "$missing" ]; then
+            echo "::error::Manual signing needs the profile name for each target. Missing repository secret(s): $missing"
+            echo "::error::Set them to the exact provisioning profile names from Certificates, Identifiers & Profiles (for example 'WiFi Secure Call App Store' and 'WiFi Secure Call Watch App Store')."
+            exit 1
+          fi
           mkdir -p archives
           xcodebuild \
             -project WiFiSecureCall.xcodeproj \
@@ -559,10 +569,11 @@ jobs:
             -authenticationKeyPath "$KEY_PATH" \
             -authenticationKeyID "$KEY_ID" \
             -authenticationKeyIssuerID "$ISSUER_ID" \
-            -allowProvisioningUpdates \
-            CODE_SIGN_STYLE=Automatic \
+            CODE_SIGN_STYLE=Manual \
             DEVELOPMENT_TEAM="$TEAM_ID" \
-            "CODE_SIGN_IDENTITY[sdk=iphoneos*]=Apple Distribution" \
+            CODE_SIGN_IDENTITY="Apple Distribution" \
+            "PROVISIONING_PROFILE_SPECIFIER[sdk=iphoneos*]=$IOS_PROFILE" \
+            "PROVISIONING_PROFILE_SPECIFIER[sdk=watchos*]=$WATCH_PROFILE" \
             archive | tee /tmp/archive.log
 
       - name: Verify both apps are signed
