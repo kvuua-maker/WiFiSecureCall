@@ -624,7 +624,8 @@ jobs:
             -authenticationKeyIssuerID "$ISSUER_ID" \
             | tee /tmp/testflight-upload.log
 
-          ls -l "$RUNNER_TEMP/export"
+          # destination=upload sends the build straight to App Store Connect and
+          # writes no export directory, so the log is the only evidence to check.
 
           grep -qE 'Upload succeeded|Delivered your binary|UPLOAD SUCCEEDED' /tmp/testflight-upload.log \
             || { echo '::error::the TestFlight upload did not report success.'; exit 1; }

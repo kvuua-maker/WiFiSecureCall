@@ -1,0 +1,43 @@
+name: TestFlight status
+
+# Reads back what App Store Connect actually holds, so a run can be confirmed from
+# the outside instead of being inferred from an upload log. Read-only: it never
+# uploads, never changes a build, and prints only build numbers and state names.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  status:
+    name: Query App Store Connect for recent builds
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Check the credentials are present
+        env:
+          KEY_ID: ${{ secrets.APPSTORE_KEY_ID }}
+          ISSUER_ID: ${{ secrets.APPSTORE_ISSUER_ID }}
+          PRIVATE_KEY: ${{ secrets.APPSTORE_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          for name in APPSTORE_KEY_ID APPSTORE_ISSUER_ID APPSTORE_PRIVATE_KEY; do
+            eval "value=\${$name:-}"
+            [ -n "$value" ] || { echo "::error::$name is not set."; exit 1; }
+          done
+          echo "App Store Connect credentials found."
+
+      - name: Query builds
+        env:
+          KEY_ID: ${{ secrets.APPSTORE_KEY_ID }}
+          ISSUER_ID: ${{ secrets.APPSTORE_ISSUER_ID }}
+          PRIVATE_KEY: ${{ secrets.APPSTORE_PRIVATE_KEY }}
+          BUNDLE_ID: com.vkapps.wifisecurecall
+        run: |
+          set -euo pipefail
+          python3 -m pip install --quiet --disable-pip-version-check pyjwt cryptography
+          python3 scripts/testflight_builds.py
