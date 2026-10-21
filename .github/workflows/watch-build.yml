@@ -1,23 +1,22 @@
-name: Watch SIP build
+name: Watch build
 
-# A focused build of the standalone watch client. The full app workflow also
-# compiles the watch target, but it builds the iPhone scheme, which means a
-# failure in the SIP stack is reported together with everything else. This job
-# exists so the SIP code has its own signal.
+# The watch screen, its CallKit adapter and the WatchConnectivity bridge compile
+# against watchOS alone. Building the watch scheme on its own means a regression in
+# the hand-off to the iPhone is reported apart from the rest of the app.
 
 on:
   push:
     branches: [main]
     paths:
-      - "Shared/SIP/**"
       - "Watch/**"
+      - "Shared/WatchBridge/**"
       - "WiFiSecureCall.xcodeproj/**"
-      - ".github/workflows/watch-sip.yml"
+      - ".github/workflows/watch-build.yml"
   pull_request:
   workflow_dispatch:
 
 concurrency:
-  group: watch-sip-${{ github.ref }}
+  group: watch-build-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -45,14 +44,14 @@ jobs:
             -destination 'generic/platform=watchOS Simulator' \
             -derivedDataPath DerivedData \
             CODE_SIGNING_ALLOWED=NO \
-            build | tee /tmp/watch-sip.log
-          grep -q 'target .*apple-watchos' /tmp/watch-sip.log
-          echo "The watch target compiled with the SIP stack."
+            build | tee /tmp/watch-build.log
+          grep -q 'target .*apple-watchos' /tmp/watch-build.log
+          echo "The watch target compiled."
 
       - name: Keep the build log on failure
         if: failure()
         uses: actions/upload-artifact@v5
         with:
-          name: watch-sip-build-log
-          path: /tmp/watch-sip.log
+          name: watch-build-log
+          path: /tmp/watch-build.log
           if-no-files-found: ignore

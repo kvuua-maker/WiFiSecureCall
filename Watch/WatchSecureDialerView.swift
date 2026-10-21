@@ -14,10 +14,14 @@ enum WatchSecureDialerNumber {
 import SwiftUI
 import WatchKit
 
-/// Places a call from the Apple Watch. Capture and playback both run on the watch, so no paired
-/// iPhone has to be running for the audio path.
+/// Dials from the Apple Watch by handing the number to the paired iPhone.
+///
+/// The watch no longer resolves or places the call itself. A watch app is suspended
+/// as soon as the wrist goes down, so a dial request is a message to the iPhone,
+/// which owns the call and the CallKit session.
 struct WatchSecureDialerView: View {
     @Environment(\.dismiss) private var dismiss
+    @ObservedObject private var bridge = WatchCallBridge.shared
     @StateObject private var store = AccountSessionStore.shared
     @State private var number = ""
     @State private var status = ""
@@ -113,24 +117,16 @@ struct WatchSecureDialerView: View {
             status = "Enter at least 3 digits"
             return
         }
-        guard let accountID = store.callableAccounts.first(where: { $0.accountID == store.activeAccountID })?.accountID
-                ?? store.callableAccounts.first?.accountID else {
-            status = "Link an account first"
-            return
-        }
         working = true
-        status = "Resolving…"
-        Task { @MainActor in
-            do {
-                let recipient = try await NotificationRuntime.shared.resolveRecipient(entry, accountID: accountID)
-                dismiss()
-                await NotificationRuntime.shared.startUserCall(targetUserID: recipient.userID, accountID: accountID)
-            } catch is CancellationError {
-                working = false
-            } catch {
-                working = false
-                status = Self.safeMessage(error)
-            }
+        switch bridge.requestCall(number: entry) {
+        case .sent:
+            status = "Calling from iPhone…"
+            dismiss()
+        case .queued:
+            status = "Queued — the iPhone will call when it wakes"
+        case let .unavailable(reason):
+            status = reason
+            working = false
         }
     }
 

@@ -8,34 +8,67 @@ Apple Watch links to an authenticated iPhone account through the server over the
 
 Independent iPhone and Apple Watch MVP for live Internet audio calls over HTTPS/WSS.
 
-## Standalone SIP client on Apple Watch
+## Calling from the watch, through the iPhone
 
-The watch no longer needs an iPhone to place a call. It registers with a SIP
-server itself, negotiates an audio stream and runs the media path on the watch:
+The watch no longer places its own call. It hands the number to the paired iPhone
+over WatchConnectivity, and the iPhone owns the call: it resolves the number,
+starts the call through the existing call stack and the CallKit session, and
+reports every state change back to the wrist.
 
-| Layer | File | Responsibility |
-| --- | --- | --- |
-| Messages | `Shared/SIP/SIPMessage.swift` | Parses and renders SIP requests and responses, including folded headers and LF endings |
-| Authentication | `Shared/SIP/SIPDigest.swift` | Answers 401 and 407 with MD5 or SHA-256 and `qop=auth` |
-| Transport | `Shared/SIP/SIPTransport.swift` | SIP over a secure WebSocket (RFC 7118) with keepalives and reconnect backoff |
-| Description | `Shared/SIP/SDP.swift` | Builds and reads the audio stream without touching crypto or candidate lines |
-| Codec | `Shared/SIP/G711.swift` | PCMU and PCMA, the codecs every trunk supports |
-| Media | `Shared/SIP/RTPMediaSession.swift` | A real UDP socket so the SDP offer names the port that is used, plus a jitter buffer |
-| Audio | `Shared/SIP/SIPAudioEngine.swift` | An 8 kHz capture and playout path |
-| Signalling | `Shared/SIP/SIPClient.swift` | Registration, one dialog, CANCEL, ACK for 2xx and non-2xx, BYE, DTMF over INFO |
-| Session | `Watch/SIPCallSession.swift` | CallKit, the media socket and the screen state |
+```
+Watch dialpad ──WCSession──▶ iPhone: resolve ──▶ CallKit call ──▶ server
+      ▲                          │
+      └──────── call.state ──────┘
+```
 
-The SIP account is entered on the watch and stored in the keychain
-(`Watch/SIPAccountStore.swift`); nothing about it comes from the paired iPhone.
-A bare number is dialled at the account's domain, which is the SIP gateway that
-routes it to the trunk; a full `sip:` URI is used as it stands.
+| File | Role |
+| --- | --- |
+| `Shared/WatchBridge/WatchBridgeMessage.swift` | Property-list message format shared by both sides |
+| `Watch/WatchCallBridge.swift` | Activation, a durable outbox, delivery and retries |
+| `iOS/IOSWatchCallBridge.swift` | Session lifecycle, request handling, state reporting |
+| `iOS/IOSCallKeepAlive.swift` | Keeps the iPhone awake while a call is up |
 
-Incoming calls are reported to CallKit while the app is running. Delivering an
-incoming call to a watch that is not running needs a VoIP push from the server,
-which is a separate piece of work and is not implemented here.
+### Why a call used to be lost after the screen went dark
 
-The server side of this — registrar, trunk routing and the RTP relay — is
-`cmd/sipgateway` in the companion repository.
+Three separate things caused it, and each one is addressed:
+
+1. **The iOS session deactivated and never came back.** `WCSession` is deactivated
+   when the watch link is rebuilt and when the watch switches. Nobody reactivated
+   it, so the bridge worked once after launch and then stopped.
+   `sessionDidDeactivate` now calls `activate()` again, and activation state is
+   reflected in the UI instead of being assumed.
+2. **A dial request only existed in memory.** The watch is suspended seconds after
+   the wrist goes down, so a request that was not delivered was gone.
+   `WatchCallOutbox` writes it to disk before anything is attempted, retries it on
+   activation, on reachability changes and on foreground, expires it after five
+   minutes so an old request cannot ring later, and deduplicates by request id so
+   a retry cannot call twice.
+3. **`sendMessage` was used whether or not the peer was awake.** It only works
+   while both apps are running. When the watch is asleep the request now goes out
+   as `transferUserInfo`, which the system delivers when the iPhone next runs,
+   and the iPhone answers through `updateApplicationContext`, which survives the
+   watch waking later.
+
+### Incoming calls
+
+The server sends a VoIP push to the iPhone. PushKit wakes the app, the existing
+CallKit path reports the call, and `IOSWatchCallBridge.notifyIncoming` mirrors it
+to the watch. The watch does not create a second CallKit call of its own: the
+system already rings the paired watch for a call reported by the iPhone, and a
+second report would ring twice. The watch shows the caller and points at the
+system banner.
+
+### Keeping the session alive
+
+`IOSCallKeepAlive` holds a background task and pings the watch every ten seconds
+**while a call is in progress** — that is the window in which Apple's rules allow
+an app to stay resident, because the call owns the audio session.
+
+There is deliberately no always-on silent audio stream. A silent stream used only
+to stay alive is rejected under App Review guideline 2.5.4 and is stopped by the
+system as soon as the audio session stops producing sound, so it would not fix the
+symptom it pretends to fix. Between calls the app is woken by a VoIP push, which
+is the supported mechanism and the one that works after hours of sleep.
 
 ## Call audio on Apple Watch
 
@@ -64,15 +97,8 @@ The MVP protects signaling and media in transit with system TLS/WSS. It does not
 | `package` | pushes to `main`, tags, manual dispatch | Builds the app bundle without signing and packs it as `WiFiSecureCall-<configuration>-<build>-unsigned.ipa` |
 | `publish` | after `package` | Attaches the `.ipa` to a GitHub Release: the tag name for `v*` tags, otherwise the rolling `ci-latest` release, replaced on every run |
 | `testflight` | manual dispatch only | Optional signed build and TestFlight submission, needs only the App Store Connect API key listed below |
-
-Three workflows run on the repository:
-
-| Workflow | Trigger | Purpose |
-| --- | --- | --- |
-| `ios-build.yml` | push, pull request, tag, manual | The build above. Jobs run on the hosted `macos-26` image, not the self-hosted label the repository has no runner for |
-| `watch-sip.yml` | changes to `Shared/SIP`, `Watch` or the project | Compiles the Apple Watch target on its own, so a SIP regression is reported apart from everything else |
-| `secrets.yml` | push, pull request, weekly | gitleaks over the full history; `.gitleaks.toml` records the six reviewed false positives |
-
+| `watch-build.yml` | changes to `Watch` or `Shared/WatchBridge` | Compiles the watch target on its own |
+| `secrets.yml` | push, pull request, weekly | gitleaks over the full history; `.gitleaks.toml` records the reviewed false positives |
 
 The default path needs no Apple certificate, no provisioning profile and no App Store Connect key, and no secret at all: the release upload uses the built-in `GITHUB_TOKEN`. Without `IOS_BEARER_TOKEN` and `WATCH_BEARER_TOKEN` the artifact is built in the Debug configuration, because the Release build phases validate those tokens; with them it is built in the Release configuration.
 

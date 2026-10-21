@@ -19,6 +19,10 @@ final class IOSNotificationController: NSObject, UIApplicationDelegate, UNUserNo
             UNNotificationAction(identifier: "REJECT", title: "Reject")
         ], intentIdentifiers: [])])
         application.registerForRemoteNotifications(); configureVoIPPushes()
+        // Activate the watch link at launch, not when a screen appears: a dial
+        // request can arrive while the app is in the background, and the session
+        // has to exist by then.
+        IOSWatchCallBridge.shared.activate()
         Task { await NotificationRuntime.shared.api.reportNotificationDiagnostic(event: "apns_registration_started", status: "started") }
         center.requestAuthorization(options: [.alert, .sound, .badge]) { _, error in
             Task { @MainActor in await self.refreshNotificationAuthorization(requestError: error) }
@@ -103,6 +107,11 @@ final class IOSNotificationController: NSObject, UIApplicationDelegate, UNUserNo
     }
 
     private func handle(_ envelope: IncomingNotificationEnvelope, voip: Bool, requestAnswer: Bool) async {
+        // A VoIP push is what wakes this app; passing the same event to the watch
+        // means the wrist shows the call even when it never saw a notification.
+        if voip {
+            IOSWatchCallBridge.shared.notifyIncoming(callID: envelope.callID, caller: envelope.callerName)
+        }
         switch envelope {
         case let .legacy(callID):
             if voip { await NotificationRuntime.shared.handleIncomingVoIP(callID: callID) }
