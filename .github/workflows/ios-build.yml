@@ -542,10 +542,17 @@ jobs:
       - name: Archive unsigned
         env:
           BUILD_NUMBER: ${{ github.run_number }}
+          BUILD_NUMBER_OVERRIDE: ${{ inputs.build_number }}
           KEY_ID: ${{ secrets.APPSTORE_KEY_ID }}
           ISSUER_ID: ${{ secrets.APPSTORE_ISSUER_ID }}
         run: |
           set -euo pipefail
+          # The dispatched build number wins. Falling back to the run counter is
+          # what produced build 183 while App Store Connect already held 208, so
+          # the number a person asks for has to be the number that is built.
+          build="${BUILD_NUMBER_OVERRIDE:-$(( BUILD_NUMBER + 100 ))}"
+          printf '%s' "$build" | grep -Eq '^[0-9]+$' || { echo "::error::build number '$build' is not numeric."; exit 1; }
+          echo "CFBundleVersion will be $build"
           mkdir -p archives
           # No signing at archive time. A signed archive would need a provisioning
           # profile before anything is built, and Xcode asks for a development one,
@@ -559,7 +566,7 @@ jobs:
             -destination 'generic/platform=iOS' \
             -archivePath "$ARCHIVE" \
             -derivedDataPath DerivedData \
-            CURRENT_PROJECT_VERSION="$(( BUILD_NUMBER + 100 ))" \
+            CURRENT_PROJECT_VERSION="$build" \
             CODE_SIGNING_ALLOWED=NO \
             archive | tee /tmp/archive.log
 
