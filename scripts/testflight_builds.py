@@ -99,7 +99,7 @@ def main() -> int:
     # The collection endpoint accepts a sort; the app relationship endpoint does not.
     builds = get(
         "/v1/builds?"
-        + urllib.parse.urlencode({"filter[app]": app["id"], "limit": 5, "sort": "-uploadedDate"}),
+        + urllib.parse.urlencode({"filter[app]": app["id"], "limit": 20, "sort": "-uploadedDate"}),
         bearer,
     )
     if not builds.get("data"):
