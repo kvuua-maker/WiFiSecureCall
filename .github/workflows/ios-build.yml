@@ -56,10 +56,11 @@ permissions:
 jobs:
   validate:
     name: Compile iPhone and Apple Watch targets
-    # The carrier probe compiles behind `#if compiler(>=6.4)`, so the build needs the Swift 6.4
-    # toolchain from Xcode 27, which is what the xcode-27 image provides and what CircleCI uses.
-    # macos-26 works for everything except the probe code.
-    runs-on: xcode-27
+    # A hosted image, not the self-hosted `xcode-27` label: no runner with that label is
+    # registered for this repository, so every job that asked for it queued and then failed.
+    # The carrier probe compiles behind `#if compiler(>=6.4)` and is simply compiled out on an
+    # older toolchain, so the shipping targets build here.
+    runs-on: macos-26
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v7
@@ -94,7 +95,7 @@ jobs:
     name: Build the app bundle
     if: github.event_name != 'pull_request'
     needs: validate
-    runs-on: xcode-27
+    runs-on: macos-26
     timeout-minutes: 60
     outputs:
       configuration: ${{ steps.configuration.outputs.configuration }}
@@ -322,7 +323,7 @@ jobs:
     # Opt-in only, so an ordinary push never uploads a build. Automatic signing needs nothing but the
     # App Store Connect API key; no certificate and no provisioning profile are uploaded by hand.
     if: ${{ github.event_name == 'workflow_dispatch' && inputs.upload_to_testflight }}
-    runs-on: xcode-27
+    runs-on: macos-26
     timeout-minutes: 60
     env:
       TEAM_ID: 9V5XXDXF3N
