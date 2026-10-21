@@ -562,7 +562,7 @@ jobs:
             -allowProvisioningUpdates \
             CODE_SIGN_STYLE=Automatic \
             DEVELOPMENT_TEAM="$TEAM_ID" \
-            CODE_SIGN_IDENTITY="Apple Distribution" \
+            "CODE_SIGN_IDENTITY[sdk=iphoneos*]=Apple Distribution" \
             archive | tee /tmp/archive.log
 
       - name: Verify both apps are signed
