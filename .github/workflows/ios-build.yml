@@ -629,10 +629,12 @@ jobs:
             -authenticationKeyPath "$KEY_PATH" \
             -authenticationKeyID "$KEY_ID" \
             -authenticationKeyIssuerID "$ISSUER_ID" \
-            | tee /tmp/testflight-upload.log
+            2>&1 | tee /tmp/testflight-upload.log
 
           # destination=upload sends the build straight to App Store Connect and
           # writes no export directory, so the log is the only evidence to check.
+          # stderr is merged in: xcodebuild reports "Upload succeeded" there, and a
+          # pipe that drops it makes a successful upload look like a failure.
 
           grep -qE 'Upload succeeded|Delivered your binary|UPLOAD SUCCEEDED' /tmp/testflight-upload.log \
             || { echo '::error::the TestFlight upload did not report success.'; exit 1; }
