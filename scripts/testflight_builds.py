@@ -115,6 +115,20 @@ def main() -> int:
             f"{attributes.get('uploadedDate', '?'):<23} "
             f"{str(attributes.get('expired', '?'))}"
         )
+
+    newest = builds["data"][0]
+    try:
+        detail = get(f"/v1/builds/{newest['id']}/buildBetaDetail", bearer)["data"]["attributes"]
+        print(
+            "newest build {}: internal={} external={} autoNotify={}".format(
+                newest["attributes"].get("version", "?"),
+                detail.get("internalBuildState", "?"),
+                detail.get("externalBuildState", "?"),
+                detail.get("autoNotifyEnabled", "?"),
+            )
+        )
+    except SystemExit as failure:
+        print(f"beta detail unavailable: {failure}")
     return 0
 
 
