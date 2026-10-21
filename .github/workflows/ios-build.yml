@@ -535,6 +535,11 @@ jobs:
       # certificate and both provisioning profiles, so the identity and the profile names are left
       # unset on purpose. Naming them here is what produced the conflicting provisioning settings:
       # xcodebuild treated an explicit identity as a manual specification.
+      # The identity and the team are stated explicitly. Left to itself, an archive
+      # with automatic signing asks Apple for an "iOS App Development" profile,
+      # which needs a registered device; a team with no devices on file cannot
+      # mint one and the archive fails. A distribution identity asks for an App
+      # Store profile instead, which needs no device.
       - name: Archive with automatic signing
         env:
           BUILD_NUMBER: ${{ github.run_number }}
@@ -556,6 +561,8 @@ jobs:
             -authenticationKeyIssuerID "$ISSUER_ID" \
             -allowProvisioningUpdates \
             CODE_SIGN_STYLE=Automatic \
+            DEVELOPMENT_TEAM="$TEAM_ID" \
+            CODE_SIGN_IDENTITY="Apple Distribution" \
             archive | tee /tmp/archive.log
 
       - name: Verify both apps are signed
