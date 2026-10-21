@@ -167,7 +167,9 @@ final class IOSWatchCallBridge: NSObject, ObservableObject {
                 activeRequestID = nil
                 return
             }
-            UIApplication.shared.open(url)
+            // open(_:) is the async variant in the current SDK; awaiting it keeps
+            // the failure report accurate instead of racing the transition.
+            await UIApplication.shared.open(url)
             send(WatchBridgeMessage(kind: .callState, requestID: requestID, state: WatchBridgeCallState.handedToSystem.rawValue, detail: "Opened the iPhone dialler"))
             activeRequestID = nil
         }
