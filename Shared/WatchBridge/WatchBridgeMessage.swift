@@ -8,7 +8,7 @@ import Foundation
 /// awake, `transferUserInfo` when only the sender is, and `updateApplicationContext`
 /// when neither is. Keeping one representation means a message queued by one path
 /// is still readable when it arrives by another.
-enum WatchBridgeKind: String, Sendable {
+enum WatchBridgeKind: String, Sendable, Codable {
     /// Watch asks the iPhone to place a call.
     case requestCall = "call.request"
     /// Watch withdraws a request it has not had confirmed yet.
@@ -22,7 +22,7 @@ enum WatchBridgeKind: String, Sendable {
     case pong = "device.pong"
 }
 
-struct WatchBridgeMessage: Sendable, Equatable {
+struct WatchBridgeMessage: Sendable, Equatable, Codable {
     var kind: WatchBridgeKind
     var requestID: UUID
     var number: String?
@@ -95,7 +95,7 @@ struct WatchBridgeMessage: Sendable, Equatable {
 }
 
 /// The call states the iPhone reports back to the watch.
-enum WatchBridgeCallState: String, Sendable {
+enum WatchBridgeCallState: String, Sendable, Codable {
     case resolving
     case dialing
     case ringing
