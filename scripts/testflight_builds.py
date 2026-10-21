@@ -96,7 +96,12 @@ def main() -> int:
     app = apps["data"][0]
     print(f"app: {app['attributes']['name']}  id={app['id']}")
 
-    builds = get(f"/v1/apps/{app['id']}/builds?" + urllib.parse.urlencode({"limit": 5}), bearer)
+    # The collection endpoint accepts a sort; the app relationship endpoint does not.
+    builds = get(
+        "/v1/builds?"
+        + urllib.parse.urlencode({"filter[app]": app["id"], "limit": 5, "sort": "-uploadedDate"}),
+        bearer,
+    )
     if not builds.get("data"):
         print("no builds uploaded for this app yet")
         return 0
