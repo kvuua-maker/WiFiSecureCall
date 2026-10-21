@@ -539,24 +539,19 @@ jobs:
       # project and then refused a distribution identity as a conflict; stating
       # every value removes that decision from Xcode. The watch app builds for the
       # watchOS SDK, so it takes its own profile through the SDK-conditional form.
-      - name: Archive with manual signing
+      - name: Archive unsigned
         env:
           BUILD_NUMBER: ${{ github.run_number }}
           KEY_ID: ${{ secrets.APPSTORE_KEY_ID }}
           ISSUER_ID: ${{ secrets.APPSTORE_ISSUER_ID }}
-          IOS_PROFILE: ${{ secrets.PROVISIONING_PROFILE_SPECIFIER }}
-          WATCH_PROFILE: ${{ secrets.WATCH_PROVISIONING_PROFILE_SPECIFIER }}
         run: |
           set -euo pipefail
-          missing=''
-          [ -n "${IOS_PROFILE:-}" ] || missing="${missing:+$missing, }PROVISIONING_PROFILE_SPECIFIER"
-          [ -n "${WATCH_PROFILE:-}" ] || missing="${missing:+$missing, }WATCH_PROVISIONING_PROFILE_SPECIFIER"
-          if [ -n "$missing" ]; then
-            echo "::error::Manual signing needs the profile name for each target. Missing repository secret(s): $missing"
-            echo "::error::Set them to the exact provisioning profile names from Certificates, Identifiers & Profiles (for example 'WiFi Secure Call App Store' and 'WiFi Secure Call Watch App Store')."
-            exit 1
-          fi
           mkdir -p archives
+          # No signing at archive time. A signed archive would need a provisioning
+          # profile before anything is built, and Xcode asks for a development one,
+          # which cannot exist for a team with no registered devices. The export
+          # step signs instead, with the distribution identity, and that is where
+          # Xcode creates the certificate and the App Store profiles.
           xcodebuild \
             -project WiFiSecureCall.xcodeproj \
             -scheme WiFiSecureCall \
@@ -565,17 +560,10 @@ jobs:
             -archivePath "$ARCHIVE" \
             -derivedDataPath DerivedData \
             CURRENT_PROJECT_VERSION="$(( BUILD_NUMBER + 100 ))" \
-            -authenticationKeyPath "$KEY_PATH" \
-            -authenticationKeyID "$KEY_ID" \
-            -authenticationKeyIssuerID "$ISSUER_ID" \
-            CODE_SIGN_STYLE=Manual \
-            DEVELOPMENT_TEAM="$TEAM_ID" \
-            CODE_SIGN_IDENTITY="Apple Distribution" \
-            "PROVISIONING_PROFILE_SPECIFIER[sdk=iphoneos*]=$IOS_PROFILE" \
-            "PROVISIONING_PROFILE_SPECIFIER[sdk=watchos*]=$WATCH_PROFILE" \
+            CODE_SIGNING_ALLOWED=NO \
             archive | tee /tmp/archive.log
 
-      - name: Verify both apps are signed
+      - name: Confirm the archive carries both apps
         run: |
           set -euo pipefail
           iphone_app="$(find "$ARCHIVE/Products/Applications" -maxdepth 1 -name '*.app' -print -quit)"
@@ -583,14 +571,12 @@ jobs:
           watch_app="$(find "$iphone_app/Watch" -maxdepth 1 -name '*.app' -print -quit)"
           [ -n "$watch_app" ] || { echo '::error::the archive has no embedded Apple Watch app.'; exit 1; }
           for app in "$iphone_app" "$watch_app"; do
-            [ -d "$app/_CodeSignature" ] || { echo "::error::$app is not signed."; exit 1; }
-            [ -f "$app/embedded.mobileprovision" ] || { echo "::error::$app has no embedded provisioning profile."; exit 1; }
             identifier="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$app/Info.plist")"
             revision="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$app/Info.plist")"
-            echo "signed: $identifier build $revision"
+            echo "archived: $identifier build $revision"
           done
 
-      - name: Upload to TestFlight
+      - name: Sign for distribution and upload to TestFlight
         env:
           KEY_ID: ${{ secrets.APPSTORE_KEY_ID }}
           ISSUER_ID: ${{ secrets.APPSTORE_ISSUER_ID }}
@@ -632,7 +618,13 @@ jobs:
             -archivePath "$ARCHIVE" \
             -exportOptionsPlist "$RUNNER_TEMP/ExportOptions.plist" \
             -exportPath "$RUNNER_TEMP/export" \
+            -allowProvisioningUpdates \
+            -authenticationKeyPath "$KEY_PATH" \
+            -authenticationKeyID "$KEY_ID" \
+            -authenticationKeyIssuerID "$ISSUER_ID" \
             | tee /tmp/testflight-upload.log
+
+          ls -l "$RUNNER_TEMP/export"
 
           grep -qE 'Upload succeeded|Delivered your binary|UPLOAD SUCCEEDED' /tmp/testflight-upload.log \
             || { echo '::error::the TestFlight upload did not report success.'; exit 1; }
