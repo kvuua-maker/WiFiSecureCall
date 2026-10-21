@@ -65,6 +65,15 @@ The MVP protects signaling and media in transit with system TLS/WSS. It does not
 | `publish` | after `package` | Attaches the `.ipa` to a GitHub Release: the tag name for `v*` tags, otherwise the rolling `ci-latest` release, replaced on every run |
 | `testflight` | manual dispatch only | Optional signed build and TestFlight submission, needs only the App Store Connect API key listed below |
 
+Three workflows run on the repository:
+
+| Workflow | Trigger | Purpose |
+| --- | --- | --- |
+| `ios-build.yml` | push, pull request, tag, manual | The build above. Jobs run on the hosted `macos-26` image, not the self-hosted label the repository has no runner for |
+| `watch-sip.yml` | changes to `Shared/SIP`, `Watch` or the project | Compiles the Apple Watch target on its own, so a SIP regression is reported apart from everything else |
+| `secrets.yml` | push, pull request, weekly | gitleaks over the full history; `.gitleaks.toml` records the six reviewed false positives |
+
+
 The default path needs no Apple certificate, no provisioning profile and no App Store Connect key, and no secret at all: the release upload uses the built-in `GITHUB_TOKEN`. Without `IOS_BEARER_TOKEN` and `WATCH_BEARER_TOKEN` the artifact is built in the Debug configuration, because the Release build phases validate those tokens; with them it is built in the Release configuration.
 
 **The published `.ipa` is unsigned.** It contains the iPhone app and its embedded Apple Watch app, and it proves the build was compiled for both platforms, but Apple only accepts signed bundles on a device. Re-sign it with your own certificate, or configure the credentials below and use the `testflight` job.
