@@ -73,11 +73,38 @@ def get(path: str, bearer: str) -> dict:
         raise SystemExit(f"App Store Connect returned HTTP {error.code} for {path}: {body}")
 
 
+def list_apps(bearer: str) -> None:
+    """Print every app record and its newest build.
+
+    A build that is missing from the expected app is often attached to another app
+    record in the same team, and this is what shows it.
+    """
+    apps = get("/v1/apps?" + urllib.parse.urlencode({"limit": 50}), bearer)
+    for app in apps.get("data", []):
+        attributes = app["attributes"]
+        line = f"{attributes.get('bundleId','?'):<45} id={app['id']:<12}"
+        builds = get(
+            "/v1/builds?"
+            + urllib.parse.urlencode({"filter[app]": app["id"], "limit": 1, "sort": "-uploadedDate"}),
+            bearer,
+        )
+        if builds.get("data"):
+            newest = builds["data"][0]["attributes"]
+            line += f" newest={newest.get('version','?')} ({newest.get('processingState','?')}) {newest.get('uploadedDate','?')}"
+        else:
+            line += " newest=none"
+        print(line)
+
+
 def main() -> int:
     key_id = os.environ.get("KEY_ID", "").strip()
     issuer = os.environ.get("ISSUER_ID", "").strip()
     secret = os.environ.get("PRIVATE_KEY", "")
     bundle_id = os.environ.get("BUNDLE_ID", "com.vkapps.wifisecurecall")
+    if os.environ.get("LIST_APPS") == "1":
+        list_apps(token(key_id, issuer, pem_from_secret(secret)))
+        return 0
+
     if not (key_id and issuer and secret):
         print("::error::KEY_ID, ISSUER_ID and PRIVATE_KEY are required.", file=sys.stderr)
         return 2

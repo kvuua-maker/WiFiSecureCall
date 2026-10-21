@@ -37,6 +37,7 @@ jobs:
           ISSUER_ID: ${{ secrets.APPSTORE_ISSUER_ID }}
           PRIVATE_KEY: ${{ secrets.APPSTORE_PRIVATE_KEY }}
           BUNDLE_ID: com.vkapps.wifisecurecall
+          LIST_APPS: "1"
         run: |
           set -euo pipefail
           python3 -m pip install --quiet --disable-pip-version-check pyjwt cryptography
