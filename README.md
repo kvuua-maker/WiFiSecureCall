@@ -8,6 +8,35 @@ Apple Watch links to an authenticated iPhone account through the server over the
 
 Independent iPhone and Apple Watch MVP for live Internet audio calls over HTTPS/WSS.
 
+## Standalone SIP client on Apple Watch
+
+The watch no longer needs an iPhone to place a call. It registers with a SIP
+server itself, negotiates an audio stream and runs the media path on the watch:
+
+| Layer | File | Responsibility |
+| --- | --- | --- |
+| Messages | `Shared/SIP/SIPMessage.swift` | Parses and renders SIP requests and responses, including folded headers and LF endings |
+| Authentication | `Shared/SIP/SIPDigest.swift` | Answers 401 and 407 with MD5 or SHA-256 and `qop=auth` |
+| Transport | `Shared/SIP/SIPTransport.swift` | SIP over a secure WebSocket (RFC 7118) with keepalives and reconnect backoff |
+| Description | `Shared/SIP/SDP.swift` | Builds and reads the audio stream without touching crypto or candidate lines |
+| Codec | `Shared/SIP/G711.swift` | PCMU and PCMA, the codecs every trunk supports |
+| Media | `Shared/SIP/RTPMediaSession.swift` | A real UDP socket so the SDP offer names the port that is used, plus a jitter buffer |
+| Audio | `Shared/SIP/SIPAudioEngine.swift` | An 8 kHz capture and playout path |
+| Signalling | `Shared/SIP/SIPClient.swift` | Registration, one dialog, CANCEL, ACK for 2xx and non-2xx, BYE, DTMF over INFO |
+| Session | `Watch/SIPCallSession.swift` | CallKit, the media socket and the screen state |
+
+The SIP account is entered on the watch and stored in the keychain
+(`Watch/SIPAccountStore.swift`); nothing about it comes from the paired iPhone.
+A bare number is dialled at the account's domain, which is the SIP gateway that
+routes it to the trunk; a full `sip:` URI is used as it stands.
+
+Incoming calls are reported to CallKit while the app is running. Delivering an
+incoming call to a watch that is not running needs a VoIP push from the server,
+which is a separate piece of work and is not implemented here.
+
+The server side of this — registrar, trunk routing and the RTP relay — is
+`cmd/sipgateway` in the companion repository.
+
 ## Call audio on Apple Watch
 
 Call audio runs on the device that places or answers the call. On the watch that means the microphone capture
