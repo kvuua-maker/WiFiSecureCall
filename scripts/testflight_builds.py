@@ -65,8 +65,12 @@ def token(key_id: str, issuer: str, pem: bytes) -> str:
 def get(path: str, bearer: str) -> dict:
     request = urllib.request.Request(API + path)
     request.add_header("Authorization", "Bearer " + bearer)
-    with urllib.request.urlopen(request, timeout=30) as response:
-        return json.load(response)
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            return json.load(response)
+    except urllib.error.HTTPError as error:
+        body = error.read().decode(errors="replace")[:400]
+        raise SystemExit(f"App Store Connect returned HTTP {error.code} for {path}: {body}")
 
 
 def main() -> int:
@@ -92,7 +96,7 @@ def main() -> int:
     app = apps["data"][0]
     print(f"app: {app['attributes']['name']}  id={app['id']}")
 
-    builds = get(f"/v1/apps/{app['id']}/builds?" + urllib.parse.urlencode({"limit": 5, "sort": "-uploadedDate"}), bearer)
+    builds = get(f"/v1/apps/{app['id']}/builds?" + urllib.parse.urlencode({"limit": 5}), bearer)
     if not builds.get("data"):
         print("no builds uploaded for this app yet")
         return 0
