@@ -10,7 +10,7 @@ import WatchKit
 /// screen: "0", delete and call each own a cell, so a tap can never land on a
 /// neighbour, and the call action is a full-width button instead of a glyph
 /// squeezed between two other controls.
-struct WatchDialPadView: View {
+struct PigeonDialView: View {
     @Environment(\.dismiss) private var dismiss
 
     @State private var number = ""

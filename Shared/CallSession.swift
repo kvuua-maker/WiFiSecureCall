@@ -68,8 +68,11 @@ private struct TerminalCompensation {
 
 @MainActor
 final class CallSession: ObservableObject {
+    private(set) var stateEnteredAt = Date()
+
     @Published private(set) var state: CallState = .idle {
         didSet {
+            stateEnteredAt = Date()
             if case let .failed(_, failure) = state {
                 DiagnosticsLog.shared.log(.state, "call_state_transition", .error, details: "\(state) \(failure.rawValue)")
             } else {
@@ -540,7 +543,15 @@ final class CallSession: ObservableObject {
                     case .ringing: break
                     default: await self.remoteTerminal(response, generation: current); return
                     }
-                } catch { self.recordRuntimeDiagnostic("call_state_poll_failure", status: "transient", callID: current.serverCallID, domain: (error as NSError).domain, code: (error as NSError).code) }
+                } catch {
+                    if Self.isMissingCall(error) {
+                        self.recordRuntimeDiagnostic("call_missing_on_server", status: "ended", callID: current.serverCallID)
+                        await self.teardownLocal(current, finalState: .ended(current.serverCallID), reportReason: nil)
+                        self.invalidateGeneration()
+                        return
+                    }
+                    self.recordRuntimeDiagnostic("call_state_poll_failure", status: "transient", callID: current.serverCallID, domain: (error as NSError).domain, code: (error as NSError).code)
+                }
                 do { try await Task.sleep(nanoseconds: 500_000_000) } catch { return }
             }
             guard self.isCurrent(current) else { return }
@@ -856,7 +867,16 @@ final class CallSession: ObservableObject {
                 _ = try await retained.signaling.mutate(retained.mutation, callID: current.serverCallID, requestID: retained.requestID)
                 terminalCompensations.removeValue(forKey: current.id)
                 return
-            } catch { continue }
+            } catch {
+                if Self.isMissingCall(error) {
+                    // The server already dropped the call; the compensation has
+                    // nothing left to cancel.
+                    recordRuntimeDiagnostic("terminal_mutation_missing", status: retained.mutation.rawValue, callID: current.serverCallID)
+                    terminalCompensations.removeValue(forKey: current.id)
+                    return
+                }
+                continue
+            }
         }
         recordRuntimeDiagnostic("terminal_mutation_failed", status: retained.mutation.rawValue, callID: current.serverCallID)
     }
@@ -887,10 +907,46 @@ final class CallSession: ObservableObject {
         invalidateGeneration(expected: current)
     }
 
+    /// A call the server has forgotten is finished, not broken.
+    private static func isMissingCall(_ error: Error) -> Bool {
+        guard let apiError = error as? AccountAPIError, case let .status(code, _) = apiError else { return false }
+        return code == 404 || code == 410
+    }
+
+    /// Ends a local call that the server no longer knows about, so a dead call
+    /// cannot keep the device busy forever.
+    func resetIfStalled(olderThan: TimeInterval = 15) {
+        switch state {
+        case .outgoingRinging, .connecting:
+            guard Date().timeIntervalSince(stateEnteredAt) > olderThan, let current = generation else { return }
+            recordRuntimeDiagnostic("foreground_stale_reset", status: String(describing: state), callID: current.serverCallID)
+            spawn { [weak self] in
+                guard let self else { return }
+                await self.teardownLocal(current, finalState: .ended(current.serverCallID), reportReason: nil)
+                self.invalidateGeneration()
+            }
+        default:
+            break
+        }
+    }
+
     private func prepareForIndependentCall() async -> Bool {
         if state.isTerminal { invalidateGeneration(); transition(.idle) }
-        guard case .idle = state else { return false }
-        return true
+        if case .idle = state { return true }
+        // A new incoming call wins over a local call that never connected. An
+        // outgoing call stuck in ringing used to block the phone from ringing at
+        // all, which looked exactly like a failed push.
+        switch state {
+        case .outgoingRinging, .connecting:
+            guard let current = generation else { invalidateGeneration(); transition(.idle); return true }
+            recordRuntimeDiagnostic("stale_call_terminated", status: "incoming_replaces", callID: current.serverCallID)
+            await teardownLocal(current, finalState: .ended(current.serverCallID), reportReason: nil)
+            invalidateGeneration()
+            transition(.idle)
+            return true
+        default:
+            return false
+        }
     }
 
     @discardableResult private func beginGeneration(serverID: UUID, localID: UUID, outgoing: Bool, signaling: any CallSignaling) -> CallGeneration {

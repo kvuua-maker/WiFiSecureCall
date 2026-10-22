@@ -2,7 +2,7 @@ import SwiftUI
 
 /// What the watch shows, in three states and no more: signed out, the list of
 /// people, or a call.
-struct WatchRootView: View {
+struct PigeonRootView: View {
     @ObservedObject var session: CallSession
     @ObservedObject private var accountStore = AccountSessionStore.shared
     @ObservedObject private var contacts = WatchContactsStore.shared
@@ -25,12 +25,12 @@ struct WatchRootView: View {
     var body: some View {
         Group {
             if isOnCall {
-                WatchInCallView(session: session)
+                PigeonCallScreen(session: session)
             } else if account == nil && !isUITesting {
-                WatchSignInView()
+                PigeonSignInView()
             } else {
                 ZStack(alignment: .bottom) {
-                    WatchHomeView(session: session)
+                    PigeonListView(session: session)
                     bottomBar
                 }
             }
@@ -51,6 +51,7 @@ struct WatchRootView: View {
             case .active:
                 DiagnosticsLog.shared.log(.lifecycle, "entered_foreground", .info)
                 bridge.applicationDidBecomeActive()
+                session.resetIfStalled()
                 contacts.refresh(synced: bridge.syncedAccounts)
                 if account != nil, case .ended = session.state { session.reset() }
             case .inactive:

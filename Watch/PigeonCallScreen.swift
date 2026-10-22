@@ -5,7 +5,7 @@ import SwiftUI
 /// One person, one timer, two buttons. The timer is the largest thing on the
 /// screen because that is what a wrist glance is for, and the two controls are
 /// 60 pt circles at the edge of the display where a thumb reaches without looking.
-struct WatchInCallView: View {
+struct PigeonCallScreen: View {
     @ObservedObject var session: CallSession
     @Environment(\.dismiss) private var dismiss
 

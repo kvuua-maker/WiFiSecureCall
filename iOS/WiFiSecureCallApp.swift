@@ -11,5 +11,5 @@ struct WiFiSecureCallApp: App {
         _session = StateObject(wrappedValue: runtime.callSession)
     }
 
-    var body: some Scene { WindowGroup { IOSRootView(session: session) } }
+    var body: some Scene { WindowGroup { TelegramRootView(session: session) } }
 }

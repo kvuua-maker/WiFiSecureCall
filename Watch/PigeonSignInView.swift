@@ -4,7 +4,7 @@ import SwiftUI
 ///
 /// Nothing else is on this screen, because on a 40 mm display every extra control
 /// is a thing to misread while standing up.
-struct WatchSignInView: View {
+struct PigeonSignInView: View {
     @EnvironmentObject private var appleAuthentication: WatchAppleAuthenticationCoordinator
 
     var body: some View {

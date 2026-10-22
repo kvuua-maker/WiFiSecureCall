@@ -2,7 +2,7 @@ import SwiftUI
 
 /// The iPhone app's shell: the three-tab messenger, plus the sheets that belong to
 /// configuration rather than to a conversation.
-struct IOSRootView: View {
+struct TelegramRootView: View {
     @ObservedObject var session: CallSession
     @StateObject private var accountStore = AccountSessionStore.shared
     @State private var showAccount = false

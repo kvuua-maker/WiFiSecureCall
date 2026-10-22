@@ -43,6 +43,9 @@ final class IOSNotificationController: NSObject, UIApplicationDelegate, UNUserNo
 
     func applicationDidBecomeActive(_ application: UIApplication) {
         DiagnosticsLog.shared.log(.lifecycle, "entered_foreground", .info, details: "iOS")
+        // A call that never left outgoingRinging while the app was away must not
+        // keep the phone busy: it would swallow the next incoming push.
+        NotificationRuntime.shared.callSession.resetIfStalled()
         Task { @MainActor in await refreshNotificationAuthorization() }
     }
 

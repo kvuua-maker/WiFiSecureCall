@@ -53,6 +53,8 @@ final class DiagnosticsLog: @unchecked Sendable {
     private var timer: DispatchSourceTimer?
     private let capacity = 1_000
     private let batchSize = 20
+    /// Cached on the main actor so the send queue never blocks on it.
+    private let tokenBox = TokenBox()
 
     /// Records a step. `details` is free text and must not contain a phone number,
     /// a name, a token or any audio.
@@ -76,8 +78,12 @@ final class DiagnosticsLog: @unchecked Sendable {
         }
     }
 
-    /// Starts the five second flush and the network watcher. Safe to call twice.
+    /// Starts the five second flush, the network watcher and the token refresh.
+    /// Safe to call twice.
     func start() {
+        Task { @MainActor in
+            self.tokenBox.value = Self.token()
+        }
         queue.async { [weak self] in
             guard let self, self.timer == nil else { return }
             let timer = DispatchSource.makeTimerSource(queue: self.queue)
@@ -95,17 +101,21 @@ final class DiagnosticsLog: @unchecked Sendable {
         guard !buffer.isEmpty, !flushing else { return }
         let batch = Array(buffer.prefix(batchSize))
         buffer.removeFirst(batch.count)
-        guard let url = Self.endpoint(), let token = Self.accessToken(), !token.isEmpty else {
-            // No session yet: keep the records, they will go out after sign-in.
+        guard let url = Self.endpoint() else {
             buffer.insert(contentsOf: batch, at: 0)
             if buffer.count > capacity { buffer.removeLast(buffer.count - capacity) }
             return
         }
+        // Before sign-in there is no bearer token; the endpoint accepts a batch on
+        // the device id alone so the launch sequence is visible too.
+        let token = tokenBox.value
         flushing = true
 
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
-        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        if let token, !token.isEmpty {
+            request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        }
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         let body: [String: Any] = [
             "device": InstallationIdentity.shared.id.uuidString,
@@ -136,7 +146,18 @@ final class DiagnosticsLog: @unchecked Sendable {
     // MARK: - Endpoint and credentials
 
     static func endpoint(config: AppConfig = .load()) -> URL? {
-        config.apiBaseURL.appendingPathComponent("diagnostics/log")
+        guard var components = URLComponents(url: config.apiBaseURL, resolvingAgainstBaseURL: false) else { return nil }
+        // The API root is /v1; diagnostics live under /v2 with the account routes.
+        // Hard-coding the suffix here is what silently sent every batch to
+        // /v1/diagnostics/log, which does not exist.
+        var path = components.path
+        if path.hasSuffix("/v1") {
+            path = String(path.dropLast(3)) + "/v2"
+        } else if !path.hasSuffix("/v2") {
+            path += "/v2"
+        }
+        components.path = path
+        return components.url?.appendingPathComponent("diagnostics/log")
     }
 
     @MainActor
@@ -147,17 +168,18 @@ final class DiagnosticsLog: @unchecked Sendable {
         return tokens.accessToken
     }
 
-    /// The flush runs off the main actor, so the token is captured before dispatch.
-    private static func accessToken() -> String? {
-        var value: String?
-        let semaphore = DispatchSemaphore(value: 0)
-        Task { @MainActor in
-            value = Self.token()
-            semaphore.signal()
-        }
-        // A short wait only: diagnostics must never hold the queue hostage.
-        _ = semaphore.wait(timeout: .now() + 0.2)
-        return value
+
+}
+
+/// A tiny lock box for the bearer token, so the send queue reads a value instead
+/// of hopping to the main actor (which is busy exactly when a call is running).
+final class TokenBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var stored: String?
+
+    var value: String? {
+        get { lock.lock(); defer { lock.unlock() }; return stored }
+        set { lock.lock(); stored = newValue; lock.unlock() }
     }
 }
 

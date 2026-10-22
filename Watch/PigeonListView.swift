@@ -5,7 +5,7 @@ import SwiftUI
 /// Each row is a card with initials, name and status. Long-press opens the two
 /// ways to reach somebody, swipe-left removes the row from this watch, and a glow
 /// in the corner says the media path is live without needing a status line.
-struct WatchHomeView: View {
+struct PigeonListView: View {
     @ObservedObject var session: CallSession
     @ObservedObject private var contacts = WatchContactsStore.shared
     @ObservedObject private var bridge = WatchCallBridge.shared
@@ -33,7 +33,7 @@ struct WatchHomeView: View {
                 .padding(.bottom, 10)
             }
         }
-        .sheet(isPresented: $showDialPad) { WatchDialPadView() }
+        .sheet(isPresented: $showDialPad) { PigeonDialView() }
     }
 
     // MARK: - Pieces
