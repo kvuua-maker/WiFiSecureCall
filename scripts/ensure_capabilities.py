@@ -30,6 +30,18 @@ WANTED = {
 }
 
 
+def capabilities(token: str, bundle_id: str) -> dict:
+    """Read the enabled capabilities of one App ID.
+
+    The relationship endpoint rejects a limit parameter on some API versions, so
+    fall back to the filtered collection before giving up.
+    """
+    try:
+        return request("GET", f"/v1/bundleIds/{bundle_id}/bundleIdCapabilities", token)
+    except SystemExit:
+        return request("GET", f"/v1/bundleIdCapabilities?filter[bundleId]={bundle_id}&limit=200", token)
+
+
 def request(method: str, path: str, token: str, body: dict | None = None) -> dict:
     data = json.dumps(body).encode() if body is not None else None
     req = urllib.request.Request(API + path, data=data, method=method)
@@ -68,10 +80,9 @@ def main() -> int:
             failures += 1
             continue
 
-        capabilities = request("GET", f"/v1/bundleIds/{bundle_id}/bundleIdCapabilities?limit=200", token)
         enabled = {
             entry["attributes"]["capabilityType"]
-            for entry in capabilities.get("data", [])
+            for entry in capabilities(token, bundle_id).get("data", [])
         }
         missing = {name: label for name, label in WANTED.items() if name not in enabled}
         print(f"{identifier}: enabled={sorted(enabled)}")
@@ -86,8 +97,7 @@ def main() -> int:
             )
             print(f"{identifier}: enabled {label} ({name})")
 
-        after = request("GET", f"/v1/bundleIds/{bundle_id}/bundleIdCapabilities?limit=200", token)
-        now = {entry["attributes"]["capabilityType"] for entry in after.get("data", [])}
+        now = {entry["attributes"]["capabilityType"] for entry in capabilities(token, bundle_id).get("data", [])}
         still = [label for name, label in WANTED.items() if name not in now]
         if still:
             print(f"::error::{identifier} is still missing: {', '.join(still)}")
