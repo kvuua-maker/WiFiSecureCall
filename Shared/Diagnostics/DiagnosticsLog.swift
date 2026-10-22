@@ -207,7 +207,7 @@ enum DiagnosticsEnvironment {
     static func recordLaunch() {
         DiagnosticsLog.shared.log(.lifecycle, "app_launched", .info, details: "build=\(Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? "?")")
 
-        #if canImport(UIKit)
+        #if os(iOS)
         let device = UIDevice.current
         device.isBatteryMonitoringEnabled = true
         let battery = Int((device.batteryLevel * 100).rounded())
