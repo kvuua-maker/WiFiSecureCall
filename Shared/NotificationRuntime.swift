@@ -92,18 +92,32 @@ final class NotificationRuntime {
             callSession.failToStart(.accountSessionInvalid)
             return
         }
-        let matches: [AccountDeviceSummary]
+        let devices: [AccountDeviceSummary]
         do {
-            matches = try await accountAPI.devices(accountID: accountID).filter {
-                $0.deviceID != InstallationIdentity.shared.id && $0.callReady
+            devices = try await accountAPI.devices(accountID: accountID).filter {
+                $0.deviceID != InstallationIdentity.shared.id
             }
         } catch {
             callSession.failToStart(Self.isInvalidAccountSession(error) ? .accountSessionInvalid : .serverUnavailable)
             return
         }
-        let preferred = matches.filter { preferredPlatforms.contains($0.platform) }
-        guard let target = Self.selectTarget(preferred: preferred, allReady: matches, allowAnyPlatformFallback: allowAnyPlatformFallback) else {
-            let ambiguous = preferred.count > 1 || (allowAnyPlatformFallback && preferred.isEmpty && matches.count > 1)
+        let ready = devices.filter(\.callReady)
+        let preferred = ready.filter { preferredPlatforms.contains($0.platform) }
+        var target = Self.selectTarget(preferred: preferred, allReady: ready, allowAnyPlatformFallback: allowAnyPlatformFallback)
+        if target == nil {
+            // No device reports itself call-ready. That flag is a cached capability,
+            // so it goes stale the moment notifications are granted after the token
+            // was uploaded, or a push token rotates. With exactly one other device
+            // there is no ambiguity about who was meant, so the call is attempted;
+            // the server and the delivery report decide whether it can ring.
+            let preferredAny = devices.filter { preferredPlatforms.contains($0.platform) }
+            if preferredAny.count == 1 {
+                target = preferredAny[0]
+                callSession.recordLifecycleDiagnostic("call_target_not_ready", status: "attempting the only registered device", callID: nil)
+            }
+        }
+        guard let target else {
+            let ambiguous = preferred.count > 1 || (allowAnyPlatformFallback && preferred.isEmpty && ready.count > 1)
             callSession.failToStart(ambiguous ? .targetAmbiguous : .targetUnavailable)
             return
         }

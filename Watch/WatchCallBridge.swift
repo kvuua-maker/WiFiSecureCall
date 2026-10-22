@@ -104,6 +104,8 @@ final class WatchCallBridge: NSObject, ObservableObject {
     @Published private(set) var isMutedOnPhone = false
     /// Who the current call is with, for the call screen.
     @Published private(set) var remoteDisplayName = ""
+    /// Account labels published by the paired iPhone.
+    @Published private(set) var syncedAccounts: [String] = []
 
     private var session: WCSession?
     private let outbox = WatchCallOutbox()
@@ -331,6 +333,9 @@ final class WatchCallBridge: NSObject, ObservableObject {
             session?.transferUserInfo(WatchBridgeMessage(kind: .pong, requestID: message.requestID).dictionary)
         case .pong:
             break
+        case .accountsSynced:
+            syncedAccounts = message.accounts ?? []
+            status = syncedAccounts.isEmpty ? "" : "Accounts in sync"
         case .requestCall, .cancelCall, .callControl:
             break
         }

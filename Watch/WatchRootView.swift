@@ -9,6 +9,9 @@ import SwiftUI
 struct WatchRootView: View {
     @ObservedObject var session: CallSession
     @ObservedObject private var accountStore = AccountSessionStore.shared
+    /// Kept alive so the paired iPhone can publish its account list and any
+    /// incoming-call hint; the bridge carries commands, never audio.
+    @ObservedObject private var bridge = WatchCallBridge.shared
     @EnvironmentObject private var appleAuthentication: WatchAppleAuthenticationCoordinator
     @Environment(\.scenePhase) private var scenePhase
 
@@ -51,8 +54,17 @@ struct WatchRootView: View {
         .sheet(isPresented: $showDialPad) { WatchDialPadView() }
         .sheet(isPresented: $showAccount) { WatchAccountLinkView(store: accountStore) }
         .sheet(isPresented: $showDiagnostics) { WatchDiagnosticsView(session: session) }
+        .onAppear { bridge.activate() }
         .onChange(of: scenePhase) { phase in
-            if phase == .active, account != nil, case .ended = session.state { session.reset() }
+            switch phase {
+            case .active:
+                bridge.applicationDidBecomeActive()
+                if account != nil, case .ended = session.state { session.reset() }
+            case .inactive, .background:
+                bridge.applicationWillResignActive()
+            @unknown default:
+                break
+            }
         }
     }
 
@@ -258,6 +270,7 @@ struct WatchDiagnosticsView: View {
                 row("Account", AccountSessionStore.shared.activeAccount?.displayLabel ?? "signed out")
                 row("Call", String(describing: session.state))
                 row("Muted", session.isMuted ? "yes" : "no")
+                row("Accounts in sync", WatchCallBridge.shared.syncedAccounts.isEmpty ? "none" : WatchCallBridge.shared.syncedAccounts.joined(separator: ", "))
             }
             .padding(.horizontal, 4)
         }

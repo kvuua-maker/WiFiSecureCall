@@ -19,6 +19,8 @@ enum WatchBridgeKind: String, Sendable, Codable {
     case incomingCall = "call.incoming"
     /// Watch asks the iPhone to mute, unmute or end the live call.
     case callControl = "call.control"
+    /// The iPhone publishes its account list so both devices show the same set.
+    case accountsSynced = "accounts.synced"
     /// Liveness probe, sent by either side while a call is up.
     case ping = "device.ping"
     case pong = "device.pong"
@@ -32,6 +34,8 @@ struct WatchBridgeMessage: Sendable, Equatable, Codable {
     var detail: String?
     var callID: UUID?
     var caller: String?
+    /// Account labels, phone numbers left out of the wire on purpose.
+    var accounts: [String]?
     var sentAt: Date
 
     init(
@@ -42,6 +46,7 @@ struct WatchBridgeMessage: Sendable, Equatable, Codable {
         detail: String? = nil,
         callID: UUID? = nil,
         caller: String? = nil,
+        accounts: [String]? = nil,
         sentAt: Date = Date()
     ) {
         self.kind = kind
@@ -51,6 +56,7 @@ struct WatchBridgeMessage: Sendable, Equatable, Codable {
         self.detail = detail
         self.callID = callID
         self.caller = caller
+        self.accounts = accounts
         self.sentAt = sentAt
     }
 
@@ -67,6 +73,7 @@ struct WatchBridgeMessage: Sendable, Equatable, Codable {
         payload["detail"] = detail
         payload["callID"] = callID?.uuidString
         payload["caller"] = caller
+        payload["accounts"] = accounts
         return payload
     }
 
@@ -91,6 +98,7 @@ struct WatchBridgeMessage: Sendable, Equatable, Codable {
             detail: dictionary["detail"] as? String,
             callID: (dictionary["callID"] as? String).flatMap(UUID.init(uuidString:)),
             caller: dictionary["caller"] as? String,
+            accounts: dictionary["accounts"] as? [String],
             sentAt: sentAt
         )
     }

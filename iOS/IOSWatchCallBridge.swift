@@ -122,6 +122,16 @@ final class IOSWatchCallBridge: NSObject, ObservableObject {
         }
     }
 
+    /// Publishes the account list so the watch and the phone agree on who is signed
+    /// in. Only labels travel: tokens stay on the device that owns them.
+    func publishAccounts() {
+        let labels = AccountSessionStore.shared.accounts.map { account -> String in
+            let label = account.displayLabel.trimmingCharacters(in: .whitespaces)
+            return label.isEmpty ? account.accountID.uuidString : label
+        }
+        send(WatchBridgeMessage(kind: .accountsSynced, accounts: labels))
+    }
+
     /// Tells the watch that a call is ringing, after a VoIP push woke this app.
     func notifyIncoming(callID: UUID, caller: String?) {
         send(WatchBridgeMessage(kind: .incomingCall, callID: callID, caller: caller))
@@ -204,6 +214,7 @@ extension IOSWatchCallBridge: WCSessionDelegate {
             self.isReachable = session.isReachable
             if activationState == .activated {
                 self.observeCallState()
+                self.publishAccounts()
             } else if let error {
                 self.lastError = error.localizedDescription
             }
