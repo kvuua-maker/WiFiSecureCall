@@ -17,6 +17,8 @@ enum WatchBridgeKind: String, Sendable, Codable {
     case callState = "call.state"
     /// iPhone tells the watch that a call is ringing.
     case incomingCall = "call.incoming"
+    /// Watch asks the iPhone to mute, unmute or end the live call.
+    case callControl = "call.control"
     /// Liveness probe, sent by either side while a call is up.
     case ping = "device.ping"
     case pong = "device.pong"
@@ -103,4 +105,22 @@ enum WatchBridgeCallState: String, Sendable, Codable {
     case ended
     case failed
     case handedToSystem
+}
+
+
+/// What the watch can ask the iPhone to do to a call it is hosting.
+enum WatchCallControl: Sendable {
+    case mute(Bool)
+    case end
+
+    var state: String {
+        switch self {
+        case let .mute(value): return value ? "mute" : "unmute"
+        case .end: return "end"
+        }
+    }
+
+    var message: WatchBridgeMessage {
+        WatchBridgeMessage(kind: .callControl, state: state)
+    }
 }

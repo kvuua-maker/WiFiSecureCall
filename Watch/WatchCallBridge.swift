@@ -99,6 +99,11 @@ final class WatchCallBridge: NSObject, ObservableObject {
     @Published private(set) var lastDeliveredRequest: UUID?
     @Published private(set) var incoming: WatchBridgeMessage?
     @Published private(set) var lastIncomingState: WatchBridgeCallState?
+    /// When the call became active, so the screen can show a real duration.
+    @Published private(set) var callStartedAt: Date?
+    @Published private(set) var isMutedOnPhone = false
+    /// Who the current call is with, for the call screen.
+    @Published private(set) var remoteDisplayName = ""
 
     private var session: WCSession?
     private let outbox = WatchCallOutbox()
@@ -155,6 +160,7 @@ final class WatchCallBridge: NSObject, ObservableObject {
         let trimmed = number.trimmingCharacters(in: .whitespacesAndNewlines)
         guard trimmed.count >= 3 else { return .unavailable("Enter at least 3 digits") }
 
+        remoteDisplayName = trimmed
         let message = WatchBridgeMessage(kind: .requestCall, number: trimmed)
         // Written down before anything is attempted: if the app is suspended
         // between here and the send, the request still exists.
@@ -175,6 +181,37 @@ final class WatchCallBridge: NSObject, ObservableObject {
         outbox.markTransferred(message.requestID)
         status = "Will call when the iPhone is free"
         return .queued
+    }
+
+    /// Sends a control command for the call the iPhone is hosting.
+    ///
+    /// The call itself runs on the phone, so the watch cannot change it directly;
+    /// this is the message that does, and it is best effort by design — a control
+    /// that cannot be delivered must not look like a failed call.
+    func toggleMuteOnPhone() {
+        let next = !isMutedOnPhone
+        isMutedOnPhone = next
+        sendControl(.mute(next))
+    }
+
+    func endCallOnPhone() {
+        sendControl(.end)
+        callStartedAt = nil
+    }
+
+    func sendControl(_ control: WatchCallControl) {
+        guard isSupported else { return }
+        activate()
+        guard let session, session.activationState == .activated else {
+            status = "iPhone is not reachable"
+            return
+        }
+        let payload = control.message.dictionary
+        if session.isReachable {
+            session.sendMessage(payload, replyHandler: nil, errorHandler: { _ in })
+        } else {
+            session.transferUserInfo(payload)
+        }
     }
 
     func cancelPendingRequests() {
@@ -205,7 +242,15 @@ final class WatchCallBridge: NSObject, ObservableObject {
 
     func clearIncoming() {
         incoming = nil
+    }
+
+    /// Puts the call screen back to idle without touching the call itself.
+    func resetCallDisplay() {
         lastIncomingState = nil
+        callStartedAt = nil
+        isMutedOnPhone = false
+        remoteDisplayName = ""
+        status = ""
     }
 
     // MARK: - Delivery
@@ -235,11 +280,19 @@ final class WatchCallBridge: NSObject, ObservableObject {
             if let raw = message.state, let state = WatchBridgeCallState(rawValue: raw) {
                 lastIncomingState = state
                 status = Self.describe(state, detail: message.detail)
-                if state == .active { startHeartbeat() }
+                if state == .active {
+                    if callStartedAt == nil { callStartedAt = Date() }
+                    startHeartbeat()
+                }
+                if state == .ended || state == .failed {
+                    callStartedAt = nil
+                    isMutedOnPhone = false
+                }
                 if state == .ended || state == .failed || state == .handedToSystem { stopHeartbeat() }
             }
         case .incomingCall:
             incoming = message
+            remoteDisplayName = message.caller ?? "iPhone"
             status = "Incoming call on iPhone"
         case .ping:
             session?.transferUserInfo(WatchBridgeMessage(kind: .pong, requestID: message.requestID).dictionary)

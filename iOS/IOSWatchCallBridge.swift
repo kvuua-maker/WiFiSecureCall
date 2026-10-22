@@ -130,6 +130,10 @@ final class IOSWatchCallBridge: NSObject, ObservableObject {
     // MARK: - Receiving from the watch
 
     private func receive(_ message: WatchBridgeMessage) {
+        if message.kind == .callControl {
+            applyControl(message)
+            return
+        }
         guard message.kind == .requestCall else { return }
         pruneHandled()
         guard handled[message.requestID] == nil else { return }
@@ -144,6 +148,22 @@ final class IOSWatchCallBridge: NSObject, ObservableObject {
         send(WatchBridgeMessage(kind: .callState, requestID: message.requestID, state: WatchBridgeCallState.resolving.rawValue))
 
         Task { await self.place(requestID: message.requestID, number: number) }
+    }
+
+    /// A control from the wrist: the call lives here, so applying it here is the
+    /// only way the watch buttons can do anything.
+    private func applyControl(_ message: WatchBridgeMessage) {
+        let session = NotificationRuntime.shared.callSession
+        switch message.state {
+        case "mute":
+            if !session.isMuted { session.toggleMute() }
+        case "unmute":
+            if session.isMuted { session.toggleMute() }
+        case "end":
+            Task { await session.endCall() }
+        default:
+            break
+        }
     }
 
     private func place(requestID: UUID, number: String) async {

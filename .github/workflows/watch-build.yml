@@ -55,3 +55,47 @@ jobs:
           name: watch-build-log
           path: /tmp/watch-build.log
           if-no-files-found: ignore
+
+  ui-tests:
+    name: Dialpad UI tests
+    runs-on: macos-26
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Report toolchain
+        run: |
+          set -euo pipefail
+          xcodebuild -version
+          xcrun --sdk watchsimulator --show-sdk-version
+
+      - name: Pick an available watch simulator
+        id: device
+        run: |
+          set -euo pipefail
+          # The device name differs between Xcode versions, so the identifier of
+          # whichever watch simulator this image ships is used instead.
+          udid="$(xcrun simctl list devices available | grep -E 'Apple Watch' | head -1 | sed -E 's/.*\(([0-9A-Fa-f-]{36})\).*/\1/')"
+          [ -n "$udid" ] || { echo '::error::no Apple Watch simulator is available on this image.'; exit 1; }
+          echo "device=$udid" >> "$GITHUB_OUTPUT"
+          xcrun simctl list devices available | grep -E 'Apple Watch' | head -3
+
+      - name: Run the dialpad UI tests
+        run: |
+          set -euo pipefail
+          xcodebuild test \
+            -project WiFiSecureCall.xcodeproj \
+            -scheme WiFiSecureCallWatchUITests \
+            -configuration Debug \
+            -destination "id=${{ steps.device.outputs.device }}" \
+            -derivedDataPath DerivedData \
+            CODE_SIGNING_ALLOWED=NO \
+            | tee /tmp/watch-ui-tests.log
+
+      - name: Keep the test log on failure
+        if: failure()
+        uses: actions/upload-artifact@v5
+        with:
+          name: watch-ui-test-log
+          path: /tmp/watch-ui-tests.log
+          if-no-files-found: ignore
