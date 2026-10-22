@@ -86,10 +86,9 @@ struct WatchRootView: View {
         .padding(.bottom, 1)
         .padding(.horizontal, 10)
         .background(
-            LinearGradient(colors: [.clear, WatchTheme.background], startPoint: .top, endPoint: .bottom)
+            LinearGradient(colors: [.clear, WatchTheme.backgroundBottom], startPoint: .top, endPoint: .bottom)
                 .frame(height: 28)
-                .allowsHitTesting(false),
-            alignment: .bottom
+                .allowsHitTesting(false)
         )
     }
 }
