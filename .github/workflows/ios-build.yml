@@ -583,19 +583,23 @@ jobs:
             echo "archived: $identifier build $revision"
           done
 
-      - name: Sign for distribution and upload to TestFlight
+      - name: Sign for distribution, verify entitlements, upload
         env:
           KEY_ID: ${{ secrets.APPSTORE_KEY_ID }}
           ISSUER_ID: ${{ secrets.APPSTORE_ISSUER_ID }}
         run: |
           set -euo pipefail
+          # Export to a directory first, not straight to App Store Connect. The
+          # signed .ipa is the only place the entitlements can be checked, and a
+          # build that ships without aps-environment is a build that cannot ring
+          # and cannot register for notifications at all.
           cat > "$RUNNER_TEMP/ExportOptions.plist" <<PLIST
           <?xml version="1.0" encoding="UTF-8"?>
           <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
           <plist version="1.0">
           <dict>
             <key>destination</key>
-            <string>upload</string>
+            <string>export</string>
             <key>method</key>
             <string>app-store-connect</string>
             <key>teamID</key>
@@ -606,20 +610,12 @@ jobs:
             <false/>
             <key>uploadSymbols</key>
             <true/>
-            <key>uploadAPIKey</key>
-            <dict>
-              <key>keyID</key>
-              <string>$KEY_ID</string>
-              <key>issuerID</key>
-              <string>$ISSUER_ID</string>
-              <key>keyPath</key>
-              <string>$KEY_PATH</string>
-            </dict>
           </dict>
           </plist>
           PLIST
           plutil -lint "$RUNNER_TEMP/ExportOptions.plist"
 
+          rm -rf "$RUNNER_TEMP/export"
           xcodebuild \
             -exportArchive \
             -archivePath "$ARCHIVE" \
@@ -629,16 +625,36 @@ jobs:
             -authenticationKeyPath "$KEY_PATH" \
             -authenticationKeyID "$KEY_ID" \
             -authenticationKeyIssuerID "$ISSUER_ID" \
-            2>&1 | tee /tmp/testflight-upload.log
+            2>&1 | tee /tmp/testflight-export.log
 
-          # destination=upload sends the build straight to App Store Connect and
-          # writes no export directory, so the log is the only evidence to check.
-          # stderr is merged in: xcodebuild reports "Upload succeeded" there, and a
-          # pipe that drops it makes a successful upload look like a failure.
+          ipa="$(find "$RUNNER_TEMP/export" -name '*.ipa' -print -quit)"
+          [ -n "$ipa" ] || { echo '::error::the export produced no .ipa.'; exit 1; }
 
-          grep -qE 'Upload succeeded|Delivered your binary|UPLOAD SUCCEEDED' /tmp/testflight-upload.log \
+          rm -rf /tmp/ipa && mkdir /tmp/ipa && unzip -q "$ipa" -d /tmp/ipa
+          phone_app="$(find /tmp/ipa/Payload -maxdepth 1 -name '*.app' -print -quit)"
+          watch_app="$(find "$phone_app/Watch" -maxdepth 1 -name '*.app' -print -quit 2>/dev/null || true)"
+          [ -n "$phone_app" ] || { echo '::error::no phone app in the exported ipa.'; exit 1; }
+          [ -n "$watch_app" ] || { echo '::error::no watch app in the exported ipa.'; exit 1; }
+
+          check_entitlements() {
+            app="$1"; label="$2"
+            codesign -d --entitlements :- "$app" > /tmp/entitlements.plist 2>/dev/null || true
+            echo "--- $label entitlements"
+            cat /tmp/entitlements.plist
+            grep -q 'aps-environment' /tmp/entitlements.plist \
+              || { echo "::error::$label was signed without aps-environment, so it cannot receive any push. Enable Push Notifications for its App ID and re-run."; exit 1; }
+            grep -q 'com.apple.developer.applesignin' /tmp/entitlements.plist \
+              || { echo "::error::$label was signed without com.apple.developer.applesignin, so Sign in with Apple fails on device before any request. Enable the capability for its App ID and re-run."; exit 1; }
+          }
+          check_entitlements "$phone_app" "iPhone app"
+          check_entitlements "$watch_app" "Watch app"
+
+          # Upload only after the entitlements are right.
+          xcrun altool --upload-app --file "$ipa" --type ios \
+            --apiKey "$KEY_ID" --apiIssuer "$ISSUER_ID" 2>&1 | tee /tmp/testflight-upload.log
+
+          grep -qE 'No errors uploading|UPLOAD SUCCEEDED|SUCCESS' /tmp/testflight-upload.log \
             || { echo '::error::the TestFlight upload did not report success.'; exit 1; }
-          echo 'Submitted to TestFlight.'
 
       - name: Remove the API key from the workspace
         if: always()

@@ -32,6 +32,7 @@ final class WatchAppleAuthenticationCoordinator: NSObject, ObservableObject, ASA
 
     func start() {
         guard !isAuthenticating else { return }
+        DiagnosticsLog.shared.log(.auth, "sign_in_apple_started", .info, details: "watchOS")
         do {
             let attempt = try AppleSignInAttempt.make()
             let request = ASAuthorizationAppleIDProvider().createRequest()
@@ -49,6 +50,7 @@ final class WatchAppleAuthenticationCoordinator: NSObject, ObservableObject, ASA
         } catch {
             clearAttempt()
             isAuthenticating = false
+            DiagnosticsLog.shared.log(.auth, "sign_in_apple_failed", .error, details: "request_creation", error: error)
             message = "Apple sign-in unavailable"
         }
     }
@@ -86,6 +88,11 @@ final class WatchAppleAuthenticationCoordinator: NSObject, ObservableObject, ASA
         guard controller === authorizationController else { return }
         clearAttempt()
         isAuthenticating = false
+        // The code matters: 1000 is "unknown" (usually a missing capability or
+        // entitlement), 1001 is the user cancelling. Without it the failure is
+        // indistinguishable from a tap on Cancel.
+        let code = (error as NSError).code
+        DiagnosticsLog.shared.log(.auth, "sign_in_apple_failed", .error, details: "authorization_code=\(code)", error: error)
         message = "Apple sign-in cancelled or unavailable"
     }
 
@@ -101,10 +108,12 @@ final class WatchAppleAuthenticationCoordinator: NSObject, ObservableObject, ASA
                 rawNonce: attempt.rawNonce
             )
             try store.add(response)
+            DiagnosticsLog.shared.log(.auth, "sign_in_apple_success", .success, details: "watchOS")
             await pushRegistration.registerKnownTokens(for: response.account.accountID)
             lastSignedInAccountID = response.account.accountID
             message = "Signed in with Apple"
         } catch let error as AppleCredentialValidationError {
+            DiagnosticsLog.shared.log(.auth, "sign_in_apple_failed", .error, details: "credential_validation", error: error)
             message = error == .stateMismatch
                 ? "Apple sign-in state verification failed"
                 : "Apple credential unavailable"

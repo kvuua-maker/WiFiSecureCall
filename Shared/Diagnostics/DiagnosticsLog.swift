@@ -1,5 +1,6 @@
 import AVFoundation
 import Foundation
+import Security
 import Network
 import UserNotifications
 #if canImport(UIKit)
@@ -241,8 +242,23 @@ enum DiagnosticsEnvironment {
         DiagnosticsLog.shared.log(.resources, "thermal_state_changed", .info, details: thermal)
         #endif
 
+        DiagnosticsLog.shared.log(.auth, "entitlements", .info, details: entitlementSummary())
         DiagnosticsLog.shared.log(.permissions, "microphone_status", .info, details: microphoneStatus())
         DiagnosticsLog.shared.log(.permissions, "notification_status", .info, details: notificationStatus())
+    }
+
+    /// The entitlement string is the only proof of what the signed bundle may do.
+    /// A missing aps-environment produces a runtime error code 3000 and a silent
+    /// failure to ring, which is exactly what happened before this existed.
+    static func entitlementSummary() -> String {
+        let keys = ["aps-environment", "com.apple.developer.applesignin"]
+        guard let task = SecTaskCreateFromSelf(nil) else { return "task_unavailable" }
+        var parts: [String] = []
+        for key in keys {
+            let value = SecTaskCopyValueForEntitlement(task, key as CFString, nil)
+            parts.append("\(key)=\(value == nil ? "absent" : "present")")
+        }
+        return parts.joined(separator: " ")
     }
 
     static func microphoneStatus() -> String {
