@@ -175,6 +175,7 @@
 		F10000000000000000000050 = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = "WiFi Secure Call.app"; sourceTree = BUILT_PRODUCTS_DIR; };
 		F10000000000000000000051 = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = WiFiSecureCallWatch.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		F10000000000000000000052 = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = WiFiSecureCallTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
+		F10000000000000000000053 = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = WiFiSecureCallWatchUITests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 		F10000000000000000000033 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CarrierCallingDiagnosticModels.swift; sourceTree = "<group>"; };
 		F10000000000000000000034 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CarrierCallingDiagnosticView.swift; sourceTree = "<group>"; };
 		F10000000000000000000035 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WatchCarrierCallingDiagnosticView.swift; sourceTree = "<group>"; };
