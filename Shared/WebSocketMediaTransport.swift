@@ -141,6 +141,10 @@ final class WebSocketMediaTransport: NSObject, MediaTransport, URLSessionWebSock
         }
     }
 
+    private func logMedia(_ step: String, _ status: DiagStatus, details: String = "") {
+        DiagnosticsLog.shared.log(.media, step, status, details: details)
+    }
+
     private func heartbeatLoop(_ socket: URLSessionWebSocketTask, callID: UUID, connectionID: UUID) async {
         while !Task.isCancelled {
             do { try await Task.sleep(nanoseconds: 25_000_000_000); try await socket.sendPing() }

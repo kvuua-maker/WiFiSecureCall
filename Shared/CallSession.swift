@@ -68,7 +68,15 @@ private struct TerminalCompensation {
 
 @MainActor
 final class CallSession: ObservableObject {
-    @Published private(set) var state: CallState = .idle
+    @Published private(set) var state: CallState = .idle {
+        didSet {
+            if case let .failed(_, failure) = state {
+                DiagnosticsLog.shared.log(.state, "call_state_transition", .error, details: "\(state) \(failure.rawValue)")
+            } else {
+                DiagnosticsLog.shared.log(.state, "call_state_transition", .info, details: String(describing: state))
+            }
+        }
+    }
     @Published private(set) var isMuted = false
     @Published private(set) var elapsedSeconds = 0
     @Published private(set) var incomingCallerName: String?

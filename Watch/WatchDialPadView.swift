@@ -172,6 +172,7 @@ struct WatchDialPadView: View {
             Haptic.failure()
             return
         }
+        DiagnosticsLog.shared.log(.modeB, "system_dial_requested", .info, details: "digits=\(digits.count)")
         Haptic.success()
         feedback = "Opening the Phone app…"
         // A simulator cannot hand a call to Phone, and a UI test needs the screen
@@ -179,6 +180,7 @@ struct WatchDialPadView: View {
         if ProcessInfo.processInfo.arguments.contains("-uiTesting") { return }
         #if os(watchOS)
         WKApplication.shared().openSystemURL(url)
+        DiagnosticsLog.shared.log(.modeB, "url_opened", .info, details: "tel")
         #endif
         dismiss()
     }

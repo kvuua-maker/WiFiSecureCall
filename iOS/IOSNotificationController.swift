@@ -22,6 +22,9 @@ final class IOSNotificationController: NSObject, UIApplicationDelegate, UNUserNo
         // Activate the watch link at launch, not when a screen appears: a dial
         // request can arrive while the app is in the background, and the session
         // has to exist by then.
+        DiagnosticsLog.shared.start()
+        DiagnosticsEnvironment.recordLaunch()
+        DiagnosticsLog.shared.log(.lifecycle, "app_launched", .info, details: "iOS")
         IOSWatchCallBridge.shared.activate()
         // The relay is the path that survives an iCloud link that is down, so it
         // is started with the app rather than when a call is placed.
@@ -34,14 +37,19 @@ final class IOSNotificationController: NSObject, UIApplicationDelegate, UNUserNo
     }
 
     func applicationDidEnterBackground(_ application: UIApplication) {
+        DiagnosticsLog.shared.log(.lifecycle, "entered_background", .info, details: "iOS")
         IOSDialRelay.shared.applicationDidEnterBackground()
     }
 
     func applicationDidBecomeActive(_ application: UIApplication) {
+        DiagnosticsLog.shared.log(.lifecycle, "entered_foreground", .info, details: "iOS")
         Task { @MainActor in await refreshNotificationAuthorization() }
     }
 
-    func application(_ application: UIApplication, didRegisterForRemoteNotificationsWithDeviceToken token: Data) { upload(token, pushType: .alert) }
+    func application(_ application: UIApplication, didRegisterForRemoteNotificationsWithDeviceToken token: Data) {
+        DiagnosticsLog.shared.log(.push, "push_token_registration_started", .info, details: "alert")
+        upload(token, pushType: .alert)
+    }
     func application(_ application: UIApplication, didFailToRegisterForRemoteNotificationsWithError error: Error) { registrationFailed(error) }
 
     private func configureVoIPPushes() { let registry = PKPushRegistry(queue: .main); registry.delegate = self; registry.desiredPushTypes = [.voIP]; voipRegistry = registry }

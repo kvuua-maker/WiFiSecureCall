@@ -117,6 +117,7 @@ final class WatchCallBridge: NSObject, ObservableObject {
     // MARK: - Lifecycle
 
     func activate() {
+        DiagnosticsLog.shared.log(.watchConnectivity, "wcsession_activated", .info, details: "requested")
         wireRelay()
         guard WCSession.isSupported() else {
             status = "This watch cannot reach an iPhone"

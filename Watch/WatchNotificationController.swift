@@ -12,6 +12,9 @@ final class WatchNotificationController: NSObject, WKApplicationDelegate, UNUser
     private var notificationsAuthorized = false
 
     func applicationDidFinishLaunching() {
+        DiagnosticsLog.shared.start()
+        DiagnosticsEnvironment.recordLaunch()
+        DiagnosticsLog.shared.log(.lifecycle, "app_launched", .info, details: "watchOS")
         NotificationRuntime.shared.configureCallKitFactory { WatchCallKitAdapter() }
         let center = UNUserNotificationCenter.current(); center.delegate = self
         center.setNotificationCategories([UNNotificationCategory(identifier: "INCOMING_CALL", actions: [
