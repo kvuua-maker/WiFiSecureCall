@@ -1,0 +1,85 @@
+name: Architecture guard
+
+# Two checks that a compiler cannot make:
+#
+#   * the shell guard fails when a third-party media stack (SIP, WebRTC, LiveKit,
+#     Twilio) appears, or when the 16 kHz / 320 / 640 / 34-byte audio contract
+#     drifts;
+#   * the unit tests assert the same numbers from inside Swift, plus the jitter and
+#     reconnect behaviour.
+#
+# Both exist because Docs/CallArchitecture.md describes two call modes that must
+# never be mixed, and a comment alone does not stop a future change from mixing
+# them.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "Shared/**"
+      - "Watch/**"
+      - "iOS/**"
+      - "Tests/**"
+      - "Docs/**"
+      - "scripts/**"
+      - ".github/workflows/architecture-guard.yml"
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: architecture-guard-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  contract:
+    name: Audio contract and dependencies
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+      - name: Run the architecture guard
+        run: ./scripts/check-architecture.sh
+
+  invariants:
+    name: Call invariant unit tests
+    runs-on: macos-26
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Report toolchain
+        run: |
+          set -euo pipefail
+          xcodebuild -version
+
+      - name: Pick an available iPhone simulator
+        id: device
+        run: |
+          set -euo pipefail
+          udid="$(xcrun simctl list devices available | grep -E 'iPhone' | head -1 | sed -E 's/.*\(([0-9A-Fa-f-]{36})\).*/\1/')"
+          [ -n "$udid" ] || { echo '::error::no iPhone simulator is available on this image.'; exit 1; }
+          echo "device=$udid" >> "$GITHUB_OUTPUT"
+
+      - name: Run the call invariant tests
+        run: |
+          set -euo pipefail
+          xcodebuild test \
+            -project WiFiSecureCall.xcodeproj \
+            -scheme WiFiSecureCall \
+            -configuration Debug \
+            -destination "id=${{ steps.device.outputs.device }}" \
+            -derivedDataPath DerivedData \
+            -only-testing:WiFiSecureCallTests \
+            CODE_SIGNING_ALLOWED=NO \
+            | tee /tmp/invariants.log
+
+      - name: Keep the test log on failure
+        if: failure()
+        uses: actions/upload-artifact@v5
+        with:
+          name: call-invariants-log
+          path: /tmp/invariants.log
+          if-no-files-found: ignore
