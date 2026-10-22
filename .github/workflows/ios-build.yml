@@ -546,9 +546,10 @@ jobs:
           PRIVATE_KEY: ${{ secrets.APPSTORE_PRIVATE_KEY }}
         run: |
           set -euo pipefail
-          python3 -m pip install --quiet pyjwt cryptography
+          python3 -m venv "$RUNNER_TEMP/asc"
+          "$RUNNER_TEMP/asc/bin/pip" install --quiet pyjwt cryptography
           cd scripts
-          python3 ensure_capabilities.py
+          "$RUNNER_TEMP/asc/bin/python" ensure_capabilities.py
 
       - name: Archive with distribution signing
         env:
