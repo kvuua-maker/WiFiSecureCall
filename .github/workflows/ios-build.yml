@@ -658,8 +658,6 @@ jobs:
             grep -q 'com.apple.developer.applesignin' /tmp/entitlements.plist \
               || { echo "::error::$label was signed without com.apple.developer.applesignin, so Sign in with Apple fails on device before any request. Enable the capability for its App ID and re-run."; exit 1; }
           }
-          check_entitlements "$phone_app" "iPhone app"
-          check_entitlements "$watch_app" "Watch app"
 
           # The export signs the bundles with their App Store profiles, but the
           # archive carried no entitlements, so the signature is naked. Re-sign
@@ -686,6 +684,9 @@ jobs:
 
           sign_bundle "$watch_app"
           sign_bundle "$phone_app"
+
+          check_entitlements "$phone_app" "iPhone app"
+          check_entitlements "$watch_app" "Watch app"
 
           rm -rf /tmp/resigned && mkdir -p /tmp/resigned
           ditto -c -k --sequesterRsrc --keepParent /tmp/ipa/Payload "$RUNNER_TEMP/resigned.ipa"
