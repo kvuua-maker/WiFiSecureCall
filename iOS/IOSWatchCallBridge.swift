@@ -167,32 +167,17 @@ final class IOSWatchCallBridge: NSObject, ObservableObject {
     }
 
     private func place(requestID: UUID, number: String) async {
-        guard let accountID = AccountSessionStore.shared.callableAccounts.first?.accountID else {
-            send(WatchBridgeMessage(kind: .callState, requestID: requestID, state: WatchBridgeCallState.failed.rawValue, detail: "Link an account first"))
+        // A command from the wrist is the confirmation. There is no sheet, no
+        // resolution and no second question: the number goes to the system dialler
+        // immediately, which is the only route this app has to a mobile network.
+        guard let digits = Self.dialableDigits(number) else {
+            send(WatchBridgeMessage(kind: .callState, requestID: requestID, state: WatchBridgeCallState.failed.rawValue, detail: "Invalid number"))
             activeRequestID = nil
             return
         }
-        do {
-            let recipient = try await NotificationRuntime.shared.resolveRecipient(number, accountID: accountID)
-            send(WatchBridgeMessage(kind: .callState, requestID: requestID, state: WatchBridgeCallState.dialing.rawValue))
-            await NotificationRuntime.shared.startUserCall(targetUserID: recipient.userID, accountID: accountID)
-        } catch {
-            // The number is not a Wi-Fi user. Handing it to the system dialer is
-            // the only way this app can reach the phone network, and the call is
-            // still preceded by the CallKit confirmation the system shows.
-            guard let digits = Self.dialableDigits(number),
-                  let url = URL(string: "tel:\(digits)"),
-                  UIApplication.shared.canOpenURL(url) else {
-                send(WatchBridgeMessage(kind: .callState, requestID: requestID, state: WatchBridgeCallState.failed.rawValue, detail: "Number not on Wi-Fi calling"))
-                activeRequestID = nil
-                return
-            }
-            // open(_:) is the async variant in the current SDK; awaiting it keeps
-            // the failure report accurate instead of racing the transition.
-            await UIApplication.shared.open(url)
-            send(WatchBridgeMessage(kind: .callState, requestID: requestID, state: WatchBridgeCallState.handedToSystem.rawValue, detail: "Opened the iPhone dialler"))
-            activeRequestID = nil
-        }
+        send(WatchBridgeMessage(kind: .callState, requestID: requestID, state: WatchBridgeCallState.handedToSystem.rawValue, detail: "Opened the iPhone dialler"))
+        IOSDialRelay.dial(digits)
+        activeRequestID = nil
     }
 
     private static func dialableDigits(_ number: String) -> String? {

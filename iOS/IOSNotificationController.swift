@@ -23,11 +23,18 @@ final class IOSNotificationController: NSObject, UIApplicationDelegate, UNUserNo
         // request can arrive while the app is in the background, and the session
         // has to exist by then.
         IOSWatchCallBridge.shared.activate()
+        // The relay is the path that survives an iCloud link that is down, so it
+        // is started with the app rather than when a call is placed.
+        IOSDialRelay.shared.start()
         Task { await NotificationRuntime.shared.api.reportNotificationDiagnostic(event: "apns_registration_started", status: "started") }
         center.requestAuthorization(options: [.alert, .sound, .badge]) { _, error in
             Task { @MainActor in await self.refreshNotificationAuthorization(requestError: error) }
         }
         return true
+    }
+
+    func applicationDidEnterBackground(_ application: UIApplication) {
+        IOSDialRelay.shared.applicationDidEnterBackground()
     }
 
     func applicationDidBecomeActive(_ application: UIApplication) {

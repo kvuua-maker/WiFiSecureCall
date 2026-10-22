@@ -115,6 +115,7 @@ final class WatchCallBridge: NSObject, ObservableObject {
     // MARK: - Lifecycle
 
     func activate() {
+        wireRelay()
         guard WCSession.isSupported() else {
             status = "This watch cannot reach an iPhone"
             return
@@ -132,11 +133,27 @@ final class WatchCallBridge: NSObject, ObservableObject {
         session.activate()
     }
 
+    private func wireRelay() {
+        WatchDialRelay.shared.onResult = { [weak self] requestID, result in
+            Task { @MainActor in
+                guard let self else { return }
+                switch result {
+                case .delivered, .queued:
+                    self.outbox.remove(requestID)
+                    self.status = "iPhone will dial \(self.remoteDisplayName)"
+                case let .failed(reason):
+                    self.status = "Cannot reach the iPhone: \(reason)"
+                }
+            }
+        }
+    }
+
     /// Called when the app comes to the foreground, which is the one moment the
     /// system is guaranteed to give us: any request queued while we were suspended
     /// is flushed here.
     func applicationDidBecomeActive() {
         activate()
+        startHeartbeat()
         let expired = outbox.removeExpired()
         if let newest = expired.last {
             outbox.remove(newest)
@@ -167,20 +184,19 @@ final class WatchCallBridge: NSObject, ObservableObject {
         outbox.enqueue(message)
         status = "Sending to iPhone…"
 
-        guard let session, session.activationState == .activated else {
-            status = "Waiting for the iPhone"
-            return .queued
+        // The transfer queue is the primary path, not the fallback. It is the one
+        // delivery Apple guarantees and it survives both ends sleeping, which
+        // sendMessage does not. sendMessage is sent as well when the phone happens
+        // to be awake, purely to make the common case feel instant.
+        if let session, session.activationState == .activated {
+            session.transferUserInfo(message.dictionary)
+            outbox.markTransferred(message.requestID)
+            if session.isReachable {
+                deliver(message, over: session)
+            }
         }
-        if session.isReachable {
-            deliver(message, over: session)
-            return .sent
-        }
-        // Not reachable: hand it to the system, which delivers it when the iPhone
-        // next runs, even if this watch app is asleep by then.
-        session.transferUserInfo(message.dictionary)
-        outbox.markTransferred(message.requestID)
-        status = "Will call when the iPhone is free"
-        return .queued
+        scheduleRelayFallback(for: message)
+        return .sent
     }
 
     /// Sends a control command for the call the iPhone is hosting.
@@ -211,6 +227,23 @@ final class WatchCallBridge: NSObject, ObservableObject {
             session.sendMessage(payload, replyHandler: nil, errorHandler: { _ in })
         } else {
             session.transferUserInfo(payload)
+        }
+    }
+
+    /// If WatchConnectivity has not confirmed the command in three seconds, the
+    /// relay takes over. Both copies carry the same request id, so whichever
+    /// arrives first dials and the other is ignored.
+    private func scheduleRelayFallback(for message: WatchBridgeMessage) {
+        let requestID = message.requestID
+        guard let number = message.number else { return }
+        Task { [weak self] in
+            try? await Task.sleep(nanoseconds: 3_000_000_000)
+            guard let self, !Task.isCancelled else { return }
+            await MainActor.run {
+                guard self.outbox.all().contains(where: { $0.message.requestID == requestID }) else { return }
+                self.status = "Reaching the iPhone another way…"
+                WatchDialRelay.shared.send(requestID: requestID, number: number)
+            }
         }
     }
 
@@ -324,7 +357,7 @@ final class WatchCallBridge: NSObject, ObservableObject {
         stopHeartbeat()
         heartbeat = Task { [weak self] in
             while !Task.isCancelled {
-                try? await Task.sleep(nanoseconds: 15_000_000_000)
+                try? await Task.sleep(nanoseconds: 10_000_000_000)
                 guard let self, !Task.isCancelled else { return }
                 await MainActor.run {
                     guard let session = self.session, session.isReachable else { return }
