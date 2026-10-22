@@ -133,7 +133,7 @@
 		F10000000000000000000090 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WatchDialRelay.swift; sourceTree = "<group>"; };
 		F10000000000000000000091 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = IOSDialRelay.swift; sourceTree = "<group>"; };
 		F100000000000000000000A0 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CallArchitectureInvariantTests.swift; sourceTree = "<group>"; };
-		F100000000000000000000B1 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DiagnosticsLog.swift; sourceTree = "<group>"; };
+		F100000000000000000000B1 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Diagnostics/DiagnosticsLog.swift; sourceTree = "<group>"; };
 		F100000000000000000000B2 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WatchContactsStore.swift; sourceTree = "<group>"; };
 		F100000000000000000000B3 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WatchHomeView.swift; sourceTree = "<group>"; };
 		F100000000000000000000B4 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WatchSignInView.swift; sourceTree = "<group>"; };
