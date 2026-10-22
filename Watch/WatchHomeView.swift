@@ -11,7 +11,7 @@ struct WatchHomeView: View {
     @ObservedObject private var bridge = WatchCallBridge.shared
     @ObservedObject private var accountStore = AccountSessionStore.shared
 
-    @State private var showDialPad = false
+    @State private var showDialPad = ProcessInfo.processInfo.arguments.contains("-uiTestingDialPad")
 
     var body: some View {
         ZStack(alignment: .topTrailing) {

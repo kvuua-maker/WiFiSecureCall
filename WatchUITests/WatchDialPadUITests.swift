@@ -92,9 +92,11 @@ final class WatchDialPadUITests: XCTestCase {
         app.launchArguments = ["-uiTesting"]
         app.launch()
 
-        let appCall = app.buttons["home.callApp"]
-        XCTAssertTrue(appCall.waitForExistence(timeout: 30), "the app-to-app call button is missing")
-        XCTAssertTrue(app.buttons["home.dialNumber"].exists, "the dial-a-number button is missing")
-        XCTAssertNotEqual(appCall.frame, app.buttons["home.dialNumber"].frame, "the two actions overlap")
+        // Mode B: the dial glyph in the header.
+        XCTAssertTrue(app.buttons["home.dialNumber"].waitForExistence(timeout: 30), "the dial-a-number action is missing")
+        // Mode A: a contact card, which places the app-to-app call.
+        let card = app.buttons["home.contact.ui-1"]
+        XCTAssertTrue(card.waitForExistence(timeout: 10), "the contact card is missing")
+        XCTAssertNotEqual(card.frame, app.buttons["home.dialNumber"].frame, "the two actions overlap")
     }
 }
