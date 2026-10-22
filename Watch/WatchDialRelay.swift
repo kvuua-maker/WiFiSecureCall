@@ -22,6 +22,7 @@ final class WatchDialRelay: @unchecked Sendable {
     private var session: URLSession?
     private var connecting = false
     private var attempt = 0
+    private var endpoint: (url: URL, token: String)?
     /// Commands written before the socket was open, replayed once it is.
     private var outbox: [(requestID: UUID, number: String)] = []
 
@@ -30,9 +31,18 @@ final class WatchDialRelay: @unchecked Sendable {
     private init() {}
 
     /// Queue a dial command. Returns immediately; the result arrives through onResult.
+    ///
+    /// Credentials are read on the main actor, because the account store is main
+    /// actor isolated, and handed to the socket queue as plain values.
+    @MainActor
     func send(requestID: UUID, number: String) {
+        guard let url = Self.relayURL(), let token = Self.accessToken() else {
+            onResult?(requestID, .failed("Sign in again to use the relay"))
+            return
+        }
         queue.async { [weak self] in
             guard let self else { return }
+            self.endpoint = (url, token)
             self.outbox.append((requestID, number))
             if self.task != nil {
                 self.drain()
@@ -56,10 +66,11 @@ final class WatchDialRelay: @unchecked Sendable {
     // MARK: - Connection
 
     private func connect() {
-        guard !connecting, let url = Self.relayURL(), let token = Self.accessToken() else {
+        guard !connecting, let endpoint else {
             flushFailure("Sign in again to use the relay")
             return
         }
+        let (url, token) = endpoint
         connecting = true
         let configuration = URLSessionConfiguration.default
         configuration.waitsForConnectivity = true
@@ -164,6 +175,7 @@ final class WatchDialRelay: @unchecked Sendable {
 
     /// The relay lives beside the API under the v1 prefix that nginx already
     /// proxies, so no new host or port has to be reachable from the watch.
+    @MainActor
     static func relayURL(config: AppConfig = .load()) -> URL? {
         guard var components = URLComponents(url: config.apiBaseURL, resolvingAgainstBaseURL: false) else { return nil }
         components.scheme = "wss"
@@ -178,6 +190,7 @@ final class WatchDialRelay: @unchecked Sendable {
         return components.url
     }
 
+    @MainActor
     static func accessToken() -> String? {
         let store = AccountSessionStore.shared
         guard let accountID = store.activeAccountID,

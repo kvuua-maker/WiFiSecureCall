@@ -13,6 +13,7 @@ final class IOSDialRelay: NSObject, @unchecked Sendable {
     private var task: URLSessionWebSocketTask?
     private var session: URLSession?
     private var attempt = 0
+    private var endpoint: (url: URL, token: String)?
     private var stopped = true
     private let handledKey = "ios.dial.relay.handled"
     private let handledLock = NSLock()
@@ -28,10 +29,13 @@ final class IOSDialRelay: NSObject, @unchecked Sendable {
 
     // MARK: - Lifecycle
 
+    @MainActor
     func start() {
+        guard let url = Self.relayURL(), let token = Self.accessToken() else { return }
         queue.async { [weak self] in
             guard let self, self.stopped else { return }
             self.stopped = false
+            self.endpoint = (url, token)
             self.connect()
         }
     }
@@ -60,7 +64,8 @@ final class IOSDialRelay: NSObject, @unchecked Sendable {
     // MARK: - Connection
 
     private func connect() {
-        guard !stopped, let url = Self.relayURL(), let token = Self.accessToken() else { return }
+        guard !stopped, let endpoint else { return }
+        let (url, token) = endpoint
         let configuration = URLSessionConfiguration.default
         configuration.waitsForConnectivity = true
         configuration.timeoutIntervalForRequest = 20
@@ -158,6 +163,7 @@ final class IOSDialRelay: NSObject, @unchecked Sendable {
 
     // MARK: - Endpoint and credentials
 
+    @MainActor
     static func relayURL(config: AppConfig = .load()) -> URL? {
         guard var components = URLComponents(url: config.apiBaseURL, resolvingAgainstBaseURL: false) else { return nil }
         components.scheme = "wss"
@@ -172,6 +178,7 @@ final class IOSDialRelay: NSObject, @unchecked Sendable {
         return components.url
     }
 
+    @MainActor
     static func accessToken() -> String? {
         let store = AccountSessionStore.shared
         guard let accountID = store.activeAccountID,
