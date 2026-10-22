@@ -539,7 +539,18 @@ jobs:
       # project and then refused a distribution identity as a conflict; stating
       # every value removes that decision from Xcode. The watch app builds for the
       # watchOS SDK, so it takes its own profile through the SDK-conditional form.
-      - name: Archive unsigned
+      - name: Ensure the App IDs may push and sign in
+        env:
+          KEY_ID: ${{ secrets.APPSTORE_KEY_ID }}
+          ISSUER_ID: ${{ secrets.APPSTORE_ISSUER_ID }}
+          PRIVATE_KEY: ${{ secrets.APPSTORE_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          python3 -m pip install --quiet pyjwt cryptography
+          cd scripts
+          python3 ensure_capabilities.py
+
+      - name: Archive with distribution signing
         env:
           BUILD_NUMBER: ${{ github.run_number }}
           BUILD_NUMBER_OVERRIDE: ${{ inputs.build_number }}
@@ -567,7 +578,13 @@ jobs:
             -archivePath "$ARCHIVE" \
             -derivedDataPath DerivedData \
             CURRENT_PROJECT_VERSION="$build" \
-            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGN_STYLE=Automatic \
+            DEVELOPMENT_TEAM="$TEAM_ID" \
+            CODE_SIGN_IDENTITY="Apple Distribution" \
+            -allowProvisioningUpdates \
+            -authenticationKeyPath "$KEY_PATH" \
+            -authenticationKeyID "$KEY_ID" \
+            -authenticationKeyIssuerID "$ISSUER_ID" \
             archive | tee /tmp/archive.log
 
       - name: Confirm the archive carries both apps
