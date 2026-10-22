@@ -11,7 +11,6 @@ import WatchKit
 /// neighbour, and the call action is a full-width button instead of a glyph
 /// squeezed between two other controls.
 struct WatchDialPadView: View {
-    @ObservedObject var bridge: WatchCallBridge
     @Environment(\.dismiss) private var dismiss
 
     @State private var number = ""
@@ -20,7 +19,6 @@ struct WatchDialPadView: View {
     private let columns = Array(repeating: GridItem(.flexible(), spacing: WatchTheme.keySpacing), count: 3)
     private let maximumDigits = 15
 
-    private var isDialling: Bool { !(bridge.lastIncomingState == .active) }
     private var digits: String { number.filter(\.isNumber) }
 
     var body: some View {
@@ -30,7 +28,7 @@ struct WatchDialPadView: View {
                 display
                 keypad
                 numberRow
-                WatchDialPadActionRow(isEnabled: digits.count >= 3 && isDialling) {
+                WatchDialPadActionRow(isEnabled: digits.count >= 3) {
                     placeCall()
                 }
                 if !feedback.isEmpty {
@@ -62,7 +60,7 @@ struct WatchDialPadView: View {
 
             Spacer()
 
-            Text(isDialling ? "New call" : "Keypad")
+            Text("Dial number")
                 .font(.system(size: 12, weight: .semibold, design: .rounded))
                 .foregroundStyle(WatchTheme.muted)
         }
@@ -130,12 +128,6 @@ struct WatchDialPadView: View {
     // MARK: - Actions
 
     private func press(_ key: String) {
-        if bridge.lastIncomingState == .active {
-            // The call is hosted by the iPhone and the keypad belongs to it; a
-            // local tone would be a sound the far end never hears.
-            feedback = "Keypad is on the iPhone during a call"
-            return
-        }
         switch key {
         case "+":
             guard number.isEmpty else { return }
@@ -164,21 +156,31 @@ struct WatchDialPadView: View {
         if !feedback.isEmpty { feedback = "" }
     }
 
+    /// Mode B: the watch asks watchOS to place the call.
+    ///
+    /// No request goes to our server and no audio passes through this app: the
+    /// system Phone takes over, exactly as documented in Docs/CallArchitecture.md.
+    /// The Apple confirmation on the iPhone is Apple's, not ours, and stays.
     private func placeCall() {
         guard digits.count >= 3 else {
             feedback = "Enter at least 3 digits"
+            Haptic.failure()
+            return
+        }
+        guard let url = WatchSystemDialerNumber.url(for: number), url.scheme == "tel" else {
+            feedback = "That is not a valid number"
+            Haptic.failure()
             return
         }
         Haptic.success()
-        switch bridge.requestCall(number: number) {
-        case .sent:
-            feedback = "Calling from iPhone…"
-            dismiss()
-        case .queued:
-            feedback = "Queued — the iPhone will call when it wakes"
-        case let .unavailable(reason):
-            feedback = reason
-        }
+        feedback = "Opening the Phone app…"
+        // A simulator cannot hand a call to Phone, and a UI test needs the screen
+        // to stay put so it can assert what happened.
+        if ProcessInfo.processInfo.arguments.contains("-uiTesting") { return }
+        #if os(watchOS)
+        WKApplication.shared().openSystemURL(url)
+        #endif
+        dismiss()
     }
 
     // MARK: - Keys

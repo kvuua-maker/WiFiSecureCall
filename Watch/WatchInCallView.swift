@@ -1,24 +1,17 @@
 import Combine
 import SwiftUI
 
-/// The call screen.
+/// The Mode A call screen.
 ///
-/// CallKit draws the system call UI, and this is the app's own view of the same
-/// call: who is on the line, how long it has run, and the two controls a wrist
-/// needs. The call itself is hosted on the iPhone, so mute and end are requests
-/// sent over WatchConnectivity rather than local state changes.
+/// This is an app-to-app call: the watch owns its own microphone, speaker and
+/// media socket, so mute and end act locally through `CallSession`. CallKit draws
+/// the system call UI on top; this screen is what the wrist sees inside the app.
 struct WatchInCallView: View {
-    @ObservedObject var bridge: WatchCallBridge
+    @ObservedObject var session: CallSession
     @Environment(\.dismiss) private var dismiss
 
-    @State private var now = Date()
-
-    private var elapsed: Int {
-        guard let start = bridge.callStartedAt else { return 0 }
-        return max(0, Int(now.timeIntervalSince(start)))
-    }
-
-    private var state: WatchBridgeCallState? { bridge.lastIncomingState }
+    private var elapsed: Int { session.elapsedSeconds }
+    private var state: CallState { session.state }
 
     var body: some View {
         ZStack {
@@ -33,8 +26,6 @@ struct WatchInCallView: View {
             }
             .padding(.horizontal, 8)
         }
-        .onAppear { tick() }
-        .onReceive(Timer.publish(every: 1, on: .main, in: .common).autoconnect()) { _ in tick() }
     }
 
     private var avatar: some View {
@@ -48,12 +39,12 @@ struct WatchInCallView: View {
                     )
                 )
                 .frame(width: 54, height: 54)
-            Image(systemName: state == .active ? "waveform" : "phone.arrow.up.right")
+            Image(systemName: isActive ? "waveform" : "phone.arrow.up.right")
                 .font(.system(size: 22, weight: .semibold))
                 .foregroundStyle(.white)
         }
         .overlay(alignment: .bottomTrailing) {
-            if state == .active {
+            if isActive {
                 Circle()
                     .fill(WatchTheme.accent)
                     .frame(width: 12, height: 12)
@@ -64,7 +55,7 @@ struct WatchInCallView: View {
 
     private var title: some View {
         VStack(spacing: 1) {
-            Text(bridge.remoteDisplayName)
+            Text(title)
                 .font(.system(size: 16, weight: .semibold, design: .rounded))
                 .lineLimit(1)
                 .minimumScaleFactor(0.6)
@@ -74,16 +65,27 @@ struct WatchInCallView: View {
         }
     }
 
+    private var isActive: Bool {
+        if case .active = state { return true }
+        if case .reconnecting = state { return true }
+        return false
+    }
+
+    private var title: String {
+        session.incomingCallerName ?? "App call"
+    }
+
     private var label: String {
         switch state {
-        case .active: return "Call on iPhone"
-        case .dialing: return "Calling…"
-        case .ringing: return "Ringing…"
-        case .resolving: return "Resolving…"
+        case .idle: return "Starting…"
+        case .outgoingRinging: return "Calling…"
+        case .incomingRinging: return "Incoming…"
+        case .connecting: return "Connecting…"
+        case .active: return "Wi-Fi call"
+        case .reconnecting: return "Reconnecting…"
+        case .ending: return "Ending…"
         case .ended: return "Ended"
-        case .failed: return bridge.status.isEmpty ? "Failed" : bridge.status
-        case .handedToSystem: return "Dialled on iPhone"
-        case .none: return "Starting…"
+        case let .failed(_, failure): return failure.rawValue
         }
     }
 
@@ -95,9 +97,9 @@ struct WatchInCallView: View {
         HStack(spacing: 10) {
             Button {
                 Haptic.key()
-                bridge.toggleMuteOnPhone()
+                session.toggleMute()
             } label: {
-                Image(systemName: bridge.isMutedOnPhone ? "mic.slash.fill" : "mic.fill")
+                Image(systemName: session.isMuted ? "mic.slash.fill" : "mic.fill")
                     .font(.system(size: 18, weight: .semibold))
                     .frame(width: 52, height: 52)
                     .background(Circle().fill(Color.white.opacity(0.14)))
@@ -105,11 +107,11 @@ struct WatchInCallView: View {
             }
             .buttonStyle(.plain)
             .accessibilityIdentifier("call.mute")
-            .accessibilityLabel(bridge.isMutedOnPhone ? "Unmute" : "Mute")
+            .accessibilityLabel(session.isMuted ? "Unmute" : "Mute")
 
             Button {
                 Haptic.failure()
-                bridge.endCallOnPhone()
+                Task { await session.endCall() }
             } label: {
                 Image(systemName: "phone.down.fill")
                     .font(.system(size: 18, weight: .semibold))
@@ -123,12 +125,4 @@ struct WatchInCallView: View {
         }
     }
 
-    private func tick() {
-        now = Date()
-        guard let started = bridge.callStartedAt else { return }
-        // A call the phone ended without telling the watch should not tick forever.
-        if state == .ended && Date().timeIntervalSince(started) > 5 {
-            bridge.resetCallDisplay()
-        }
-    }
 }

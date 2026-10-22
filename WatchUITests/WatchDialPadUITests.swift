@@ -72,7 +72,7 @@ final class WatchDialPadUITests: XCTestCase {
         XCTAssertTrue(call.isEnabled, "call must enable at three digits")
     }
 
-    func testCallStartsTheHandoff() throws {
+    func testCallOpensTheSystemDialler() throws {
         let display = app.staticTexts["dialpad.display"]
         XCTAssertTrue(display.waitForExistence(timeout: 30))
 
@@ -81,9 +81,20 @@ final class WatchDialPadUITests: XCTestCase {
         }
         app.buttons["dialpad.call"].tap()
 
-        // The screen reports the handoff instead of silently doing nothing, which
-        // is what the previous build did when the iPhone was unreachable.
-        let feedback = app.staticTexts.containing(NSPredicate(format: "label CONTAINS[c] 'iPhone'")).firstMatch
-        XCTAssertTrue(feedback.waitForExistence(timeout: 10), "no handoff feedback was shown")
+        // Mode B hands the number to watchOS. The simulator cannot place the call,
+        // so the screen says what it is doing and stays put for the assertion.
+        let feedback = app.staticTexts.containing(NSPredicate(format: "label CONTAINS[c] 'Phone app'")).firstMatch
+        XCTAssertTrue(feedback.waitForExistence(timeout: 10), "no dial feedback was shown")
+    }
+
+    func testHomeOffersBothCallModes() throws {
+        app.terminate()
+        app.launchArguments = ["-uiTesting"]
+        app.launch()
+
+        let appCall = app.buttons["home.callApp"]
+        XCTAssertTrue(appCall.waitForExistence(timeout: 30), "the app-to-app call button is missing")
+        XCTAssertTrue(app.buttons["home.dialNumber"].exists, "the dial-a-number button is missing")
+        XCTAssertNotEqual(appCall.frame, app.buttons["home.dialNumber"].frame, "the two actions overlap")
     }
 }
