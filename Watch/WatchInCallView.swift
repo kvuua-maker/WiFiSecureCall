@@ -55,7 +55,7 @@ struct WatchInCallView: View {
 
     private var title: some View {
         VStack(spacing: 1) {
-            Text(title)
+            Text(callerTitle)
                 .font(.system(size: 16, weight: .semibold, design: .rounded))
                 .lineLimit(1)
                 .minimumScaleFactor(0.6)
@@ -71,7 +71,7 @@ struct WatchInCallView: View {
         return false
     }
 
-    private var title: String {
+    private var callerTitle: String {
         session.incomingCallerName ?? "App call"
     }
 
