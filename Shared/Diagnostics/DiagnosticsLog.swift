@@ -224,21 +224,12 @@ enum DiagnosticsEnvironment {
     }
 
     static func microphoneStatus() -> String {
-        #if os(iOS)
-        switch AVAudioApplication.shared.recordPermission {
-        case .granted: return "granted"
-        case .denied: return "denied"
-        case .undetermined: return "undetermined"
-        @unknown default: return "unknown"
-        }
-        #else
         switch AVAudioSession.sharedInstance().recordPermission {
         case .granted: return "granted"
         case .denied: return "denied"
         case .undetermined: return "undetermined"
         @unknown default: return "unknown"
         }
-        #endif
     }
 
     static func notificationStatus() -> String {

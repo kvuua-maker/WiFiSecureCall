@@ -46,7 +46,7 @@ struct IOSChatView: View {
             Button { dismiss() } label: {
                 Image(systemName: "chevron.left")
                     .font(.system(size: 17, weight: .semibold))
-                    .foregroundStyle(IOSTheme.accent)
+                    .foregroundColor(IOSTheme.accent)
             }
             .buttonStyle(.plain)
 
@@ -54,10 +54,10 @@ struct IOSChatView: View {
             VStack(alignment: .leading, spacing: 1) {
                 Text(contact.name)
                     .font(.system(size: 16, weight: .semibold))
-                    .foregroundStyle(.white)
+                    .foregroundColor(.white)
                 Text("tap the phone to call")
                     .font(.system(size: 12))
-                    .foregroundStyle(IOSTheme.textSecondary)
+                    .foregroundColor(IOSTheme.textSecondary)
             }
             Spacer(minLength: 0)
             Button {
@@ -65,7 +65,7 @@ struct IOSChatView: View {
             } label: {
                 Image(systemName: "phone.fill")
                     .font(.system(size: 16, weight: .semibold))
-                    .foregroundStyle(.white)
+                    .foregroundColor(.white)
                     .frame(width: 38, height: 38)
                     .background(Circle().fill(IOSTheme.accent))
             }
@@ -88,10 +88,10 @@ struct IOSChatView: View {
                     Text(record.kind == .outgoing ? "Outgoing call" : record.kind == .incoming ? "Incoming call" : "Call failed")
                         .font(.system(size: 14, weight: .medium))
                 }
-                .foregroundStyle(.white)
+                .foregroundColor(.white)
                 Text(detail(record))
                     .font(.system(size: 11))
-                    .foregroundStyle(.white.opacity(0.65))
+                    .foregroundColor(.white.opacity(0.65))
             }
             .padding(.horizontal, 12)
             .padding(.vertical, 9)
@@ -106,14 +106,14 @@ struct IOSChatView: View {
     private func detail(_ record: CallRecord) -> String {
         let time = IOSMainView.time(record.date)
         guard record.duration > 0 else { return time }
-        return "\(time) · \(WatchInCallView.format(record.duration))"
+        return "\(time) · \(IOSTheme.format(record.duration))"
     }
 
     private var inputBar: some View {
         HStack(spacing: 10) {
-            TextField("", text: $draft, prompt: Text("Message").foregroundStyle(IOSTheme.textSecondary))
+            TextField("", text: $draft, prompt: Text("Message").foregroundColor(IOSTheme.textSecondary))
                 .textFieldStyle(.plain)
-                .foregroundStyle(.white)
+                .foregroundColor(.white)
                 .padding(.horizontal, 14)
                 .padding(.vertical, 10)
                 .background(Capsule().fill(IOSTheme.surfaceRaised))
@@ -122,7 +122,7 @@ struct IOSChatView: View {
             } label: {
                 Image(systemName: "arrow.up")
                     .font(.system(size: 15, weight: .bold))
-                    .foregroundStyle(.white)
+                    .foregroundColor(.white)
                     .frame(width: 36, height: 36)
                     .background(Circle().fill(IOSTheme.accent))
             }

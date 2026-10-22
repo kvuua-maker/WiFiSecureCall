@@ -28,15 +28,15 @@ struct IOSCallScreenView: View {
                     .shadow(color: IOSTheme.avatarColor(for: name).opacity(0.6), radius: 30)
                 Text(name)
                     .font(.system(size: 26, weight: .semibold))
-                    .foregroundStyle(.white)
+                    .foregroundColor(.white)
                     .padding(.top, 16)
                 Text(label)
                     .font(.system(size: 14))
-                    .foregroundStyle(IOSTheme.textSecondary)
+                    .foregroundColor(IOSTheme.textSecondary)
                     .padding(.top, 4)
-                Text(WatchInCallView.format(elapsed))
+                Text(IOSTheme.format(elapsed))
                     .font(.system(size: 40, weight: .light).monospacedDigit())
-                    .foregroundStyle(.white)
+                    .foregroundColor(.white)
                     .padding(.top, 10)
                     .accessibilityIdentifier("call.timer")
 
@@ -82,14 +82,14 @@ struct IOSCallScreenView: View {
             } label: {
                 Image(systemName: symbol)
                     .font(.system(size: 22, weight: .semibold))
-                    .foregroundStyle(.white)
+                    .foregroundColor(.white)
                     .frame(width: 64, height: 64)
                     .background(Circle().fill(tint))
             }
             .buttonStyle(.plain)
             Text(title)
                 .font(.system(size: 12))
-                .foregroundStyle(IOSTheme.textSecondary)
+                .foregroundColor(IOSTheme.textSecondary)
         }
     }
 

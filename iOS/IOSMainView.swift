@@ -42,7 +42,7 @@ struct IOSMainView: View {
     }
 
     private var chatsTab: some View {
-        NavigationStack {
+        NavigationView {
             ZStack {
                 IOSTheme.background.ignoresSafeArea()
                 if contacts.isEmpty {
@@ -62,12 +62,10 @@ struct IOSMainView: View {
                         }
                     }
                     .listStyle(.plain)
-                    .scrollContentBackground(.hidden)
+                    
                 }
             }
             .navigationTitle("Chats")
-            .toolbarBackground(IOSTheme.background, for: .navigationBar)
-            .toolbarColorScheme(.dark, for: .navigationBar)
         }
     }
 
@@ -77,21 +75,21 @@ struct IOSMainView: View {
             VStack(alignment: .leading, spacing: 2) {
                 Text(contact.name)
                     .font(.system(size: 16, weight: .semibold))
-                    .foregroundStyle(.white)
+                    .foregroundColor(.white)
                     .lineLimit(1)
                 Text("Voice call over Wi-Fi")
                     .font(.system(size: 13))
-                    .foregroundStyle(IOSTheme.textSecondary)
+                    .foregroundColor(IOSTheme.textSecondary)
                     .lineLimit(1)
             }
             Spacer(minLength: 0)
             VStack(alignment: .trailing, spacing: 4) {
                 Text(Self.time(history.records.first?.date ?? Date()))
                     .font(.system(size: 12))
-                    .foregroundStyle(IOSTheme.textSecondary)
+                    .foregroundColor(IOSTheme.textSecondary)
                 Image(systemName: "chevron.right")
                     .font(.system(size: 12, weight: .semibold))
-                    .foregroundStyle(IOSTheme.textSecondary)
+                    .foregroundColor(IOSTheme.textSecondary)
             }
         }
         .padding(.vertical, 6)
@@ -102,47 +100,47 @@ struct IOSMainView: View {
         VStack(spacing: 10) {
             Image(systemName: "bubble.left.and.bubble.right")
                 .font(.system(size: 40))
-                .foregroundStyle(IOSTheme.textSecondary)
+                .foregroundColor(IOSTheme.textSecondary)
             Text("No chats yet")
                 .font(.system(size: 18, weight: .semibold))
-                .foregroundStyle(.white)
+                .foregroundColor(.white)
             Text("Sign in to see the people you can call")
                 .font(.system(size: 14))
-                .foregroundStyle(IOSTheme.textSecondary)
+                .foregroundColor(IOSTheme.textSecondary)
         }
     }
 
     // MARK: - Calls
 
     private var callsTab: some View {
-        NavigationStack {
+        NavigationView {
             ZStack {
                 IOSTheme.background.ignoresSafeArea()
                 if history.records.isEmpty {
                     Text("No calls yet")
                         .font(.system(size: 15))
-                        .foregroundStyle(IOSTheme.textSecondary)
+                        .foregroundColor(IOSTheme.textSecondary)
                 } else {
                     List {
                         ForEach(history.records) { record in
                             HStack(spacing: 12) {
                                 Image(systemName: record.symbol)
                                     .font(.system(size: 15, weight: .semibold))
-                                    .foregroundStyle(color(for: record.kind))
+                                    .foregroundColor(color(for: record.kind))
                                     .frame(width: 24)
                                 VStack(alignment: .leading, spacing: 2) {
                                     Text(record.name)
                                         .font(.system(size: 16, weight: .medium))
-                                        .foregroundStyle(.white)
+                                        .foregroundColor(.white)
                                     Text(Self.time(record.date))
                                         .font(.system(size: 12))
-                                        .foregroundStyle(IOSTheme.textSecondary)
+                                        .foregroundColor(IOSTheme.textSecondary)
                                 }
                                 Spacer(minLength: 0)
                                 if record.duration > 0 {
-                                    Text(WatchInCallView.format(record.duration))
+                                    Text(IOSTheme.format(record.duration))
                                         .font(.system(size: 13).monospacedDigit())
-                                        .foregroundStyle(IOSTheme.textSecondary)
+                                        .foregroundColor(IOSTheme.textSecondary)
                                 }
                             }
                             .listRowBackground(IOSTheme.background)
@@ -150,12 +148,10 @@ struct IOSMainView: View {
                         }
                     }
                     .listStyle(.plain)
-                    .scrollContentBackground(.hidden)
+                    
                 }
             }
             .navigationTitle("Calls")
-            .toolbarBackground(IOSTheme.background, for: .navigationBar)
-            .toolbarColorScheme(.dark, for: .navigationBar)
         }
     }
 
@@ -170,7 +166,7 @@ struct IOSMainView: View {
     // MARK: - Settings
 
     private var settingsTab: some View {
-        NavigationStack {
+        NavigationView {
             ZStack {
                 IOSTheme.background.ignoresSafeArea()
                 ScrollView {
@@ -183,8 +179,6 @@ struct IOSMainView: View {
                 }
             }
             .navigationTitle("Settings")
-            .toolbarBackground(IOSTheme.background, for: .navigationBar)
-            .toolbarColorScheme(.dark, for: .navigationBar)
         }
     }
 
@@ -194,10 +188,10 @@ struct IOSMainView: View {
             VStack(alignment: .leading, spacing: 3) {
                 Text(accounts.activeAccount?.displayLabel ?? "Not signed in")
                     .font(.system(size: 18, weight: .semibold))
-                    .foregroundStyle(.white)
+                    .foregroundColor(.white)
                 Text(accounts.activeAccount?.phoneNumber ?? "Sign in with Apple to call")
                     .font(.system(size: 13))
-                    .foregroundStyle(IOSTheme.textSecondary)
+                    .foregroundColor(IOSTheme.textSecondary)
             }
             Spacer(minLength: 0)
         }
@@ -218,9 +212,9 @@ struct IOSMainView: View {
 
     private func settingRow(_ title: String, _ value: String) -> some View {
         HStack {
-            Text(title).font(.system(size: 15)).foregroundStyle(.white)
+            Text(title).font(.system(size: 15)).foregroundColor(.white)
             Spacer(minLength: 0)
-            Text(value).font(.system(size: 14)).foregroundStyle(IOSTheme.textSecondary)
+            Text(value).font(.system(size: 14)).foregroundColor(IOSTheme.textSecondary)
         }
         .padding(.horizontal, 16)
         .padding(.vertical, 14)

@@ -19,6 +19,10 @@ enum IOSTheme {
         return Color(hue: Double(scalar % 360) / 360.0, saturation: 0.45, brightness: 0.62)
     }
 
+    static func format(_ seconds: Int) -> String {
+        String(format: "%02d:%02d", seconds / 60, seconds % 60)
+    }
+
     static func initials(_ name: String) -> String {
         let letters = name.compactMap { $0.isLetter ? String($0) : nil }
         let value = letters.prefix(2).joined().uppercased()
@@ -34,7 +38,7 @@ struct IOSAvatar: View {
             Circle().fill(IOSTheme.avatarColor(for: name))
             Text(IOSTheme.initials(name))
                 .font(.system(size: size * 0.36, weight: .semibold, design: .rounded))
-                .foregroundStyle(.white)
+                .foregroundColor(.white)
         }
         .frame(width: size, height: size)
     }
