@@ -298,7 +298,7 @@ final class WatchCallBridge: NSObject, ObservableObject {
             session?.transferUserInfo(WatchBridgeMessage(kind: .pong, requestID: message.requestID).dictionary)
         case .pong:
             break
-        case .requestCall, .cancelCall:
+        case .requestCall, .cancelCall, .callControl:
             break
         }
     }
