@@ -116,6 +116,11 @@
 		C10000000000000000000001 = {isa = PBXCopyFilesBuildPhase; buildActionMask = 2147483647; dstPath = "$(CONTENTS_FOLDER_PATH)/Watch"; dstSubfolderSpec = 16; files = (B10000000000000000000401, ); name = "Embed Watch Content"; runOnlyForDeploymentPostprocessing = 0; };
 /* End PBXCopyFilesBuildPhase section */
 
+/* Begin PBXFileReference section */
+		F10000000000000000000080 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WatchTheme.swift; sourceTree = "<group>"; };
+		F10000000000000000000081 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WatchDialPadView.swift; sourceTree = "<group>"; };
+		F10000000000000000000082 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WatchInCallView.swift; sourceTree = "<group>"; };
+		F10000000000000000000083 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WatchAppleSignInButton.swift; sourceTree = "<group>"; };
 		F10000000000000000000084 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WatchDialPadUITests.swift; sourceTree = "<group>"; };
 		F10000000000000000000070 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WatchBridgeMessage.swift; sourceTree = "<group>"; };
 		F10000000000000000000071 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WatchCallBridge.swift; sourceTree = "<group>"; };
