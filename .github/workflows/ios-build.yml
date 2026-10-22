@@ -648,6 +648,7 @@ jobs:
           [ -n "$phone_app" ] || { echo '::error::no phone app in the exported ipa.'; exit 1; }
           [ -n "$watch_app" ] || { echo '::error::no watch app in the exported ipa.'; exit 1; }
 
+          echo "re-signing bundles"
           check_entitlements() {
             app="$1"; label="$2"
             codesign -d --entitlements :- "$app" > /tmp/entitlements.plist 2>/dev/null || true
@@ -663,8 +664,15 @@ jobs:
           # archive carried no entitlements, so the signature is naked. Re-sign
           # each bundle with the profile's own entitlements plus the two
           # capabilities this product needs.
-          identity="$(security find-identity -v -p codesigning | grep -m1 'Apple Distribution' | sed -E 's/.*"(.*)"/\1/')"
-          [ -n "$identity" ] || { echo '::error::no Apple Distribution identity on the runner.'; exit 1; }
+          # The distribution certificate Xcode used is in the keychain, but its name
+          # is not necessarily "Apple Distribution" as a literal: read it back from
+          # the signature that export just produced.
+          identity="$(codesign -dvvv "$phone_app" 2>&1 | sed -n 's/^Authority=//p' | head -1 || true)"
+          if [ -z "$identity" ]; then
+            echo "::error::could not read the signing identity from the exported app."
+            codesign -dvvv "$phone_app" 2>&1 | head -20
+            exit 1
+          fi
           echo "signing identity: $identity"
 
           sign_bundle() {
