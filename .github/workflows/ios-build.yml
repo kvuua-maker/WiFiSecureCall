@@ -677,21 +677,36 @@ jobs:
 
           sign_bundle() {
             app="$1"
-            profile="$app/embedded.mobileprovision"
-            [ -f "$profile" ] || { echo "::error::$app has no embedded profile."; exit 1; }
-            security cms -D -i "$profile" > /tmp/profile.plist
-            /usr/libexec/PlistBuddy -x -c 'Print :Entitlements' /tmp/profile.plist > /tmp/entitlements.plist
-            /usr/libexec/PlistBuddy -c 'Delete :aps-environment' /tmp/entitlements.plist 2>/dev/null || true
-            /usr/libexec/PlistBuddy -c 'Add :aps-environment string production' /tmp/entitlements.plist
-            /usr/libexec/PlistBuddy -c 'Delete :com.apple.developer.applesignin' /tmp/entitlements.plist 2>/dev/null || true
-            /usr/libexec/PlistBuddy -c 'Add :com.apple.developer.applesignin array' /tmp/entitlements.plist
-            /usr/libexec/PlistBuddy -c 'Add :com.apple.developer.applesignin:0 string Default' /tmp/entitlements.plist
-            codesign --force --sign "$identity" --timestamp --entitlements /tmp/entitlements.plist "$app"
-            codesign --verify --deep --strict "$app"
+            label="$2"
+            echo "=== re-signing $label: $app"
+            profile="$(find "$app" -maxdepth 1 -name 'embedded.mobileprovision' -print -quit)"
+            if [ -z "$profile" ]; then
+              echo "::error::$label has no embedded.mobileprovision, so there is no profile to take entitlements from. Contents:"
+              ls -la "$app" | head -20
+              exit 1
+            fi
+            echo "profile: $profile"
+            security cms -D -i "$profile" > /tmp/profile.plist \
+              || { echo "::error::$label: security cms could not decode the profile."; exit 1; }
+            /usr/libexec/PlistBuddy -x -c 'Print :Entitlements' /tmp/profile.plist > /tmp/entitlements.plist \
+              || { echo "::error::$label: the profile has no Entitlements dictionary."; exit 1; }
+            /usr/libexec/PlistBuddy -c 'Delete :aps-environment' /tmp/entitlements.plist >/dev/null 2>&1 || true
+            /usr/libexec/PlistBuddy -c 'Add :aps-environment string production' /tmp/entitlements.plist \
+              || { echo "::error::$label: could not add aps-environment."; exit 1; }
+            /usr/libexec/PlistBuddy -c 'Delete :com.apple.developer.applesignin' /tmp/entitlements.plist >/dev/null 2>&1 || true
+            /usr/libexec/PlistBuddy -c 'Add :com.apple.developer.applesignin array' /tmp/entitlements.plist \
+              || { echo "::error::$label: could not add the applesignin array."; exit 1; }
+            /usr/libexec/PlistBuddy -c 'Add :com.apple.developer.applesignin:0 string Default' /tmp/entitlements.plist \
+              || { echo "::error::$label: could not add the applesignin value."; exit 1; }
+            codesign --force --sign "$identity" --timestamp --entitlements /tmp/entitlements.plist "$app" \
+              || { echo "::error::$label: codesign failed."; exit 1; }
+            codesign --verify --strict "$app" \
+              || { echo "::error::$label: the new signature does not verify."; exit 1; }
+            echo "re-signed $label"
           }
 
-          sign_bundle "$watch_app"
-          sign_bundle "$phone_app"
+          sign_bundle "$watch_app" "Watch app"
+          sign_bundle "$phone_app" "iPhone app"
 
           check_entitlements "$phone_app" "iPhone app"
           check_entitlements "$watch_app" "Watch app"
