@@ -716,6 +716,9 @@ jobs:
           mkdir -p "$HOME/private_keys"
           cp "$KEY_PATH" "$HOME/private_keys/AuthKey_$KEY_ID.p8"
 
+          check_entitlements "$phone_app" "iPhone app"
+          check_entitlements "$watch_app" "Watch app"
+
           # Upload only after the entitlements are right.
           # The ipa that export produced is already the signed one; the gate checked
           # the same bytes by unzipping this exact file.
