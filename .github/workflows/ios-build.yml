@@ -661,6 +661,10 @@ jobs:
           plutil -lint "$RUNNER_TEMP/ExportOptions.plist"
 
           rm -rf "$RUNNER_TEMP/export"
+          # A profile cached before the App ID gained Push and Sign in with Apple
+          # would be reused and the signature would be rejected at runtime with
+          # error 3000 even though the entitlements file asks for push.
+          rm -rf "$HOME/Library/MobileDevice/Provisioning Profiles"/*
           xcodebuild \
             -exportArchive \
             -archivePath "$ARCHIVE" \
@@ -691,6 +695,19 @@ jobs:
               || { echo "::error::$label was signed without aps-environment, so it cannot receive any push. Enable Push Notifications for its App ID and re-run."; exit 1; }
             grep -q 'com.apple.developer.applesignin' /tmp/entitlements.plist \
               || { echo "::error::$label was signed without com.apple.developer.applesignin, so Sign in with Apple fails on device before any request. Enable the capability for its App ID and re-run."; exit 1; }
+            # The signature is only half of it: iOS reads the embedded profile as
+            # well, and a stale profile without push makes registration fail with
+            # error 3000 while the signature looks correct.
+            profile="$(find "$app" -maxdepth 1 -name 'embedded.mobileprovision' -print -quit)"
+            [ -n "$profile" ] || { echo "::error::$label has no embedded.mobileprovision."; exit 1; }
+            security cms -D -i "$profile" > /tmp/profile.plist 2>/dev/null \
+              || { echo "::error::$label: the embedded profile cannot be decoded."; exit 1; }
+            /usr/libexec/PlistBuddy -x -c 'Print :Entitlements' /tmp/profile.plist > /tmp/profile-entitlements.plist
+            grep -q 'aps-environment' /tmp/profile-entitlements.plist \
+              || { echo "::error::$label uses a profile without push. Re-run so a fresh App Store profile is generated."; exit 1; }
+            grep -q 'com.apple.developer.applesignin' /tmp/profile-entitlements.plist \
+              || { echo "::error::$label uses a profile without Sign in with Apple."; exit 1; }
+            echo "$label profile and signature agree"
           }
 
           # Xcode has just signed both bundles with the entitlements we placed in
