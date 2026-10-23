@@ -700,7 +700,9 @@ jobs:
           cp "$KEY_PATH" "$HOME/private_keys/AuthKey_$KEY_ID.p8"
 
           # Upload only after the entitlements are right.
-          xcrun altool --upload-app --file "$RUNNER_TEMP/resigned.ipa" --type ios \
+          # The ipa that export produced is already the signed one; the gate checked
+          # the same bytes by unzipping this exact file.
+          xcrun altool --upload-app --file "$ipa" --type ios \
             --apiKey "$KEY_ID" --apiIssuer "$ISSUER_ID" 2>&1 | tee /tmp/testflight-upload.log
 
           grep -qE 'No errors uploading|UPLOAD SUCCEEDED|SUCCESS' /tmp/testflight-upload.log \
