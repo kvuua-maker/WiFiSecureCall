@@ -694,7 +694,10 @@ jobs:
           }
 
           # Xcode has just signed both bundles with the entitlements we placed in
-          # the archive; the gate below proves it.
+          # the archive; the gate below proves it. altool looks for the key in
+          # ~/private_keys, so put it there before asking it to upload.
+          mkdir -p "$HOME/private_keys"
+          cp "$KEY_PATH" "$HOME/private_keys/AuthKey_$KEY_ID.p8"
 
           # Upload only after the entitlements are right.
           xcrun altool --upload-app --file "$RUNNER_TEMP/resigned.ipa" --type ios \
