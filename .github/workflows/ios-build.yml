@@ -595,6 +595,39 @@ jobs:
             echo "archived: $identifier build $revision"
           done
 
+      - name: Give the archive its entitlements
+        run: |
+          set -euo pipefail
+          # An unsigned archive carries no entitlements, and Xcode's export signs
+          # with whatever is in archived-expanded-entitlements.xcent. Writing that
+          # file is what puts aps-environment and Sign in with Apple into the
+          # signature; without it the shipped bundle has neither.
+          iphone_app="$(find "$ARCHIVE/Products/Applications" -maxdepth 1 -name '*.app' -print -quit)"
+          watch_app="$(find "$iphone_app/Watch" -maxdepth 1 -name '*.app' -print -quit)"
+
+          write_entitlements() {
+            app="$1"; bundle_id="$2"
+            cat > "$app/archived-expanded-entitlements.xcent" <<PLIST
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>application-identifier</key><string>$TEAM_ID.$bundle_id</string>
+            <key>com.apple.developer.team-identifier</key><string>$TEAM_ID</string>
+            <key>aps-environment</key><string>production</string>
+            <key>com.apple.developer.applesignin</key><array><string>Default</string></array>
+            <key>keychain-access-groups</key><array><string>$TEAM_ID.*</string></array>
+            <key>beta-reports-active</key><true/>
+          </dict>
+          </plist>
+          PLIST
+            echo "wrote entitlements for $bundle_id"
+            cat "$app/archived-expanded-entitlements.xcent"
+          }
+
+          write_entitlements "$iphone_app" "com.vkapps.wifisecurecall"
+          write_entitlements "$watch_app" "com.vkapps.wifisecurecall.watchkitapp"
+
       - name: Sign for distribution, verify entitlements, upload
         env:
           KEY_ID: ${{ secrets.APPSTORE_KEY_ID }}
@@ -660,59 +693,8 @@ jobs:
               || { echo "::error::$label was signed without com.apple.developer.applesignin, so Sign in with Apple fails on device before any request. Enable the capability for its App ID and re-run."; exit 1; }
           }
 
-          # The export signs the bundles with their App Store profiles, but the
-          # archive carried no entitlements, so the signature is naked. Re-sign
-          # each bundle with the profile's own entitlements plus the two
-          # capabilities this product needs.
-          # The distribution certificate Xcode used is in the keychain, but its name
-          # is not necessarily "Apple Distribution" as a literal: read it back from
-          # the signature that export just produced.
-          identity="$(codesign -dvvv "$phone_app" 2>&1 | sed -n 's/^Authority=//p' | head -1 || true)"
-          if [ -z "$identity" ]; then
-            echo "::error::could not read the signing identity from the exported app."
-            codesign -dvvv "$phone_app" 2>&1 | head -20
-            exit 1
-          fi
-          echo "signing identity: $identity"
-
-          sign_bundle() {
-            app="$1"
-            label="$2"
-            echo "=== re-signing $label: $app"
-            profile="$(find "$app" -maxdepth 1 -name 'embedded.mobileprovision' -print -quit)"
-            if [ -z "$profile" ]; then
-              echo "::error::$label has no embedded.mobileprovision, so there is no profile to take entitlements from. Contents:"
-              ls -la "$app" | head -20
-              exit 1
-            fi
-            echo "profile: $profile"
-            security cms -D -i "$profile" > /tmp/profile.plist \
-              || { echo "::error::$label: security cms could not decode the profile."; exit 1; }
-            /usr/libexec/PlistBuddy -x -c 'Print :Entitlements' /tmp/profile.plist > /tmp/entitlements.plist \
-              || { echo "::error::$label: the profile has no Entitlements dictionary."; exit 1; }
-            /usr/libexec/PlistBuddy -c 'Delete :aps-environment' /tmp/entitlements.plist >/dev/null 2>&1 || true
-            /usr/libexec/PlistBuddy -c 'Add :aps-environment string production' /tmp/entitlements.plist \
-              || { echo "::error::$label: could not add aps-environment."; exit 1; }
-            /usr/libexec/PlistBuddy -c 'Delete :com.apple.developer.applesignin' /tmp/entitlements.plist >/dev/null 2>&1 || true
-            /usr/libexec/PlistBuddy -c 'Add :com.apple.developer.applesignin array' /tmp/entitlements.plist \
-              || { echo "::error::$label: could not add the applesignin array."; exit 1; }
-            /usr/libexec/PlistBuddy -c 'Add :com.apple.developer.applesignin:0 string Default' /tmp/entitlements.plist \
-              || { echo "::error::$label: could not add the applesignin value."; exit 1; }
-            codesign --force --sign "$identity" --timestamp --entitlements /tmp/entitlements.plist "$app" \
-              || { echo "::error::$label: codesign failed."; exit 1; }
-            codesign --verify --strict "$app" \
-              || { echo "::error::$label: the new signature does not verify."; exit 1; }
-            echo "re-signed $label"
-          }
-
-          sign_bundle "$watch_app" "Watch app"
-          sign_bundle "$phone_app" "iPhone app"
-
-          check_entitlements "$phone_app" "iPhone app"
-          check_entitlements "$watch_app" "Watch app"
-
-          rm -rf /tmp/resigned && mkdir -p /tmp/resigned
-          ditto -c -k --sequesterRsrc --keepParent /tmp/ipa/Payload "$RUNNER_TEMP/resigned.ipa"
+          # Xcode has just signed both bundles with the entitlements we placed in
+          # the archive; the gate below proves it.
 
           # Upload only after the entitlements are right.
           xcrun altool --upload-app --file "$RUNNER_TEMP/resigned.ipa" --type ios \
